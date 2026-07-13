@@ -1,0 +1,20 @@
+{
+    "name": "beezi",
+    "owner": {
+        "name": "Beezi"
+    },
+    "plugins": [
+        {
+            "name": "beezi",
+            "source": "./",
+            "description": "Beezi AI ticket drafting for Claude Code - draft tickets grounded in your repo and create them on your board or in Beezi",
+            "version": "0.1.0"
+        },
+        {
+            "name": "beezi-ai",
+            "source": "./beezi-ai",
+            "description": "Beezi AI ticket drafting for Claude (claude.ai) - sign in with your Beezi account and draft tickets, then create them on your board or in Beezi",
+            "version": "0.1.0"
+        }
+    ]
+}

@@ -1,0 +1,8 @@
+{
+    "name": "beezi-ai",
+    "description": "Beezi AI ticket drafting for Claude - sign in with your Beezi account, draft tickets, and create them on your board (Jira / Azure DevOps) or in Beezi",
+    "version": "0.1.0",
+    "author": {
+        "name": "Beezi"
+    }
+}

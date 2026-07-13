@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+        "beezi": {
+            "type": "http",
+            "url": "https://zenaida-unretinued-huong.ngrok-free.dev/api/mcp/sse"
+        }
+    }
+}
