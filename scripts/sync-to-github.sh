@@ -15,6 +15,9 @@
 #   TARGET_BRANCH  Branch to update on GitHub. Default: main.
 #   FORCE          `true` to overwrite diverged GitHub history. Default: false.
 #   DRY_RUN        `true` to show what would be pushed and exit. Default: false.
+#   ALLOW_NON_PROD `true` to mirror even if a .mcp.json points at a dev tunnel.
+#                  Default: false. The GitHub repo is public - a tunnel URL
+#                  published here stays in the commit log.
 #
 # The PAT is passed to git through GIT_ASKPASS so it never appears in the
 # process list, in `git remote -v`, or in pipeline logs.
@@ -27,6 +30,7 @@ SOURCE_REF="${SOURCE_REF:-HEAD}"
 TARGET_BRANCH="${TARGET_BRANCH:-main}"
 FORCE="${FORCE:-false}"
 DRY_RUN="${DRY_RUN:-false}"
+ALLOW_NON_PROD="${ALLOW_NON_PROD:-false}"
 
 die() { echo "sync-to-github: $*" >&2; exit 1; }
 
@@ -49,6 +53,18 @@ git rev-parse --verify "$SOURCE_REF" >/dev/null 2>&1 \
 
 sha="$(git rev-parse "$SOURCE_REF")"
 echo "sync-to-github: $slug  <-  $SOURCE_REF ($sha) -> $TARGET_BRANCH"
+
+# The GitHub mirror is public. Refuse to publish a connector URL that points at
+# a dev tunnel or a local box - it would stay in the commit log afterwards.
+if [ "$ALLOW_NON_PROD" != "true" ]; then
+    non_prod="$(git grep -n -I -E 'ngrok|localhost|127\.0\.0\.1|0\.0\.0\.0' "$sha" -- '*.mcp.json' || true)"
+    if [ -n "$non_prod" ]; then
+        echo "sync-to-github: refusing to mirror - non-production connector URL found:" >&2
+        echo "$non_prod" | sed 's/^/  /' >&2
+        echo "Point it at the production Beezi API, or set ALLOW_NON_PROD=true to override." >&2
+        exit 1
+    fi
+fi
 
 if [ "$DRY_RUN" = "true" ]; then
     echo "sync-to-github: DRY_RUN=true, nothing pushed."

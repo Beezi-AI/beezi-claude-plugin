@@ -31,6 +31,10 @@
 .PARAMETER DryRun
     Show what would be pushed and exit.
 
+.PARAMETER AllowNonProd
+    Mirror even if a .mcp.json points at a dev tunnel. The GitHub repo is
+    public - a tunnel URL published there stays in the commit log.
+
 .EXAMPLE
     ./sync-to-github.ps1 -GithubRepo beezi/beezi-claude-plugins -DryRun
 #>
@@ -41,7 +45,8 @@ param(
     [string]$SourceRef = 'HEAD',
     [string]$TargetBranch = 'main',
     [switch]$Force,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$AllowNonProd = [bool]$env:ALLOW_NON_PROD
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,6 +70,17 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sha)) {
 $sha = $sha.Trim()
 
 Write-Host "sync-to-github: $slug  <-  $SourceRef ($sha) -> $TargetBranch"
+
+# The GitHub mirror is public. Refuse to publish a connector URL that points at
+# a dev tunnel or a local box - it would stay in the commit log afterwards.
+if (-not $AllowNonProd) {
+    $nonProd = & git grep -n -I -E 'ngrok|localhost|127\.0\.0\.1|0\.0\.0\.0' $sha -- '*.mcp.json' 2>$null
+    if ($LASTEXITCODE -eq 0 -and $nonProd) {
+        Write-Host 'sync-to-github: refusing to mirror - non-production connector URL found:' -ForegroundColor Red
+        $nonProd | ForEach-Object { Write-Host "  $_" }
+        Die 'Point it at the production Beezi API, or pass -AllowNonProd to override.'
+    }
+}
 
 if ($DryRun) {
     Write-Host 'sync-to-github: DryRun, nothing pushed.'
