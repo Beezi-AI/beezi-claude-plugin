@@ -27,7 +27,7 @@ azure-pipelines-github-sync.yml   release pipeline
 
 Each plugin is self-contained — its own `.claude-plugin/plugin.json`, `.mcp.json`, `skills/`, and README. The two `create-ticket` skills are deliberately near-identical copies rather than a shared file: a plugin has to stand alone once installed, and the remediation steps differ per platform (`/mcp` vs **Settings → Connectors**).
 
-The plugins are thin launchers. The drafting methodology, question flow, and field rules are served by the Beezi MCP server at call time via `get_drafting_instructions`, so updates ship server-side with no plugin reinstall — and any other MCP client gets the identical workflow from the same endpoint.
+The plugins are thin launchers. The drafting methodology, question flow, and field rules are served by the Beezi MCP server at call time via `get_drafting_instructions`, so updates ship server-side with no plugin reinstall — and any other MCP client gets the identical workflow from the same endpoint
 
 ## Branches
 
