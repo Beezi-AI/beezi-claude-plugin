@@ -2,10 +2,7 @@
     "mcpServers": {
         "beezi": {
             "type": "http",
-            "url": "${BEEZI_MCP_URL:-https://beezi-api-prod.azurewebsites.net/api/mcp}",
-            "headers": {
-                "Authorization": "Bearer ${BEEZI_PAT}"
-            }
+            "url": "${BEEZI_MCP_URL:-https://beezi-api-prod.azurewebsites.net/api/mcp}"
         }
     }
 }

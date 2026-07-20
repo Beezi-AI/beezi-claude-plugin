@@ -2,7 +2,7 @@
 
 Draft and create Beezi tickets inside Claude. The plugin connects Claude to the Beezi MCP server: it fetches your project's ticket template, drafts every field, asks clarifying questions when the request is unclear, and — after you approve the draft — creates the ticket on your board (Jira / Azure DevOps) or in Beezi.
 
-Unlike the Claude Code plugin (which uses a Personal Access Token), this one authenticates with **OAuth**: on first use Claude opens a **"Sign in with Beezi"** window, and every ticket you create is created as **you**, on your own tenant. You must already be a Beezi user.
+Authentication is **OAuth**: on first use Claude opens a **"Sign in with Beezi"** window, and every ticket you create is created as **you**, on your own tenant. You must already be a Beezi user.
 
 ## Install
 

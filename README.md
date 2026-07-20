@@ -11,15 +11,9 @@ Draft and create Beezi tickets from your terminal. The plugin connects Claude Co
    /plugin install beezi@beezi
    ```
 
-2. Create a Personal Access Token in **Beezi → Settings → Personal Access Tokens** and export it:
+2. Restart Claude Code and run `/mcp`. Select the `beezi` server and complete the browser sign-in - Claude Code handles the OAuth flow against your Beezi account and stores the token for you.
 
-   ```bash
-   export BEEZI_PAT="bzi_..."
-   ```
-
-   Add the export to your shell profile so it survives new terminals.
-
-3. Restart Claude Code. Check the connection with `/mcp` - the `beezi` server should be connected.
+3. Check `/mcp` again - the `beezi` server should be connected. If it ever drops, re-run `/mcp` to re-authenticate.
 
 To point the plugin at a non-production Beezi instance, set `BEEZI_MCP_URL` (defaults to the production API):
 
