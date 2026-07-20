@@ -1,4 +1,4 @@
-# Mirrors the prod branch to the public GitHub repo after a release PR merges.
+# Mirrors `prod` to the public GitHub repo after a release PR merges into it.
 #
 # One-way: Azure DevOps -> GitHub. Nothing ever flows back.
 #
@@ -16,7 +16,7 @@
 trigger:
     branches:
         include:
-            - main
+            - prod
 
 pr: none
 

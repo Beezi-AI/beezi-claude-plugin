@@ -31,7 +31,7 @@ The plugins are thin launchers. The drafting methodology, question flow, and fie
 
 ## Branches
 
-`dev` is the integration branch; `main` is prod. Merging a release PR into `main` triggers `azure-pipelines-github-sync.yml`, which mirrors `main` to the public GitHub repo that users add with `/plugin marketplace add`.
+`dev` is the integration branch; `prod` is the release branch. Merging a release PR from `dev` into `prod` triggers `azure-pipelines-github-sync.yml`, which mirrors `prod` to the public GitHub repo that users add with `/plugin marketplace add`.
 
 ## Releasing
 
