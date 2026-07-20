@@ -5,15 +5,15 @@
     },
     "plugins": [
         {
-            "name": "beezi",
-            "source": "./",
-            "description": "Beezi AI ticket drafting for Claude Code - draft tickets grounded in your repo and create them on your board or in Beezi",
+            "name": "beezi-code",
+            "source": "./plugins/beezi-code",
+            "description": "Beezi AI ticket drafting for Claude Code - draft tickets grounded in the repo you're working in, then create them on your board (Jira / Azure DevOps) or in Beezi",
             "version": "0.1.0"
         },
         {
-            "name": "beezi-ai",
-            "source": "./beezi-ai",
-            "description": "Beezi AI ticket drafting for Claude (claude.ai) - sign in with your Beezi account and draft tickets, then create them on your board or in Beezi",
+            "name": "beezi-web",
+            "source": "./plugins/beezi-web",
+            "description": "Beezi AI ticket drafting for Claude on claude.ai - sign in with your Beezi account, draft tickets, then create them on your board (Jira / Azure DevOps) or in Beezi",
             "version": "0.1.0"
         }
     ]

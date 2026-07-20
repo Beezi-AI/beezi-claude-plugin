@@ -7,7 +7,7 @@ Authentication is **OAuth**: on first use Claude opens a **"Sign in with Beezi"*
 ## Install
 
 1. In Claude, open **Customize → Plugins → Add marketplace** and add this repository's URL.
-2. Install the **beezi-ai** plugin.
+2. Install the **beezi-web** plugin.
 3. Ask naturally ("file a bug: the sync worker retries too aggressively on 429s") or run the skill directly. On first use, complete the **Sign in with Beezi** consent. The `beezi` connector then appears under **Settings → Connectors**.
 
 ## Quick test without installing the plugin

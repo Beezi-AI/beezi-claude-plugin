@@ -1,44 +1,48 @@
-# Beezi plugin for Claude Code
+# Beezi plugins for Claude
 
-Draft and create Beezi tickets from your terminal. The plugin connects Claude Code to the Beezi MCP server: it fetches your project's ticket template, drafts every field grounded in the repository you're working in, asks clarifying questions when the request is unclear, and - after you approve the draft - creates the ticket on your board (Jira / Azure DevOps) or in Beezi.
+A plugin marketplace with two plugins, one per platform. Both connect Claude to the Beezi MCP server to draft tickets and create them on your board (Jira / Azure DevOps) or in Beezi.
 
-## Installation
+| Plugin | Platform | Install |
+| --- | --- | --- |
+| [`beezi-code`](plugins/beezi-code) | Claude Code (terminal) | `/plugin install beezi-code@beezi` |
+| [`beezi-web`](plugins/beezi-web) | Claude on claude.ai | **Customize → Plugins**, then install **beezi-web** |
 
-1. Add the marketplace and install the plugin:
+Add the marketplace first:
 
-   ```
-   /plugin marketplace add <org>/beezi-claude-plugin
-   /plugin install beezi@beezi
-   ```
+```
+/plugin marketplace add <org>/beezi-claude-plugins
+```
 
-2. Restart Claude Code and run `/mcp`. Select the `beezi` server and complete the browser sign-in - Claude Code handles the OAuth flow against your Beezi account and stores the token for you.
+Both authenticate with **OAuth** against your own Beezi account — tickets are created as you, on your tenant. You must already be a Beezi user.
 
-3. Check `/mcp` again - the `beezi` server should be connected. If it ever drops, re-run `/mcp` to re-authenticate.
+## Layout
 
-To point the plugin at a non-production Beezi instance, set `BEEZI_MCP_URL` (defaults to the production API):
+```
+.claude-plugin/marketplace.json   both plugins are listed here
+plugins/beezi-code/               Claude Code plugin
+plugins/beezi-web/                claude.ai plugin
+scripts/                          GitHub mirror scripts
+azure-pipelines-github-sync.yml   release pipeline
+```
+
+Each plugin is self-contained — its own `.claude-plugin/plugin.json`, `.mcp.json`, `skills/`, and README. The two `create-ticket` skills are deliberately near-identical copies rather than a shared file: a plugin has to stand alone once installed, and the remediation steps differ per platform (`/mcp` vs **Settings → Connectors**).
+
+The plugins are thin launchers. The drafting methodology, question flow, and field rules are served by the Beezi MCP server at call time via `get_drafting_instructions`, so updates ship server-side with no plugin reinstall — and any other MCP client gets the identical workflow from the same endpoint.
+
+## Branches
+
+`dev` is the integration branch; `main` is prod. Merging a release PR into `main` triggers `azure-pipelines-github-sync.yml`, which mirrors `main` to the public GitHub repo that users add with `/plugin marketplace add`.
+
+## Releasing
+
+The mirror refuses to publish while any `.mcp.json` points at a dev tunnel or localhost, because the GitHub repo is public and the URL would persist in the commit log. Point the connector at the production Beezi API before releasing, or set `ALLOW_NON_PROD=true` to override deliberately.
+
+To run the mirror by hand:
 
 ```bash
-export BEEZI_MCP_URL="http://localhost:5001/api/mcp"
+GITHUB_PAT=... GITHUB_REPO=owner/name DRY_RUN=true scripts/sync-to-github.sh
 ```
 
-## Usage
-
-Ask naturally, or invoke the skill directly:
-
+```powershell
+./scripts/sync-to-github.ps1 -GithubRepo owner/name -DryRun
 ```
-/beezi:create-ticket the retry logic in the sync worker gives up too early on 429s
-```
-
-Claude resolves the Beezi project from your git remote, explores the repo, asks questions only when something is genuinely unclear, shows you the full draft for validation, and creates the ticket where you choose.
-
-## MCP tools
-
-| Tool | Purpose |
-| --- | --- |
-| `get_drafting_instructions` | The complete drafting workflow — always fetched fresh from Beezi |
-| `list_projects` | Projects your token can create tickets in |
-| `resolve_project` | Match a git remote URL to a Beezi project |
-| `get_ticket_template` | Enabled ticket fields + generation rules for a project/issue type |
-| `create_ticket` | Create the validated ticket on the board or in Beezi |
-
-The plugin itself is a thin launcher: the drafting methodology, question flow and field rules are served by the Beezi MCP server at call time. Updates ship server-side — no plugin reinstall — and any other MCP client (Cursor, VS Code, Codex, ChatGPT) gets the identical workflow by connecting to the same endpoint.

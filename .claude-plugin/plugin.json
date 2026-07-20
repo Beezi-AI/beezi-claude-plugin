@@ -1,8 +1,0 @@
-{
-    "name": "beezi",
-    "description": "Beezi AI ticket drafting for Claude Code - draft tickets grounded in your repo and create them on your board or in Beezi",
-    "version": "0.1.0",
-    "author": {
-        "name": "Beezi"
-    }
-}
