@@ -1,4 +1,4 @@
-# beezi-analytics-plugin
+# beezi
 
 A Claude Code plugin that hooks into session lifecycle events (SessionStart, PostToolUse, SessionEnd) to collect and report token usage analytics for Beezi task branches. On session end it ships a summary — tokens consumed, tool calls made, and branch context — to the Beezi analytics endpoint so teams can track AI-assisted development cost and throughput per task.
 

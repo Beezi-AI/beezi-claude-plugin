@@ -67,4 +67,4 @@ Then ask Claude to draft or create a ticket, the same as above.
 The analytics plugin reports token counts, tool-call counts, durations, branch and task
 ids, the sanitized origin remote, and the session name. Your auth token and the contents
 of `~/.claude.json` never leave the machine. Full details, including credential storage
-per OS: [`beezi-analytics-plugin/README.md`](beezi-analytics-plugin/README.md).
+per OS: [`plugins/beezi/README.md`](plugins/beezi/README.md).
