@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs", "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/checkpoint.mjs", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/stop.mjs", "timeout": 10 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/report.mjs", "timeout": 10 } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/stop-failure.mjs", "timeout": 10 } ] }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "beezi-analytics-plugin",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Beezi analytics plugin for Claude Code.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

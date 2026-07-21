@@ -1,48 +1,70 @@
 # Beezi plugins for Claude
 
-A plugin marketplace with two plugins, one per platform. Both connect Claude to the Beezi MCP server to draft tickets and create them on your board (Jira / Azure DevOps) or in Beezi.
+Official Beezi plugins for Claude — track the cost of AI-assisted work per task and create
+tickets on your board without leaving the conversation.
 
-| Plugin | Platform | Install |
+| Plugin | Platform | What you get |
 | --- | --- | --- |
-| [`beezi-code`](plugins/beezi-code) | Claude Code (terminal) | `/plugin install beezi-code@beezi` |
-| [`beezi-web`](plugins/beezi-web) | Claude on claude.ai | **Customize → Plugins**, then install **beezi-web** |
+| `beezi` | Claude Code (terminal) | Automatic session analytics per Beezi task branch + ticket drafting |
+| `beezi-web` | Claude on claude.ai | Ticket drafting |
 
-Add the marketplace first:
+Both plugins sign in with your own Beezi account — you must already be a Beezi user, and
+everything happens as you, on your tenant.
 
-```
-/plugin marketplace add <org>/beezi-claude-plugins
-```
+## Claude Code — `beezi`
 
-Both authenticate with **OAuth** against your own Beezi account — tickets are created as you, on your tenant. You must already be a Beezi user.
-
-## Layout
+### 1. Install
 
 ```
-.claude-plugin/marketplace.json   both plugins are listed here
-plugins/beezi-code/               Claude Code plugin
-plugins/beezi-web/                claude.ai plugin
-scripts/                          GitHub mirror scripts
-azure-pipelines-github-sync.yml   release pipeline
+/plugin marketplace add https://github.com/Beezi-AI/beezi-claude-code
+/plugin install beezi@beezi
 ```
 
-Each plugin is self-contained — its own `.claude-plugin/plugin.json`, `.mcp.json`, `skills/`, and README. The two `create-ticket` skills are deliberately near-identical copies rather than a shared file: a plugin has to stand alone once installed, and the remediation steps differ per platform (`/mcp` vs **Settings → Connectors**).
+### 2. Link your machine
 
-The plugins are thin launchers. The drafting methodology, question flow, and field rules are served by the Beezi MCP server at call time via `get_drafting_instructions`, so updates ship server-side with no plugin reinstall — and any other MCP client gets the identical workflow from the same endpoint
-
-## Branches
-
-`dev` is the integration branch; `prod` is the release branch. Merging a release PR from `dev` into `prod` triggers `azure-pipelines-github-sync.yml`, which mirrors `prod` to the public GitHub repo that users add with `/plugin marketplace add`.
-
-## Releasing
-
-The mirror refuses to publish while any `.mcp.json` points at a dev tunnel or localhost, because the GitHub repo is public and the URL would persist in the commit log. Point the connector at the production Beezi API before releasing, or set `ALLOW_NON_PROD=true` to override deliberately.
-
-To run the mirror by hand:
-
-```bash
-GITHUB_PAT=... GITHUB_REPO=owner/name DRY_RUN=true scripts/sync-to-github.sh
+```
+/beezi:login
 ```
 
-```powershell
-./scripts/sync-to-github.ps1 -GithubRepo owner/name -DryRun
-```
+Approve the sign-in in your browser. That's it — from now on, work on Beezi task branches
+is tracked automatically; you don't need to run anything else.
+
+### Commands
+
+| Command | Purpose |
+| --- | --- |
+| `/beezi:login` | Link this machine via browser sign-in; the token is kept in your OS secret store. |
+| `/beezi:me` | Show whether this machine is linked, and as whom. |
+| `/beezi:track` | Force-save analytics for the current task branch mid-session. |
+| `/beezi:refresh` | Re-capture your Claude subscription plan for accurate cost reporting. |
+
+### Ticket drafting
+
+Ask Claude to draft or create a ticket — the bundled `create-ticket` skill connects to the
+Beezi server, drafts a ticket grounded in the repo you're working in, and creates it on
+your board (Jira / Azure DevOps) or in Beezi once you approve the draft. The first time,
+authorize the `beezi` connector when prompted (check `/mcp` if you don't see it).
+
+### Optional configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BEEZI_API_URL` | `https://beezi-api-prod.azurewebsites.net/api` | Beezi API base URL. |
+| `BEEZI_MCP_URL` | `https://beezi-api-prod.azurewebsites.net/api/mcp` | Beezi server for ticket drafting. |
+| `BEEZI_HOME` | `~/.beezi` | Local state root (queue, cursors, credentials). |
+
+## Claude on claude.ai — `beezi-web`
+
+1. Open **Customize → Plugins**.
+2. Add this marketplace, then install **beezi-web**.
+3. Sign in with your Beezi account when the `beezi` connector asks (it appears under
+   **Settings → Connectors**).
+
+Then ask Claude to draft or create a ticket, the same as above.
+
+## Privacy
+
+The analytics plugin reports token counts, tool-call counts, durations, branch and task
+ids, the sanitized origin remote, and the session name. Your auth token and the contents
+of `~/.claude.json` never leave the machine. Full details, including credential storage
+per OS: [`beezi-analytics-plugin/README.md`](beezi-analytics-plugin/README.md).
