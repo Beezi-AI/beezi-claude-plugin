@@ -1,6 +1,8 @@
 // Bounded POST of a JSON body with bearer auth. Returns the fetch Response so callers
 // own the status/body handling; throws on network error or timeout (caller catches).
 // The timeout guards the hook's 10s budget — a hung server must not stall the turn.
+import { machineHeaders } from './machine-identity.mjs';
+
 const DEFAULT_TIMEOUT_MS = 3000;
 
 export async function postJson(url, token, body, deps = {}) {
@@ -14,6 +16,7 @@ export async function postJson(url, token, body, deps = {}) {
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
+        ...machineHeaders(),
       },
       body: JSON.stringify(body),
       signal: controller.signal,

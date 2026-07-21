@@ -3,7 +3,8 @@ import os from 'node:os';
 import { apiOrigin, PROTECTED_RESOURCE_PATH } from './config.mjs';
 import { UserError } from './friendly-error.mjs';
 
-const TIMEOUT_MS = 5000;
+// Clerk development instances cold-start well past 5s; measured 5.6s–20s on first contact.
+const TIMEOUT_MS = 15000;
 
 async function fetchWithTimeout(fetchImpl, url, init) {
   const controller = new AbortController();

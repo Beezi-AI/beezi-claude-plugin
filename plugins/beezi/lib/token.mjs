@@ -6,6 +6,7 @@ import {
   deleteCredentials as _deleteCredentials,
 } from './credentials.mjs';
 import { refreshTokens as _refreshTokens } from './oauth.mjs';
+import { setMachineClientId } from './machine-identity.mjs';
 import { beeziHome } from './paths.mjs';
 
 const SKEW_MS = 60_000;
@@ -51,6 +52,7 @@ export async function getAccessToken(deps = {}) {
   let creds;
   try { creds = await getCreds(deps); } catch { return null; }
   if (!creds) return null;
+  setMachineClientId(creds.client_id);
   if ((creds.expires_at ?? 0) - now() > SKEW_MS) return creds.access_token;
 
   if (!acquireLock()) {

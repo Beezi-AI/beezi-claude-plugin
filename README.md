@@ -35,6 +35,7 @@ is tracked automatically; you don't need to run anything else.
 | --- | --- |
 | `/beezi:login` | Link this machine via browser sign-in; the token is kept in your OS secret store. |
 | `/beezi:me` | Show whether this machine is linked, and as whom. |
+| `/beezi:logout` | Unlink this machine — revokes its access and removes the stored credentials. |
 | `/beezi:track` | Force-save analytics for the current task branch mid-session. |
 | `/beezi:refresh` | Re-capture your Claude subscription plan for accurate cost reporting. |
 

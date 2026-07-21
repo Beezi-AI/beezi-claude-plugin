@@ -16,6 +16,7 @@ It also ships ticket drafting: the `create-ticket` skill (`skills/create-ticket/
 
 - `/beezi:login` — link this machine (browser sign-in with your Beezi account via Clerk OAuth + PKCE); stores the credentials in the OS secret store, or a restricted-permission file when no store is available (see Credential storage below). After upgrading from 0.1.x, run it once — old device-flow tokens are invalid.
 - `/beezi:me` — show this machine's link status (linked account).
+- `/beezi:logout` — unlink this machine: asks the portal to drop it and revoke its OAuth client, then deletes the stored credentials. Falls back to revoking directly at the auth server when the portal is unreachable; always logs out locally.
 - `/beezi:track` — manually save analytics for the **current** task branch. Fails with an error if the branch is not a `.../task-…` branch or the repo is not connected; on success prints `analytics saved for task-…`.
 
 Analytics are otherwise tracked automatically via the session lifecycle hooks — `/beezi:track` is only needed to force a save mid-session.

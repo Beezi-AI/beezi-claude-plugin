@@ -5,6 +5,7 @@ import { apiBase, OAUTH_SCOPES } from '../lib/config.mjs';
 import { discover, registerClient, pkcePair, exchangeCode } from '../lib/oauth.mjs';
 import { getCredentials, setCredentials } from '../lib/credentials.mjs';
 import { startLoopback } from '../lib/loopback.mjs';
+import { setMachineClientId } from '../lib/machine-identity.mjs';
 import { whoami } from '../lib/whoami.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 
@@ -60,6 +61,7 @@ async function run() {
 
   const existing = await getCredentials().catch(() => null);
   if (existing) {
+    setMachineClientId(existing.client_id);
     const who = await whoami(existing.access_token, { base });
     if (who?.valid) {
       const account = who.name || who.email;

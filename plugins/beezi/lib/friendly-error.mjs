@@ -34,12 +34,23 @@ function isNetwork(error) {
   return error?.message === 'fetch failed';
 }
 
+// An aborted fetch surfaces as a DOMException named AbortError with no `code`, so it
+// reaches neither NETWORK_CODES nor 'fetch failed'; match on the name at both levels.
+function isTimeout(error) {
+  const name = error?.name ?? error?.cause?.name;
+  return name === 'AbortError' || name === 'TimeoutError';
+}
+
 function isBadJson(error) {
   return error instanceof SyntaxError || /\bJSON\b/i.test(String(error?.message ?? ''));
 }
 
 export function friendlyMessage(error, { env = process.env } = {}) {
   if (error?.userFacing) return error.message;
+
+  if (isTimeout(error)) {
+    return 'The login server took too long to respond. Check BEEZI_API_URL, then try again.';
+  }
 
   if (isNetwork(error)) {
     return 'Could not reach the Beezi server. Check your internet connection and try again.';
