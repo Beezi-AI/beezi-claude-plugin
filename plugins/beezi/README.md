@@ -2,7 +2,7 @@
 
 A Claude Code plugin that hooks into session lifecycle events (SessionStart, PostToolUse, SessionEnd) to collect and report token usage analytics for Beezi task branches. On session end it ships a summary — tokens consumed, tool calls made, and branch context — to the Beezi analytics endpoint so teams can track AI-assisted development cost and throughput per task.
 
-It also ships ticket drafting: the `create-ticket` skill (`skills/create-ticket/SKILL.md`) plus a `.mcp.json` connector to the Beezi MCP server. The skill is a thin launcher — the drafting workflow is served by the server via `get_drafting_instructions`, so it stays current without a plugin reinstall. The connector defaults to the production Beezi API; set `BEEZI_MCP_URL` to override.
+It also ships ticket drafting: the `create-ticket` skill (`skills/create-ticket/SKILL.md`) plus a `.mcp.json` stdio bridge (`scripts/mcp.mjs` → `lib/mcp-bridge.mjs`) that forwards MCP traffic to the Beezi server authenticated with the stored `/beezi:login` credentials — no separate MCP OAuth prompt. The skill is a thin launcher — the drafting workflow is served by the server via `get_drafting_instructions`, so it stays current without a plugin reinstall. The bridge defaults to the production Beezi API; set `BEEZI_MCP_URL` to override.
 
 ## Install
 

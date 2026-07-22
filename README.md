@@ -43,8 +43,9 @@ is tracked automatically; you don't need to run anything else.
 
 Ask Claude to draft or create a ticket — the bundled `create-ticket` skill connects to the
 Beezi server, drafts a ticket grounded in the repo you're working in, and creates it on
-your board (Jira / Azure DevOps) or in Beezi once you approve the draft. The first time,
-authorize the `beezi` connector when prompted (check `/mcp` if you don't see it).
+your board (Jira / Azure DevOps) or in Beezi once you approve the draft. Ticket drafting
+uses the same machine link as analytics — once you've run `/beezi:login`, there is
+nothing extra to authorize.
 
 ### Optional configuration
 

@@ -1,8 +1,8 @@
 {
     "mcpServers": {
         "beezi": {
-            "type": "http",
-            "url": "${BEEZI_MCP_URL:-https://beezi-api-prod.azurewebsites.net/api/mcp}"
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs"]
         }
     }
 }
