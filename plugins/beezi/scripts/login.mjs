@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { apiBase, OAUTH_SCOPES } from '../lib/config.mjs';
 import { discover, registerClient, pkcePair, exchangeCode } from '../lib/oauth.mjs';
-import { getCredentials, setCredentials } from '../lib/credentials.mjs';
+import { getCredentials, setCredentials, deleteCredentials } from '../lib/credentials.mjs';
 import { startLoopback } from '../lib/loopback.mjs';
 import { setMachineClientId } from '../lib/machine-identity.mjs';
 import { whoami } from '../lib/whoami.mjs';
@@ -59,7 +59,7 @@ async function bindClient(meta, existing, state) {
 async function run() {
   const base = apiBase();
 
-  const existing = await getCredentials().catch(() => null);
+  let existing = await getCredentials().catch(() => null);
   if (existing) {
     setMachineClientId(existing.client_id);
     const who = await whoami(existing.access_token, { base });
@@ -69,7 +69,13 @@ async function run() {
       console.log('  Nothing to do.\n');
       return;
     }
-    // Token invalid/revoked → fall through and re-link.
+    if (who && !who.valid) {
+      // Revoked link (e.g. unlinked from the portal): the registered client is
+      // likely deleted too — reusing it gets invalid_client. Start fresh.
+      await deleteCredentials().catch(() => {});
+      existing = null;
+    }
+    // whoami null (offline) → keep the stored client and try to reuse it.
   }
 
   console.log('\nBeezi analytics — link this machine\n');
@@ -110,6 +116,7 @@ async function run() {
     refresh_token: tokens.refresh_token,
     expires_at: Date.now() + (tokens.expires_in ?? 86_400) * 1000,
   });
+  setMachineClientId(clientId);
   console.log(`\n✓ Beezi analytics linked. Credentials stored in ${where}.`);
 }
 
