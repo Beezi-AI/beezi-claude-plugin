@@ -51,8 +51,8 @@ nothing extra to authorize.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BEEZI_API_URL` | `https://beezi-api-prod.azurewebsites.net/api` | Beezi API base URL. |
-| `BEEZI_MCP_URL` | `https://beezi-api-prod.azurewebsites.net/api/mcp` | Beezi server for ticket drafting. |
+| `BEEZI_API_URL` | `https://beezi-api-staging.azurewebsites.net/api` | Beezi API base URL. |
+| `BEEZI_MCP_URL` | `https://beezi-api-staging.azurewebsites.net/api/mcp` | Beezi server for ticket drafting. |
 | `BEEZI_HOME` | `~/.beezi` | Local state root (queue, cursors, credentials). |
 
 ## Claude on claude.ai — `beezi-web`

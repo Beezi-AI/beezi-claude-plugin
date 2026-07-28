@@ -129,12 +129,13 @@ test('1. no token → enqueues nothing, writes no state, fetch never called', as
 
 // ─── test 2: git failure → segment skipped, cursor still advances ────────────
 
-test('2. git failure per-cwd → segment skipped (no enqueue/flush), cursor still advances', async (t) => {
+test('2. git failure per-cwd → segment still tracked under a local: remote', async (t) => {
   const dir = makeTmpDir(t);
   setHome(dir);
 
   let fetchCalled = false;
-  const fetchImpl = async () => { fetchCalled = true; return { status: 200 }; };
+  // 503 keeps the queue file on disk so the payload can be inspected after the flush.
+  const fetchImpl = async () => { fetchCalled = true; return { status: 503 }; };
 
   const transcript = writeTranscript(dir, [
     assistantLine('feature/task-1', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:00.000Z'),
@@ -149,10 +150,12 @@ test('2. git failure per-cwd → segment skipped (no enqueue/flush), cursor stil
     },
   );
 
-  // Per-cwd remote resolution returns null on git failure → segment skipped,
-  // nothing enqueued and no fetch, but the cursor advances past the processed line.
-  assert.equal(readQueue(dir).length, 0, 'no queue files (remote unresolved → segment skipped)');
-  assert.equal(fetchCalled, false, 'fetch must not be called');
+  // Git being unavailable no longer loses the usage: the segment falls back to the cwd's
+  // folder name so the spend is still reported, and the cursor advances past the line.
+  const queued = readQueue(dir);
+  assert.equal(queued.length, 1, 'one queue file (git failure falls back to a local: remote)');
+  assert.equal(queued[0].payload.remote, `local:${path.basename(dir)}`);
+  assert.equal(fetchCalled, true, 'the fallback segment is flushed');
   const state = readState(dir, 'sess-2');
   assert.ok(state, 'state file must exist');
   assert.equal(state.cursor, 1, 'cursor advances even when the remote cannot be resolved');
@@ -628,7 +631,7 @@ test('16. reflog interleave within a repo → branch attributed by line timestam
 
 // ─── test 17: repo with no origin → its segment is skipped ──────────────────────
 
-test('17. repo without an origin remote → segment skipped, cursor still advances', async (t) => {
+test('17. repo without an origin remote → tracked under a local: remote', async (t) => {
   const dir = makeTmpDir(t);
   setHome(dir);
 
@@ -643,15 +646,19 @@ test('17. repo without an origin remote → segment skipped, cursor still advanc
     {
       getAccessToken: async () => 'tok',
       gitImpl: fakeGitByRoot({ '/repo/noorigin': { branch: 'feature/task-a', remote: null } }),
-      fetchImpl: async () => { fetchCalled = true; return { status: 200 }; },
+      // 503 keeps the queue file on disk so the payload can be inspected after the flush.
+      fetchImpl: async () => { fetchCalled = true; return { status: 503 }; },
     },
   );
 
-  assert.equal(readQueue(dir).length, 0, 'no queue file when origin cannot be resolved');
-  assert.equal(fetchCalled, false, 'fetch not called');
+  // A repo with no origin is named by its own folder, not dropped.
+  const queued = readQueue(dir);
+  assert.equal(queued.length, 1, 'one queue file when origin cannot be resolved');
+  assert.equal(queued[0].payload.remote, 'local:noorigin');
+  assert.equal(fetchCalled, true, 'fetch called');
   const state = readState(dir, 'sess-17');
   assert.ok(state, 'state file exists');
-  assert.equal(state.cursor, 1, 'cursor advanced past the skipped segment');
+  assert.equal(state.cursor, 1, 'cursor advanced past the segment');
 });
 
 // Realistic assistant message = 3 block-lines (thinking/text/tool_use) sharing id + usage.

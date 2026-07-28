@@ -35,6 +35,15 @@ function enqueue(payload) {
   writeJsonSecure(path.join(queueDir(), filename), payload);
 }
 
+// Stand-in "remote" for work with no git origin behind it — a directory that isn't a repo, or a
+// repo with no origin. Only the folder name travels, never the path around it, and the `local:`
+// prefix keeps it from ever canonicalizing onto a real remote server-side.
+function localRemote(dir) {
+  if (!dir) return null;
+  const name = path.basename(dir);
+  return name ? `local:${name}` : null;
+}
+
 // The machine's IANA timezone (e.g. Europe/Kyiv). Snapshotted per checkpoint so the server can
 // bucket this session's activity in the user's local time even if they later travel. Null when
 // the runtime can't resolve one — the field is then omitted from the payload.
@@ -126,7 +135,8 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const enqueueSegments = (segs, segmentScope, extra = null) => {
     for (const seg of segs) {
       if (seg.stats.token_total === 0 && seg.stats.duration_sec === 0) continue;
-      const remote = resolveRemote(seg.repoRoot);
+      const remote = resolveRemote(seg.repoRoot) ?? localRemote(seg.repoRoot ?? cwd);
+      // Nothing left to name the work by — only reachable when the session has no cwd either.
       if (!remote) continue;
       // A single write failure must not abort the window (which would leave the cursor
       // unadvanced and re-process everything forever) — skip that segment and continue.
