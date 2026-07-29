@@ -1,21 +1,30 @@
-// Gracefully drain undici's keep-alive pool before a forced exit. On Windows,
-// process.exit() while undici still holds its async handle trips the libuv
-// assertion (!(handle->flags & UV_HANDLE_CLOSING), async.c). close() releases
-// those handles first, then a setImmediate tick lets libuv run the sockets'
-// close callbacks so no handle is still mid-close when process.exit() forces
-// teardown. Falls back to plain exit if the internal dispatcher symbol ever
-// goes away. Deps are injectable for tests.
+// Never force a hook process to exit. On Windows, process.exit() tears the event loop down
+// while a handle is still mid-close, and libuv aborts the process:
+//   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76
+// The abort is what Claude Code reports as "Stop hook error" — the hook's work had already
+// finished and its stdout was already written, so nothing was actually broken except the
+// exit. Reproduced 4/4 with process.exit() and 0/4 without it, same workload.
+//
+// So: drain undici's keep-alive pool (that pool is the only thing that would otherwise hold
+// the loop open for keepAliveTimeout), record the exit code, and let the process end on its
+// own. The unref'd timer is a last resort for the case where some other handle stays open —
+// being unref'd, it can never keep the process alive itself, and force-exiting late still
+// beats blowing the hook's 10s budget. Deps are injectable for tests.
+const FORCE_EXIT_MS = 2000;
+
 export async function exitClean(code = 0, deps = {}) {
   const getDispatcher =
     deps.getDispatcher ?? (() => globalThis[Symbol.for('undici.globalDispatcher.1')]);
   const exit = deps.exit ?? ((c) => process.exit(c));
+  const setExitCode = deps.setExitCode ?? ((c) => { process.exitCode = c; });
+  const schedule = deps.schedule ?? ((fn, ms) => setTimeout(fn, ms).unref());
 
   const dispatcher = getDispatcher();
   if (dispatcher) {
     try { await dispatcher.close(); }
     catch { try { await dispatcher.destroy(); } catch { /* exit anyway */ } }
   }
-  // One loop tick so libuv flushes the closed sockets' async callbacks before the forced exit.
-  await new Promise((resolve) => setImmediate(resolve));
-  exit(code);
+
+  setExitCode(code);
+  schedule(() => exit(code), deps.forceExitAfterMs ?? FORCE_EXIT_MS);
 }
