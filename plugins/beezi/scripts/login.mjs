@@ -117,7 +117,14 @@ async function run() {
     expires_at: Date.now() + (tokens.expires_in ?? 86_400) * 1000,
   });
   setMachineClientId(clientId);
+  // The portal registers a machine from the X-Beezi-Host/Client headers that ride along on an
+  // authenticated request — it has no registration endpoint. Without a call here it keeps
+  // showing this machine as not connected until some later hook happens to fire, so make that
+  // first call now. Best-effort: the link itself is already stored and valid.
+  const who = await whoami(tokens.access_token, { base }).catch(() => null);
   console.log(`\n✓ Beezi analytics linked. Credentials stored in ${where}.`);
+  const account = who?.valid ? (who.name || who.email) : null;
+  if (account) console.log(`  Account: ${account}`);
 }
 
 // argv ('start'/'wait') is ignored: the PKCE flow is a single blocking command,

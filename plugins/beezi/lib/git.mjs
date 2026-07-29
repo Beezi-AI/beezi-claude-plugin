@@ -11,6 +11,9 @@ export function git(args, cwd) {
     // Bound the spawn so a hung git can't burn the whole 10s hook budget.
     timeout: 5000,
     killSignal: 'SIGKILL',
+    // Keep git's stderr off the user's terminal: every caller try/catches and reads a
+    // failure as "no signal", so a probe outside a repo is normal, not something to report.
+    stdio: ['ignore', 'pipe', 'ignore'],
     // Pin the C locale so parsed output (e.g. reflog "checkout: moving from…") stays
     // English regardless of the user's git language settings.
     env: { ...process.env, LC_ALL: 'C', LANG: 'C' },

@@ -4,11 +4,18 @@ import { apiOrigin, PROTECTED_RESOURCE_PATH } from './config.mjs';
 import { UserError } from './friendly-error.mjs';
 
 // Clerk development instances cold-start well past 5s; measured 5.6s–20s on first contact.
+// Only the interactive login commands can afford to wait that long.
 const TIMEOUT_MS = 15000;
 
-async function fetchWithTimeout(fetchImpl, url, init) {
+// Refresh runs inside hooks, which Claude Code kills at 10s (see hooks/hooks.json). The
+// refresh must therefore give up well inside that budget: a kill landing after the server
+// rotated the refresh token but before the replacement is persisted leaves the stored token
+// permanently dead, and every later refresh then reports a revoked grant.
+const REFRESH_TIMEOUT_MS = 7000;
+
+async function fetchWithTimeout(fetchImpl, url, init, timeoutMs = TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, { ...init, signal: controller.signal });
   } finally {
@@ -81,12 +88,12 @@ export async function registerClient(registrationEndpoint, redirectUri, deps = {
   return body.client_id;
 }
 
-async function postForm(fetchImpl, url, params) {
+async function postForm(fetchImpl, url, params, timeoutMs) {
   return fetchWithTimeout(fetchImpl, url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(params).toString(),
-  });
+  }, timeoutMs);
 }
 
 export async function exchangeCode({ tokenEndpoint, clientId, redirectUri, code, verifier }, deps = {}) {
@@ -111,12 +118,16 @@ export async function refreshTokens({ tokenEndpoint, clientId, refreshToken }, d
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: clientId,
-    });
+    }, deps.timeoutMs ?? REFRESH_TIMEOUT_MS);
     if (res.ok) return { tokens: await res.json() };
     if (res.status === 400 || res.status === 401) {
       let body = {};
       try { body = await res.json(); } catch { /* keep {} */ }
-      if (!body.error || body.error === 'invalid_grant' || body.error === 'invalid_client') {
+      // Only a named revocation counts. A 400/401 with no parseable `error` is far more
+      // often a proxy, captive portal or HTML error page than a revoked grant, and the
+      // caller's response to invalidGrant is to delete the credentials — too destructive
+      // to trigger on a body we could not read.
+      if (body.error === 'invalid_grant' || body.error === 'invalid_client') {
         return { invalidGrant: true };
       }
     }

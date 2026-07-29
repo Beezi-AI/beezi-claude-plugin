@@ -56,10 +56,13 @@ export async function getAccessToken(deps = {}) {
   if ((creds.expires_at ?? 0) - now() > SKEW_MS) return creds.access_token;
 
   if (!acquireLock()) {
-    // Another hook is refreshing; give it a beat, then use whatever it stored.
+    // Another hook is refreshing; give it a beat, then use what it stored — but only if it
+    // actually finished. Handing back the same expired token just produces a 401 downstream,
+    // and a 401 is read as a revoked link.
     await sleep(750);
     const again = await getCreds(deps).catch(() => null);
-    return again?.access_token ?? null;
+    if (again && (again.expires_at ?? 0) - now() > SKEW_MS) return again.access_token;
+    return null;
   }
   try {
     const r = await refresh(
@@ -70,7 +73,10 @@ export async function getAccessToken(deps = {}) {
       await deleteCreds(deps);
       return null;
     }
-    if (!r.tokens?.access_token) return creds.access_token; // transient — let the server 401 if truly dead
+    // Transient failure (network, timeout, unreadable error body). Report "no usable token"
+    // rather than returning the expired one: callers treat a 401 as a revoked link and drop
+    // the credentials, so a stale token turns a blip into a permanent logout.
+    if (!r.tokens?.access_token) return null;
     const next = {
       ...creds,
       access_token: r.tokens.access_token,

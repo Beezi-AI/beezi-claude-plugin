@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getAccessToken as _getAccessToken } from './token.mjs';
-import { deleteCredentials as _deleteCredentials } from './credentials.mjs';
 import { flushQueue } from './checkpoint.mjs';
 import { git as _git, resolveOriginRemote } from './git.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
@@ -87,9 +86,12 @@ async function announceRepo(cwd, token, fetchImpl, gitImpl) {
   } catch { return null; } // offline — silent
 }
 
-// Only an explicit revocation (whoami says invalid) should nuke the token.
-// Offline/unknown (null) is treated as valid so we never drop a token we can't check.
-async function isTokenRevoked(token, fetchImpl) {
+// whoami reports invalid for any 401/403, which covers an expired token and a permissions
+// or wrong-environment refusal as well as a genuine revocation — too coarse to delete on.
+// So this only decides what to *tell* the user; discarding credentials is left to the token
+// endpoint naming the grant revoked, or to the user re-running /beezi:login.
+// Offline/unknown (null) still reads as fine, so a check we couldn't run stays silent.
+async function isTokenRejected(token, fetchImpl) {
   const who = await whoami(token, { fetchImpl });
   return who?.valid === false;
 }
@@ -97,7 +99,6 @@ async function isTokenRevoked(token, fetchImpl) {
 // Returns an optional systemMessage string (or null). Never throws for expected failures.
 export async function runSessionStart(input, deps = {}) {
   const getAccessToken = deps.getAccessToken ?? _getAccessToken;
-  const deleteCredentials = deps.deleteCredentials ?? _deleteCredentials;
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
   const gitImpl = deps.gitImpl ?? _git;
   const detectBillingSource = deps.detectBillingSource ?? _detectBillingSource;
@@ -109,9 +110,8 @@ export async function runSessionStart(input, deps = {}) {
   if (!token)
     return '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Run /beezi:login to link it.';
 
-  if (await isTokenRevoked(token, fetchImpl)) {
-    try { await deleteCredentials(); } catch { /* best-effort */ }
-    return '⚠ Beezi: this machine’s link was revoked — analytics are NOT being tracked. Run /beezi:login to re-link.';
+  if (await isTokenRejected(token, fetchImpl)) {
+    return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Run /beezi:login to re-link.';
   }
 
   initSessionState(input.session_id, { cwd: input.cwd ?? null, transcriptPath: input.transcript_path ?? null });

@@ -247,7 +247,7 @@ test('10. getAccessToken throws → resolves to login reminder, no error escapes
 
 // ─── test 11: revoked token — whoami 401 → deletes token, warns ──────────────
 
-test('11. revoked token — whoami 401 → deletes token, returns revoked warning', async (t) => {
+test('11. rejected token — whoami 401 → warns but keeps the credentials', async (t) => {
   const dir = makeTmpDir(t);
   setHome(dir);
 
@@ -257,16 +257,19 @@ test('11. revoked token — whoami 401 → deletes token, returns revoked warnin
     return { ok: true, json: async () => ({ connected: false }) };
   };
 
-  const result = await runSessionStart(baseInput({ session_id: 'sess-revoked' }), {
+  const result = await runSessionStart(baseInput({ session_id: 'sess-rejected' }), {
     getAccessToken: async () => 'tok',
     deleteCredentials: async () => { deleted = true; },
     fetchImpl,
     gitImpl: fakeGit('https://host/repo.git'),
   });
 
-  assert.equal(result, '⚠ Beezi: this machine’s link was revoked — analytics are NOT being tracked. Run /beezi:login to re-link.');
-  assert.equal(deleted, true, 'revoked token must be deleted');
-  assert.equal(readStateFile(dir, 'sess-revoked'), null, 'no state file must be created for a revoked token');
+  assert.equal(result, '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Run /beezi:login to re-link.');
+  // A 401 here is equally an expired token, a permissions refusal, or a wrong-environment
+  // call — too coarse to unlink on. Only the token endpoint naming the grant revoked, or an
+  // explicit /beezi:login, may discard credentials.
+  assert.equal(deleted, false, 'a rejected whoami must not delete the credentials');
+  assert.equal(readStateFile(dir, 'sess-rejected'), null, 'no state file must be created for a rejected token');
 });
 
 // ─── stale-plan nudge helpers ────────────────────────────────────────────────

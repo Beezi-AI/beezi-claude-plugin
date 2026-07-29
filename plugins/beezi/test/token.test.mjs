@@ -65,14 +65,15 @@ test('invalid_grant wipes credentials and returns null', async (t) => {
   assert.equal(deleted, true);
 });
 
-test('transient refresh failure falls back to the stale token', async (t) => {
+test('transient refresh failure yields no token rather than the stale one', async (t) => {
   tmpHome(t);
   const token = await getAccessToken({
     getCredentials: async () => ({ ...FRESH }),
     refreshTokens: async () => ({ tokens: null }),
     now: () => 9_999_000,
   });
-  assert.equal(token, 'at');
+  // Handing back the expired token would 401 downstream, and a 401 reads as a revoked link.
+  assert.equal(token, null);
 });
 
 test('waits out a concurrent refresh instead of racing it', async (t) => {
@@ -80,11 +81,15 @@ test('waits out a concurrent refresh instead of racing it', async (t) => {
   fs.mkdirSync(path.join(dir, 'token-refresh.lock'), { recursive: true }); // someone holds the lock
   let reread = 0;
   const token = await getAccessToken({
-    getCredentials: async () => { reread += 1; return { ...FRESH }; },
+    getCredentials: async () => {
+      reread += 1;
+      // The second read sees what the lock holder finished storing.
+      return reread === 1 ? { ...FRESH } : { ...FRESH, access_token: 'at2', expires_at: 20_000_000 };
+    },
     refreshTokens: async () => { throw new Error('must not refresh under contention'); },
     now: () => 9_999_000,
     sleep: async () => {},
   });
-  assert.equal(token, 'at'); // second read's token
+  assert.equal(token, 'at2'); // the holder's refreshed token, not the expired one we read first
   assert.equal(reread, 2);
 });

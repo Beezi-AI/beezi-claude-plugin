@@ -1,6 +1,7 @@
+import path from 'node:path';
 import { getAccessToken } from '../lib/token.mjs';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
-import { git, resolveOriginRemote, currentBranch, taskFromBranch } from '../lib/git.mjs';
+import { currentBranch, taskFromBranch } from '../lib/git.mjs';
 import { resolveSessionTranscript } from '../lib/transcript.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 
@@ -12,24 +13,15 @@ function fail(message) {
 }
 
 async function main() {
-  let branch;
-  try {
-    branch = currentBranch(cwd);
-  } catch {
-    fail('Beezi: not a git repository — run this inside your project.');
-  }
-
-  // Every branch is worth tracking: task branches attribute to their ticket, the rest to the
-  // repository. `taskFromBranch` only decides the label we echo, never whether we report.
-  const task = taskFromBranch(branch);
-  const label = task ?? branch;
+  // Label only. The checkpoint attributes every segment from the transcript, so a cwd outside
+  // any repo — or a repo with no origin — is not a reason to refuse; those report under a
+  // `local:<folder>` remote like the automatic hooks do.
+  let branch = null;
+  try { branch = currentBranch(cwd); } catch { /* not a repo */ }
+  const label = taskFromBranch(branch) ?? branch ?? (path.basename(cwd) || cwd);
 
   const token = await getAccessToken().catch(() => null);
   if (!token) fail('Beezi: this machine is not linked. Run /beezi:login first.');
-
-  if (!resolveOriginRemote(git, cwd)) {
-    fail('Beezi: this repo has no "origin" remote. Nothing tracked.');
-  }
 
   const transcript = resolveSessionTranscript(cwd);
   if (!transcript) {
