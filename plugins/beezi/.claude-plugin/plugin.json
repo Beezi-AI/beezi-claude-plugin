@@ -1,6 +1,6 @@
 {
   "name": "beezi",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Reports Claude Code session token analytics for Beezi task branches, and drafts tickets to create on your board (Jira / Azure DevOps) or in Beezi.",
   "author": { "name": "Beezi" }
 }
