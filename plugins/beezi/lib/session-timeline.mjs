@@ -60,14 +60,34 @@ function isInterruptMarker(line) {
   );
 }
 
+// A finished subagent re-enters the main thread as a type:'user' line whose text opens with
+// '<task-notification>' — content is a plain string, not blocks, so the array-only scan used for
+// interrupts does not reach it. It is the agent being woken by its OWN subagent, never a human
+// typing: read as a turn-start it painted every subagent wait as waiting_user.
+const TASK_NOTIFICATION_PREFIX = '<task-notification>';
+function startsWithPrefix(content, prefix) {
+  if (typeof content === 'string') return content.trimStart().startsWith(prefix);
+  if (Array.isArray(content)) {
+    return content.some(
+      (b) => b?.type === 'text' && typeof b.text === 'string' && b.text.trimStart().startsWith(prefix),
+    );
+  }
+  return false;
+}
+function isTaskNotification(line) {
+  if (line?.type !== 'user') return false;
+  return startsWithPrefix(line.message?.content, TASK_NOTIFICATION_PREFIX);
+}
+
 // A genuine user turn-start, as opposed to a tool_result echo (Claude Code writes those as
-// type:'user' too), an interrupt marker, or an injected meta line. The gap BEFORE such a line is
-// time the agent spent waiting on the human.
+// type:'user' too), an interrupt marker, a subagent completion notification, or an injected meta
+// line. The gap BEFORE such a line is time the agent spent waiting on the human.
 function isRealUserPrompt(line) {
   if (line?.type !== 'user') return false;
   if (line.isMeta || line.isCompactSummary) return false;
   if (line.toolUseResult !== undefined) return false;
   if (isInterruptMarker(line)) return false;
+  if (isTaskNotification(line)) return false;
   const c = line.message?.content;
   if (typeof c === 'string') return c.trim().length > 0;
   if (Array.isArray(c)) {
@@ -91,7 +111,12 @@ function buildPeriods(lines) {
     if (line?.type === 'permission-mode') continue;
     const ms = tsOf(line);
     if (ms == null) continue;
-    anchors.push({ ts: ms, isPrompt: isRealUserPrompt(line), mode: currentMode });
+    anchors.push({
+      ts: ms,
+      isPrompt: isRealUserPrompt(line),
+      isTaskNotif: isTaskNotification(line),
+      mode: currentMode,
+    });
   }
   anchors.sort((a, b) => a.ts - b.ts);
 
@@ -101,10 +126,16 @@ function buildPeriods(lines) {
     const cur = anchors[i];
     if (cur.ts <= prev.ts) continue;
     let state;
+    // Waiting on the human always wins, at any duration — a prompt is a prompt whether the human
+    // answered in 5 seconds or came back after lunch.
     if (cur.isPrompt) state = STATE.WAITING_USER;
-    // `>=`, matching delta.mjs, which accrues a gap only while it is strictly under the threshold.
-    // With `>` an exactly-300s gap read as WORKING here but was dropped there.
-    else if (cur.ts - prev.ts >= IDLE_GAP_SEC * 1000) state = STATE.IDLE;
+    // A gap that ENDS at a subagent notification is the agent blocked on its own subagent, at any
+    // duration: background subagents hand back their tool_result in under a second, so the wait is
+    // not the tool_use→tool_result window, it is the stretch of main-thread silence that the
+    // notification breaks. The `>=` gap fallback matches delta.mjs, which accrues a gap only while
+    // it is strictly under the threshold. With `>` an exactly-300s gap read as WORKING here but was
+    // dropped there.
+    else if (cur.isTaskNotif || cur.ts - prev.ts >= IDLE_GAP_SEC * 1000) state = STATE.IDLE;
     else state = isPlanMode(cur.mode) ? STATE.PLANNING : STATE.WORKING;
 
     const last = merged[merged.length - 1];
@@ -183,11 +214,25 @@ function buildSubagents(transcriptPath, sessionId) {
   return out;
 }
 
+// Drop everything before the first real user prompt. Claude Code opens every transcript with the
+// SessionStart hook attachments, stamped the moment the session appears — and `/clear` opens a
+// fresh transcript in a terminal the human may not touch again for ten minutes. Charting from
+// there dates the session to when the terminal was cleared and bills the whole pre-prompt gap as
+// waiting_user. The session starts when the human first speaks. A transcript with no prompt at all
+// (cleared, then abandoned) has nothing to chart — null, and the caller reports no timeline.
+function dropLeadIn(lines) {
+  const first = lines.findIndex(isRealUserPrompt);
+  return first === -1 ? null : lines.slice(first);
+}
+
 // Derive the whole session timeline from the transcript. Returns null when there's nothing to
-// place on a time axis (no timestamped lines). generated_at stamps when it was computed.
+// place on a time axis (no user prompt, or no timestamped lines). generated_at stamps when it was
+// computed.
 export function computeSessionTimeline(transcriptPath, sessionId) {
   let lines;
   try { lines = parseTranscript(transcriptPath); } catch { return null; }
+  lines = dropLeadIn(lines);
+  if (lines === null) return null;
 
   const periods = buildPeriods(lines);
   const plan_events = buildPlanEvents(lines);

@@ -172,6 +172,7 @@ test('emits one plan_start/plan_ready pair per plan cycle, ordered', (t) => {
   const dir = makeTmpDir(t);
   const transcriptPath = path.join(dir, 'cycles.jsonl');
   writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
     { type: 'permission-mode', permissionMode: 'plan' },
     { type: 'assistant', message: { content: [{ type: 'text', text: 'a' }] }, timestamp: ts(10) },
     { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'p1', name: 'ExitPlanMode', input: {} }] }, timestamp: ts(20) },
@@ -194,6 +195,7 @@ test('plan mode with no ExitPlanMode yields a lone plan_start', (t) => {
   const dir = makeTmpDir(t);
   const transcriptPath = path.join(dir, 'cancelled.jsonl');
   writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
     { type: 'permission-mode', permissionMode: 'plan' },
     { type: 'assistant', message: { content: [{ type: 'text', text: 'planning' }] }, timestamp: ts(15) },
     { type: 'permission-mode', permissionMode: 'default' },
@@ -201,6 +203,67 @@ test('plan mode with no ExitPlanMode yields a lone plan_start', (t) => {
   ]);
   const tl = computeSessionTimeline(transcriptPath, 'cancelled');
   assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: ts(15) }]);
+});
+
+test('the pre-prompt lead-in is dropped — the session starts when the human first speaks', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'clear.jsonl');
+  writeJsonl(transcriptPath, [
+    // /clear opens a fresh transcript and the SessionStart hook attachments land at once...
+    { type: 'attachment', attachment: { type: 'hook_success' }, timestamp: ts(0) },
+    { type: 'attachment', attachment: { type: 'hook_additional_context' }, timestamp: ts(2) },
+    // ...then the terminal sits untouched for ten minutes before the human types.
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(600) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(610) },
+  ]);
+  const tl = computeSessionTimeline(transcriptPath, 'clear');
+
+  assert.equal(tl.started_at, ts(600), 'the axis starts at the prompt, not at the clear');
+  assert.deepEqual(tl.periods, [{ state: 'working', started_at: ts(600), ended_at: ts(610) }]);
+});
+
+test('a transcript with no user prompt yields null (cleared, then abandoned)', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'abandoned.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'attachment', attachment: { type: 'hook_success' }, timestamp: ts(0) },
+    { type: 'attachment', attachment: { type: 'hook_additional_context' }, timestamp: ts(2) },
+  ]);
+  assert.equal(computeSessionTimeline(transcriptPath, 'abandoned'), null);
+});
+
+test('waiting on a subagent is idle, not waiting_user, at any duration', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'subagent-wait.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'a1', name: 'Agent', input: {} }] }, timestamp: ts(10) },
+    // A background subagent hands its tool_result back at once — this is not where the agent waits.
+    { type: 'user', toolUseResult: {}, message: { content: [{ type: 'tool_result', content: 'started' }] }, timestamp: ts(11) },
+    // 100s of main-thread silence, broken by the subagent's completion notification. Under the 300s
+    // idle threshold, so only the notification itself can classify this as idle.
+    { type: 'user', message: { content: '<task-notification>\n<task-id>x</task-id>\n' }, timestamp: ts(111) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'read the report' }] }, timestamp: ts(120) },
+  ]);
+  const tl = computeSessionTimeline(transcriptPath, 'subagent-wait');
+
+  assert.ok(!tl.periods.some((p) => p.state === 'waiting_user'), 'a subagent is not a human');
+  const idle = tl.periods.filter((p) => p.state === 'idle');
+  assert.equal(idle.length, 1);
+  assert.deepEqual([idle[0].started_at, idle[0].ended_at], [ts(11), ts(111)]);
+});
+
+test('a block-shaped task notification is recognised too', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'notif-blocks.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'spawning' }] }, timestamp: ts(10) },
+    { type: 'user', message: { content: [{ type: 'text', text: '<task-notification>\n<task-id>x</task-id>' }] }, timestamp: ts(60) },
+  ]);
+  const tl = computeSessionTimeline(transcriptPath, 'notif-blocks');
+  assert.ok(!tl.periods.some((p) => p.state === 'waiting_user'));
+  assert.ok(tl.periods.some((p) => p.state === 'idle'));
 });
 
 test('empty transcript yields null (nothing to place on the axis)', (t) => {
