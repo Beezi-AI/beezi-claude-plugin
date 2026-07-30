@@ -129,7 +129,11 @@ export function createBridge(deps = {}) {
 
   async function serverErrorMessage(res) {
     try {
-      const message = (await res.json())?.error?.message;
+      const body = await res.json();
+      // JSON-RPC errors nest under `error`; the portal's HTTP errors put the sentence at the
+      // top level with `error` holding only the status name ("Forbidden"). Read both, so a
+      // plan or permission refusal reaches the user in the server's own words.
+      const message = body?.error?.message ?? (typeof body?.message === 'string' ? body.message : null);
       if (message) return `Beezi MCP error: ${message}`;
     } catch {
       /* non-JSON body */
@@ -139,7 +143,7 @@ export function createBridge(deps = {}) {
 
   async function handleMessage(msg) {
     const ids = requestIds(msg);
-    const token = await getToken();
+    let token = await getToken();
     if (!token) {
       ids.forEach((id) => errorResponse(id, NOT_LINKED_MESSAGE));
       return;
@@ -154,12 +158,31 @@ export function createBridge(deps = {}) {
         await reinitialize(token);
         res = await post(msg, token);
       }
+      // A 401 is the server telling us the token is dead — better evidence than the expires_at
+      // we estimated locally, which is a pure guess when the token response omits expires_in.
+      // Renew once on its word and retry, so a short-lived token doesn't strand the whole
+      // MCP server until the user re-links by hand.
+      if (res.status === 401) {
+        const refreshed = await getToken({}, { forceRefresh: true }).catch(() => null);
+        if (refreshed && refreshed !== token) {
+          token = refreshed;
+          res = await post(msg, token);
+        }
+      }
       if (res.ok) {
         await emit(res);
         return;
       }
-      if (res.status === 401 || res.status === 403) {
+      if (res.status === 401) {
         ids.forEach((id) => errorResponse(id, REJECTED_MESSAGE));
+        return;
+      }
+      // 403 is authenticated-but-not-permitted: the account lacks access to this feature, and
+      // no token can change that. Sending the user to /beezi:login (as a shared 401/403 branch
+      // did) is advice that cannot work, so report what the server actually said.
+      if (res.status === 403) {
+        const forbidden = await serverErrorMessage(res);
+        ids.forEach((id) => errorResponse(id, forbidden));
         return;
       }
       const message = await serverErrorMessage(res);

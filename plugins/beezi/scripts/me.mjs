@@ -9,7 +9,13 @@ async function main() {
     return;
   }
 
-  const who = await whoami(token);
+  let who = await whoami(token);
+  if (who && !who.valid) {
+    // A 401 means the server considers the token dead, whatever our own expires_at estimate
+    // said. Refresh once on its word before reporting the link as gone.
+    const refreshed = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
+    if (refreshed) who = await whoami(refreshed);
+  }
   if (who === null) {
     console.log('Beezi: could not reach the server to check your link. Check your connection and try again.');
     return;

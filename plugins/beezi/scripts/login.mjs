@@ -114,7 +114,10 @@ async function run() {
     token_endpoint: meta.tokenEndpoint,
     access_token: tokens.access_token,
     refresh_token: tokens.refresh_token,
-    expires_at: Date.now() + (tokens.expires_in ?? 86_400) * 1000,
+    // Underestimate when the server omits expires_in — see DEFAULT_EXPIRES_IN_S in lib/token.mjs.
+    // Guessing long parks a dead token in the keychain for the whole difference, and nothing
+    // refreshes it because expires_at still reads healthy.
+    expires_at: Date.now() + (tokens.expires_in ?? 3_600) * 1000,
   });
   setMachineClientId(clientId);
   // The portal registers a machine from the X-Beezi-Host/Client headers that ride along on an

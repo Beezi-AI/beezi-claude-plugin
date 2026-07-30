@@ -288,7 +288,19 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 // failed = transient (5xx/network, file kept for retry).
 export async function flushQueue(token, deps = {}) {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const getAccessToken = deps.getAccessToken ?? _getAccessToken;
   const result = { flushed: 0, rejected: 0, failed: 0, lastError: null };
+  // A 401 is authentication, not a verdict on the payload, so it must not count as a permanent
+  // rejection — that would delete queued analytics that were never actually refused. Renew once
+  // for the whole flush and retry; if renewal fails, keep every file for the next attempt.
+  let renewed = false;
+  const renewToken = async () => {
+    if (renewed) return null;
+    renewed = true;
+    const next = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
+    if (next && next !== token) { token = next; return next; }
+    return null;
+  };
 
   const dir = queueDir();
   const reportUrl = `${apiBase()}${ENDPOINTS.sessionsReport}`;
@@ -306,10 +318,20 @@ export async function flushQueue(token, deps = {}) {
     if (payload == null) continue;
 
     try {
-      const res = await postJson(reportUrl, token, payload, { fetchImpl });
+      let res = await postJson(reportUrl, token, payload, { fetchImpl });
+      // 401 only: a 403 is authenticated-but-not-permitted, which no new token resolves.
+      if (res.status === 401) {
+        const next = await renewToken();
+        if (next) res = await postJson(reportUrl, next, payload, { fetchImpl });
+      }
       if (res.status >= 200 && res.status < 300) {
         result.flushed += 1;
         fs.unlinkSync(filePath);
+      } else if (res.status === 401) {
+        // Still unauthenticated after a renewal attempt — keep the file; the payload was
+        // never judged, and re-linking should let it through later.
+        result.failed += 1;
+        result.lastError = `HTTP ${res.status}`;
       } else if (res.status < 500) {
         // Permanent rejection — drop the file, but remember why.
         result.rejected += 1;

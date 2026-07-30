@@ -111,7 +111,15 @@ export async function runSessionStart(input, deps = {}) {
     return '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Run /beezi:login to link it.';
 
   if (await isTokenRejected(token, fetchImpl)) {
-    return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Run /beezi:login to re-link.';
+    // The 401 is the server's verdict on the token; expires_at was only ours, and a server that
+    // omits expires_in leaves it a guess. Take the server's word and refresh once before
+    // declaring the link bad — otherwise a token that died earlier than we estimated is never
+    // renewed, and every session reports a rejection that a single refresh would have fixed.
+    const refreshed = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
+    if (!refreshed || await isTokenRejected(refreshed, fetchImpl)) {
+      return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Run /beezi:login to re-link.';
+    }
+    token = refreshed;
   }
 
   initSessionState(input.session_id, { cwd: input.cwd ?? null, transcriptPath: input.transcript_path ?? null });
