@@ -993,6 +993,133 @@ test('21. per-agent cursor — second run only processes new subagent lines', as
   assert.equal(readState(dir, 'sess-21').agentCursors['agent-abc123'], 2, 'agent cursor advanced');
 });
 
+// ─── parallel subagents: reported time is the union, not the sum ─────────────
+
+test('25. parallel subagents overlapping the main thread bill only uncovered wall clock', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  // Main thread is anchored across the whole 10:00:00 → 10:04:00 window (240s of active time).
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'claude-fable-5', usage, '2024-01-01T10:00:00.000Z'),
+    assistantLine('main', 'claude-fable-5', usage, '2024-01-01T10:02:00.000Z'),
+    assistantLine('main', 'claude-fable-5', usage, '2024-01-01T10:04:00.000Z'),
+  ]);
+  // Two agents run concurrently inside that window: 10:00:30–10:03:30 and 10:01:00–10:02:00.
+  writeSubagentTranscript(dir, 'sess-22', 'agent-aaa', [
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:00:30.000Z'),
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:03:30.000Z'),
+  ]);
+  writeSubagentTranscript(dir, 'sess-22', 'agent-bbb', [
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:01:00.000Z'),
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:02:00.000Z'),
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-22', transcript_path: transcript, cwd: dir },
+    {
+      getAccessToken: async () => 'tok',
+      gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'),
+      fetchImpl: fakeFetch(503), // keep queue files so we can inspect them
+    },
+  );
+
+  const items = readQueue(dir);
+  assert.equal(items.length, 3, 'main segment + two subagent segments');
+
+  const main = items.find(i => i.payload.segmentId === 'sess-22:1-3');
+  assert.equal(main.payload.duration_sec, 240, 'main thread keeps its full span');
+
+  const aaa = items.find(i => i.payload.agent_id === 'agent-aaa');
+  const bbb = items.find(i => i.payload.agent_id === 'agent-bbb');
+  assert.equal(aaa.payload.duration_sec, 0, 'agent-aaa runs entirely inside the main span');
+  assert.equal(bbb.payload.duration_sec, 0, 'agent-bbb runs entirely inside the main span');
+  assert.ok(aaa.payload.token_total > 0, 'subagent tokens are still reported in full');
+  assert.ok(bbb.payload.token_total > 0);
+
+  const billed = items.reduce((acc, i) => acc + i.payload.duration_sec, 0);
+  assert.equal(billed, 240, 'SUM(duration_sec) equals wall clock, not 240+180+60=480');
+
+  const state = readState(dir, 'sess-22');
+  assert.deepEqual(
+    state.coveredIntervals,
+    [[Date.parse('2024-01-01T10:00:00.000Z'), Date.parse('2024-01-01T10:04:00.000Z')]],
+    'coverage persisted as one merged interval',
+  );
+});
+
+test('26. a subagent outliving the main span bills the uncovered tail', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  // Main is only anchored for its first 60s; the agent keeps working past that.
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'claude-fable-5', usage, '2024-01-01T10:00:00.000Z'),
+    assistantLine('main', 'claude-fable-5', usage, '2024-01-01T10:01:00.000Z'),
+  ]);
+  writeSubagentTranscript(dir, 'sess-23', 'agent-long', [
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:00:30.000Z'),
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:03:00.000Z'),
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-23', transcript_path: transcript, cwd: dir },
+    {
+      getAccessToken: async () => 'tok',
+      gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'),
+      fetchImpl: fakeFetch(503),
+    },
+  );
+
+  const items = readQueue(dir);
+  const main = items.find(i => !i.payload.is_subagent);
+  const agent = items.find(i => i.payload.is_subagent);
+  assert.equal(main.payload.duration_sec, 60);
+  assert.equal(agent.payload.duration_sec, 120, 'only 10:01:00 → 10:03:00 is uncovered');
+  assert.equal(
+    items.reduce((acc, i) => acc + i.payload.duration_sec, 0),
+    180,
+    'union spans 10:00:00 → 10:03:00',
+  );
+});
+
+test('27. coverage persists across checkpoints — a late subagent window is not re-billed', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'claude-fable-5', usage, '2024-01-01T10:00:00.000Z'),
+    assistantLine('main', 'claude-fable-5', usage, '2024-01-01T10:02:00.000Z'),
+  ]);
+
+  const captured = [];
+  const deps = {
+    getAccessToken: async () => 'tok',
+    gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'),
+    fetchImpl: async (_url, opts) => { captured.push(JSON.parse(opts.body)); return { status: 200 }; },
+  };
+
+  // Checkpoint 1: main only — the agent transcript does not exist on disk yet.
+  await runCheckpoint({ session_id: 'sess-24', transcript_path: transcript, cwd: dir }, deps);
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].duration_sec, 120);
+
+  // Checkpoint 2: the agent's transcript lands, covering minutes already billed by the main thread.
+  writeSubagentTranscript(dir, 'sess-24', 'agent-late', [
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:00:30.000Z'),
+    assistantLine('main', 'claude-sonnet-5', usage, '2024-01-01T10:01:30.000Z'),
+  ]);
+  await runCheckpoint({ session_id: 'sess-24', transcript_path: transcript, cwd: dir }, deps);
+
+  assert.equal(captured.length, 2, 'the late subagent window is still reported');
+  assert.equal(captured[1].is_subagent, true);
+  assert.equal(captured[1].duration_sec, 0, 'its minutes were already claimed in the previous run');
+  assert.ok(captured[1].token_total > 0, 'its tokens still count');
+});
+
 // ─── session cwd/transcript recorded in state (cwd-change recovery) ──────────
 
 test('22. checkpoint records cwd + transcriptPath in session state, tracking cwd changes', async (t) => {

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { extractPathSignal } from './repo-timeline.mjs';
 import { computeCodeChanges } from './code-changes.mjs';
 import { computeOperations } from './operations.mjs';
+import { buildActiveIntervals, totalMs } from './active-time.mjs';
 
 // Gaps longer than this between two activity lines count as idle, not active time. Exported so the
 // session-timeline derivation classifies "working" against the exact same threshold.
@@ -71,12 +72,16 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
 
   const closeRun = () => {
     if (run) {
+      const activeIntervals = buildActiveIntervals(run.timestamps, IDLE_GAP_SEC * 1000);
       segments.push({
         repoRoot: run.repoRoot,
         branch: run.branch,
         fromLine: run.fromLine,
         toLine: run.toLine,
-        stats: summarize(run.models, run.timestamps, run.lines),
+        // Deliberately outside `stats` (which is spread wholesale into the report payload): the
+        // intervals feed the caller's cross-transcript union, they are not a reported field.
+        activeIntervals,
+        stats: summarize(run.models, run.timestamps, run.lines, activeIntervals),
       });
       run = null;
     }
@@ -139,13 +144,11 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   return { nextCursor: Math.max(fromLine, raw.length), segments, rateLimitEvents };
 }
 
-function summarize(models, timestamps, lines) {
+function summarize(models, timestamps, lines, activeIntervals) {
   timestamps.sort((a, z) => a - z);
-  let activeMs = 0;
-  for (let i = 1; i < timestamps.length; i++) {
-    const gap = timestamps[i] - timestamps[i - 1];
-    if (gap > 0 && gap < IDLE_GAP_SEC * 1000) activeMs += gap;
-  }
+  // Segment-local active time. The caller subtracts whatever an earlier transcript already
+  // claimed before this reaches the wire — see checkpoint.mjs.
+  const activeMs = totalMs(activeIntervals);
   const totals = Object.values(models).reduce((acc, m) => ({
     token_input: acc.token_input + m.token_input,
     token_output: acc.token_output + m.token_output,

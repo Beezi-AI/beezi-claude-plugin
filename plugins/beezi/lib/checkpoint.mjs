@@ -15,6 +15,7 @@ import { readBillingConfig, subscriptionReportFields, thirdPartyReportFields } f
 import { resolveSessionName } from './session-name.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { listSubagentTranscripts, buildTaskDescriptionMap } from './subagents.mjs';
+import { claimIntervals, mergeIntervals, subtractIntervals, totalMs } from './active-time.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 
 function loadState(id) {
@@ -132,9 +133,27 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // The last enqueued payload becomes the "anchor" we can replay to push a later rename.
   let lastPayload = null;
   const timezone = detectTimezone();
+
+  // Wall clock already billed for this session, as merged [startMs, endMs) intervals. The main
+  // transcript and every subagent transcript cover the SAME stretch of clock — the parent blocks on
+  // the Task tool_use while its agents run, and parallel agents overlap each other — so a segment
+  // may only bill the part no earlier segment claimed. Summing them instead multiplied a session's
+  // reported time by roughly (1 + number of parallel agents). Persisted across checkpoints because
+  // a subagent's lines can land in a later window than the main lines covering the same minutes.
+  let covered = mergeIntervals(Array.isArray(state.coveredIntervals) ? state.coveredIntervals : []);
+  let coveredDirty = false;
+
   const enqueueSegments = (segs, segmentScope, extra = null) => {
     for (const seg of segs) {
-      if (seg.stats.token_total === 0 && seg.stats.duration_sec === 0) continue;
+      // Main-transcript segments run through here first and so keep their full span; subagents bill
+      // only the residual. Deterministic, and it puts the time on the thread that was blocked for
+      // the whole fan-out. A computeDelta without interval tracking (an injected double) keeps its
+      // own scalar rather than silently zeroing.
+      const intervals = Array.isArray(seg.activeIntervals) ? seg.activeIntervals : null;
+      const durationSec = intervals
+        ? Math.round(totalMs(subtractIntervals(intervals, covered)) / 1000)
+        : seg.stats.duration_sec;
+      if (seg.stats.token_total === 0 && durationSec === 0) continue;
       const remote = resolveRemote(seg.repoRoot) ?? localRemote(seg.repoRoot ?? cwd);
       // Nothing left to name the work by — only reachable when the session has no cwd either.
       if (!remote) continue;
@@ -155,8 +174,15 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           ...(timezone ? { timezone } : {}),
           ...(extra || {}),
           ...seg.stats,
+          duration_sec: durationSec,
         };
         enqueue(payload);
+        // Claim only what actually reached the queue: a failed write must not swallow the window
+        // for every later segment too.
+        if (intervals?.length) {
+          covered = claimIntervals(covered, intervals);
+          coveredDirty = true;
+        }
         lastPayload = payload;
         enqueued += 1;
       } catch { /* keep going; the cursor still advances below */ }
@@ -260,6 +286,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   }
   if (agentCursorsDirty) {
     state.agentCursors = agentCursors;
+    stateDirty = true;
+  }
+  if (coveredDirty) {
+    state.coveredIntervals = covered;
     stateDirty = true;
   }
   // Remember where this session lives. The session's cwd drifts (cd, worktree switches)

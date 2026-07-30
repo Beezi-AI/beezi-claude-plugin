@@ -102,7 +102,9 @@ function buildPeriods(lines) {
     if (cur.ts <= prev.ts) continue;
     let state;
     if (cur.isPrompt) state = STATE.WAITING_USER;
-    else if (cur.ts - prev.ts > IDLE_GAP_SEC * 1000) state = STATE.IDLE;
+    // `>=`, matching delta.mjs, which accrues a gap only while it is strictly under the threshold.
+    // With `>` an exactly-300s gap read as WORKING here but was dropped there.
+    else if (cur.ts - prev.ts >= IDLE_GAP_SEC * 1000) state = STATE.IDLE;
     else state = isPlanMode(cur.mode) ? STATE.PLANNING : STATE.WORKING;
 
     const last = merged[merged.length - 1];
