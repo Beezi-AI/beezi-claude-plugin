@@ -21,7 +21,7 @@ const deps = (over = {}) => ({
 test('POSTs to /sessions/errors with bearer auth and full payload', async () => {
   const { calls, fetchImpl } = captureFetch(200);
   const res = await reportSessionError(
-    { session_id: 's1', error_type: 'rate_limit', transcript_path: '/t.jsonl' },
+    { session_id: 's1', error: 'rate_limit', transcript_path: '/t.jsonl' },
     deps({
       fetchImpl,
       readFile: () =>
@@ -47,10 +47,44 @@ test('POSTs to /sessions/errors with bearer auth and full payload', async () => 
   });
 });
 
+test('reports a real StopFailure billing payload, stamped from the transcript line', async () => {
+  const { calls, fetchImpl } = captureFetch(200);
+  const res = await reportSessionError(
+    {
+      session_id: 's1',
+      error: 'billing_error',
+      error_details: 'Your credit balance is too low to access the Anthropic API.',
+      last_assistant_message: 'Credit balance is too low',
+      transcript_path: '/t.jsonl',
+    },
+    deps({
+      fetchImpl,
+      readFile: () =>
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-07-31T18:44:50.690Z',
+          isApiErrorMessage: true,
+          error: 'billing_error',
+          apiErrorStatus: 400,
+          message: { content: [{ type: 'text', text: 'Credit balance is too low' }] },
+        }),
+    }),
+  );
+
+  assert.equal(res.reported, true);
+  assert.deepEqual(JSON.parse(calls[0].opts.body), {
+    sessionId: 's1',
+    error: 'billing_error',
+    errorDetails: 'Your credit balance is too low to access the Anthropic API.',
+    lastAssistantMessage: 'Credit balance is too low',
+    occurredAt: '2026-07-31T18:44:50.690Z',
+  });
+});
+
 test('bails without a token (no fetch)', async () => {
   const { calls, fetchImpl } = captureFetch();
   const res = await reportSessionError(
-    { session_id: 's1', error_type: 'rate_limit' },
+    { session_id: 's1', error: 'rate_limit' },
     deps({ fetchImpl, getAccessToken: async () => null }),
   );
   assert.equal(res.reported, false);
@@ -58,21 +92,22 @@ test('bails without a token (no fetch)', async () => {
   assert.equal(calls.length, 0);
 });
 
-test('bails on missing session_id / error_type (no fetch)', async () => {
+test('bails on missing session_id / error (no fetch)', async () => {
   const { calls, fetchImpl } = captureFetch();
-  const res = await reportSessionError({ error_type: 'rate_limit' }, deps({ fetchImpl }));
+  const res = await reportSessionError({ error: 'rate_limit' }, deps({ fetchImpl }));
   assert.equal(res.reported, false);
   assert.equal(calls.length, 0);
 });
 
 test('readErrorContext returns nulls when transcript is missing/unreadable', () => {
-  assert.deepEqual(readErrorContext(null), { lastAssistantMessage: null, errorDetails: null });
+  const empty = { lastAssistantMessage: null, errorDetails: null, occurredAt: null };
+  assert.deepEqual(readErrorContext(null), empty);
   assert.deepEqual(
     readErrorContext('/nope.jsonl', {
       readFile: () => {
         throw new Error('enoent');
       },
     }),
-    { lastAssistantMessage: null, errorDetails: null },
+    empty,
   );
 });

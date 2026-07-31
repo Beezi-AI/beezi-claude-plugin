@@ -703,7 +703,7 @@ test('18. realistic multi-line messages across two windows attribute per repo (C
   assert.notEqual(captured[0].segmentId, captured[1].segmentId, 'disjoint segmentIds across windows');
 });
 
-test('reports rate-limit events to /sessions/errors', async (t) => {
+test('reports api-error events to /sessions/errors', async (t) => {
   const dir = makeTmpDir(t);
   setHome(dir);
   const file = writeTranscript(dir, [
@@ -715,8 +715,8 @@ test('reports rate-limit events to /sessions/errors', async (t) => {
   const computeDelta = () => ({
     nextCursor: 1,
     segments: [],
-    rateLimitEvents: [
-      { text: "You've hit your session limit · resets 4:30pm (Europe/Kiev)", occurredAt: '2026-07-08T10:00:00.000Z', lineNo: 1 },
+    apiErrorEvents: [
+      { error: 'rate_limit', text: "You've hit your session limit · resets 4:30pm (Europe/Kiev)", occurredAt: '2026-07-08T10:00:00.000Z', lineNo: 1 },
     ],
   });
 

@@ -127,7 +127,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   } catch {
     return { enqueued: 0, flush: null };
   }
-  const { nextCursor, segments, rateLimitEvents = [] } = delta;
+  const { nextCursor, segments, apiErrorEvents = [] } = delta;
 
   let enqueued = 0;
   // The last enqueued payload becomes the "anchor" we can replay to push a later rename.
@@ -212,19 +212,24 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       agent_name: toolUseId ? (taskDescriptions.get(toolUseId) ?? null) : null,
       spawn_depth: spawnDepth,
     });
+    // A subagent that dies on an API error never ends the main turn, so no StopFailure fires
+    // for it — its transcript is the only place that failure is recorded.
+    apiErrorEvents.push(...(agentDelta.apiErrorEvents ?? []));
     if (agentDelta.nextCursor !== agentFrom) {
       agentCursors[agentId] = agentDelta.nextCursor;
       agentCursorsDirty = true;
     }
   }
 
-  // postSessionError swallows its own failures (never rejects), so a limit-report
-  // problem can't break the checkpoint — no wrapper needed.
-  for (const event of rateLimitEvents) {
+  // postSessionError swallows its own failures (never rejects), so an error-report
+  // problem can't break the checkpoint — no wrapper needed. This is also the safety net for
+  // a StopFailure hook that never fired: the server keys on session+error+minute and both
+  // paths stamp the transcript line's timestamp, so the two collapse onto one row.
+  for (const event of apiErrorEvents) {
     await postSessionError(
       {
         sessionId: session_id,
-        error: 'rate_limit',
+        error: event.error,
         errorDetails: null,
         lastAssistantMessage: event.text,
         occurredAt: event.occurredAt ?? new Date().toISOString(),

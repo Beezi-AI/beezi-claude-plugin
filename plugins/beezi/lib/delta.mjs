@@ -20,6 +20,15 @@ function messageText(message) {
   return null;
 }
 
+// Errors Claude Code retries on its own, using its own classification (the explicit flag, plus
+// overloaded/server_error). Reporting these would bury the durable failures — no credits, auth
+// revoked, rate limit — that a team actually needs to see.
+function isTransientApiError(line) {
+  return line.apiErrorIsTransient === true
+    || line.error === 'overloaded'
+    || line.error === 'server_error';
+}
+
 // Attribute each new transcript line to (repoRoot, branch): repo from tool-path signals,
 // branch from the injected branchAt (per-repo reflog in production). Split the window into
 // contiguous same-(repo, branch) runs; each maximal run is one segment with a disjoint
@@ -66,7 +75,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
 
   const countedMessages = new Set();
   const segments = [];
-  const rateLimitEvents = [];
+  const apiErrorEvents = [];
   let run = null;
   let activeRoot = cwd != null ? repoRootOf(cwd) : null;
 
@@ -114,8 +123,13 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     run.lines.push(line);
     if (ms != null) run.timestamps.push(ms);
 
-    if (line.isApiErrorMessage === true && (line.error === 'rate_limit' || line.apiErrorStatus === 429)) {
-      rateLimitEvents.push({
+    // Every API error the turn hit, not just rate limits: `line.error` carries the code
+    // (rate_limit, billing_error, authentication_failed…); a 429 without one is a rate limit.
+    if (line.isApiErrorMessage === true && !isTransientApiError(line)) {
+      apiErrorEvents.push({
+        error: typeof line.error === 'string'
+          ? line.error
+          : (line.apiErrorStatus === 429 ? 'rate_limit' : 'unknown'),
         text: messageText(line.message),
         occurredAt: line.timestamp ?? null,
         lineNo,
@@ -141,7 +155,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     }
   }
   closeRun();
-  return { nextCursor: Math.max(fromLine, raw.length), segments, rateLimitEvents };
+  return { nextCursor: Math.max(fromLine, raw.length), segments, apiErrorEvents };
 }
 
 function summarize(models, timestamps, lines, activeIntervals) {

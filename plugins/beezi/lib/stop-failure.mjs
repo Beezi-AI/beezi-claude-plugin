@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import { getAccessToken } from './token.mjs';
 import { postSessionError } from './session-error-report.mjs';
 
-// Best-effort: pull the last assistant message text and any API-error detail from the
-// transcript tail. The StopFailure error_type is the reliable signal; these are extra context.
+// Best-effort: pull the last assistant message text, any API-error detail, and the error line's
+// own timestamp from the transcript tail. The StopFailure `error` code is the reliable signal;
+// these fill in whatever the hook payload didn't carry.
 export function readErrorContext(transcriptPath, deps = {}) {
   const readFile = deps.readFile ?? ((p) => fs.readFileSync(p, 'utf-8'));
-  const empty = { lastAssistantMessage: null, errorDetails: null };
+  const empty = { lastAssistantMessage: null, errorDetails: null, occurredAt: null };
   if (!transcriptPath) return empty;
 
   let content;
@@ -21,17 +22,21 @@ export function readErrorContext(transcriptPath, deps = {}) {
   const lines = trimmed.split('\n');
   let lastAssistantMessage = null;
   let errorDetails = null;
+  let occurredAt = null;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i].trim()) continue;
     let line;
     try { line = JSON.parse(lines[i]); } catch { continue; }
-    if (errorDetails == null) errorDetails = extractErrorDetail(line);
+    if (errorDetails == null) {
+      errorDetails = extractErrorDetail(line);
+      if (errorDetails != null && typeof line.timestamp === 'string') occurredAt = line.timestamp;
+    }
     if (lastAssistantMessage == null && line.type === 'assistant') {
       lastAssistantMessage = extractText(line.message);
     }
     if (lastAssistantMessage != null && errorDetails != null) break;
   }
-  return { lastAssistantMessage, errorDetails };
+  return { lastAssistantMessage, errorDetails, occurredAt };
 }
 
 function extractText(message) {
@@ -49,9 +54,11 @@ function extractText(message) {
   return null;
 }
 
+// On an API-error transcript line `line.error` is the error CODE, which already travels as the
+// payload's `error` — so take a detail off the object form only, then the rendered text.
 function extractErrorDetail(line) {
   if (!line?.isApiErrorMessage && !line?.is_error && line?.type !== 'error') return null;
-  const msg = line.error?.message ?? line.error ?? line.message?.content ?? null;
+  const msg = line.error?.message ?? line.message?.content ?? null;
   if (typeof msg === 'string') return truncate(msg);
   return extractText(line.message);
 }
@@ -68,19 +75,24 @@ export async function reportSessionError(input, deps = {}) {
   const getTokenImpl = deps.getAccessToken ?? getAccessToken;
 
   const sessionId = input?.session_id;
-  const error = input?.error_type;
+  // Claude Code names this field `error` on the StopFailure payload; `error_type` was the
+  // older spelling and costs nothing to keep accepting.
+  const error = input?.error ?? input?.error_type;
   if (!sessionId || !error) return { reported: false, reason: 'missing-fields' };
 
   const token = await getTokenImpl(deps);
   if (!token) return { reported: false, reason: 'no-token' };
 
-  const { lastAssistantMessage, errorDetails } = readErrorContext(input.transcript_path, deps);
+  const context = readErrorContext(input.transcript_path, deps);
   const payload = {
     sessionId,
     error,
-    errorDetails,
-    lastAssistantMessage,
-    occurredAt: now().toISOString(),
+    // The hook hands us both of these; the transcript scan covers the case where it doesn't.
+    errorDetails: input.error_details ?? context.errorDetails,
+    lastAssistantMessage: input.last_assistant_message ?? context.lastAssistantMessage,
+    // Stamp from the transcript's own error line so this lands on the same server row as the
+    // checkpoint's transcript scan, which can't see the hook's clock.
+    occurredAt: context.occurredAt ?? now().toISOString(),
   };
   return postSessionError(payload, token, { fetchImpl });
 }

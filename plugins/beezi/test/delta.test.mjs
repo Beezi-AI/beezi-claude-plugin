@@ -705,12 +705,45 @@ test('collects rate-limit events from the window', (t) => {
     },
   ]);
 
-  const { rateLimitEvents } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
+  const { apiErrorEvents } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
 
-  assert.equal(rateLimitEvents.length, 1);
-  assert.match(rateLimitEvents[0].text, /resets 4:30pm \(Europe\/Kiev\)/);
-  assert.equal(rateLimitEvents[0].occurredAt, '2026-07-08T10:00:00.000Z');
-  assert.equal(rateLimitEvents[0].lineNo, 2);
+  assert.equal(apiErrorEvents.length, 1);
+  assert.equal(apiErrorEvents[0].error, 'rate_limit');
+  assert.match(apiErrorEvents[0].text, /resets 4:30pm \(Europe\/Kiev\)/);
+  assert.equal(apiErrorEvents[0].occurredAt, '2026-07-08T10:00:00.000Z');
+  assert.equal(apiErrorEvents[0].lineNo, 2);
+});
+
+test('captures a billing error and skips transient ones', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-billing-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    {
+      type: 'assistant',
+      model: '<synthetic>',
+      timestamp: '2026-07-31T18:44:00.000Z',
+      isApiErrorMessage: true,
+      error: 'server_error',
+      message: { content: [{ type: 'text', text: 'API Error: 500' }] },
+    },
+    {
+      type: 'assistant',
+      model: '<synthetic>',
+      timestamp: '2026-07-31T18:44:50.690Z',
+      isApiErrorMessage: true,
+      error: 'billing_error',
+      apiErrorStatus: 400,
+      message: { content: [{ type: 'text', text: 'Credit balance is too low' }] },
+    },
+  ]);
+
+  const { apiErrorEvents } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
+
+  assert.equal(apiErrorEvents.length, 1);
+  assert.equal(apiErrorEvents[0].error, 'billing_error');
+  assert.equal(apiErrorEvents[0].text, 'Credit balance is too low');
+  assert.equal(apiErrorEvents[0].occurredAt, '2026-07-31T18:44:50.690Z');
 });
 
 test('no rate-limit events in a clean window', (t) => {
@@ -721,6 +754,6 @@ test('no rate-limit events in a clean window', (t) => {
       input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
     }, '2026-07-08T09:59:00.000Z'),
   ]);
-  const { rateLimitEvents } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
-  assert.equal(rateLimitEvents.length, 0);
+  const { apiErrorEvents } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
+  assert.equal(apiErrorEvents.length, 0);
 });
