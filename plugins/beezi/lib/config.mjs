@@ -1,7 +1,7 @@
 export function apiBase() {
   return (
     process.env.BEEZI_API_URL ??
-    "https://beezi-api-staging.azurewebsites.net/api"
+    "https://beezi-api-prod.azurewebsites.net/api"
   );
 }
 
