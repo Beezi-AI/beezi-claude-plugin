@@ -13,6 +13,9 @@ test('buildConfig — null/absent expiresAt yields null credentialsExpiresAt (no
     { subscriptionType: 'team', rateLimitTier: 'default_raven', expiresAt: null, via: 'login' },
     {},
     new Date('2026-07-07T00:00:00.000Z'),
+    // These raw fields only ever come from a readable oauthAccount (--from-claude), which is
+    // itself the evidence that resolves the source to subscription.
+    { subscriptionType: 'team' },
   );
   assert.equal(cfg.credentialsExpiresAt, null);
   assert.equal(cfg.plan, 'team');
@@ -28,6 +31,7 @@ test('buildConfig — subscription env yields plan + raw fields', () => {
     { subscriptionType: 'pro', rateLimitTier: 'default_claude_max_5x', expiresAt: '1754418735285', via: 'login' },
     {},
     new Date('2026-07-07T00:00:00.000Z'),
+    { subscriptionType: 'pro' },
   );
   assert.equal(cfg.version, 1);
   assert.equal(cfg.source, 'subscription');
@@ -156,4 +160,34 @@ test('shouldKeepExisting — a non-subscription fresh capture (plan null) still 
   // The guard protects only against 'unknown'; a machine that moved to api-key
   // billing must be able to replace a stale self-report with the nulled config.
   assert.equal(shouldKeepExisting({ plan: null }, { selfReported: true, plan: 'pro' }), false);
+});
+
+// ─── self-reporting a non-subscription machine ──────────────────────────────
+
+test('buildConfig — --plan api_key declares an API-key machine, with no plan attached', () => {
+  const cfg = buildConfig({ plan: 'api_key', via: 'login-user' }, {}, new Date('2026-08-05T00:00:00.000Z'));
+  assert.equal(cfg.source, 'anthropic_api_key');
+  assert.equal(cfg.plan, null);
+  assert.equal(cfg.subscriptionType, null);
+  assert.equal(cfg.rateLimitTier, null);
+  assert.equal(cfg.selfReported, true);
+  assert.equal(cfg.capturedBy, 'login-user');
+});
+
+test('buildConfig — a positively-named env still outranks the api_key declaration', () => {
+  const cfg = buildConfig({ plan: 'api_key' }, { CLAUDE_CODE_USE_BEDROCK: '1' }, new Date());
+  assert.equal(cfg.source, 'third_party');
+});
+
+test('buildConfig — self-reported tier resolves an otherwise-unknown machine to subscription', () => {
+  const cfg = buildConfig({ plan: 'max_20x', via: 'login-user' }, {}, new Date());
+  assert.equal(cfg.source, 'subscription');
+  assert.equal(cfg.plan, 'max_20x');
+  assert.equal(cfg.selfReported, true);
+});
+
+test('buildConfig — an exported API key overrules a claimed subscription tier', () => {
+  const cfg = buildConfig({ plan: 'max_20x' }, { ANTHROPIC_API_KEY: 'sk-x' }, new Date());
+  assert.equal(cfg.source, 'anthropic_api_key');
+  assert.equal(cfg.plan, null, 'no plan may survive a non-subscription source');
 });

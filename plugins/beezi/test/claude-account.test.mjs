@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readClaudeAccount } from '../lib/claude-account.mjs';
+import path from 'node:path';
+import { readClaudeAccount, readClaudeAuthSignals } from '../lib/claude-account.mjs';
 
 const withAccount = (oauthAccount) => ({
   exists: () => true,
@@ -72,4 +73,55 @@ test('readClaudeAccount — CLAUDE_CONFIG_DIR candidate is checked first', () =>
     readFile: () => '{}',
   });
   assert.ok(seen[0].includes('cfg'));
+});
+
+// ─── readClaudeAuthSignals: presence-only, never the key value ───────────────
+
+// Keys are built with path.join so the fake matches the separator the lib actually emits.
+const HOME = path.join(path.sep, 'home', 'u');
+const AT = (...parts) => path.join(HOME, ...parts);
+
+function fakeFs(files) {
+  return {
+    exists: (p) => Object.prototype.hasOwnProperty.call(files, p),
+    readFile: (p) => files[p],
+    env: {},
+    homedir: HOME,
+  };
+}
+
+test('readClaudeAuthSignals — a /login managed key shows up as primaryApiKey', () => {
+  const s = readClaudeAuthSignals(fakeFs({
+    [AT('.claude.json')]: JSON.stringify({ primaryApiKey: 'sk-ant-api-SECRET' }),
+  }));
+  assert.deepEqual(s, { hasManagedApiKey: true, hasApiKeyHelper: false });
+  // The flag is a boolean — the credential itself must never leave this function.
+  assert.equal(JSON.stringify(s).includes('SECRET'), false);
+});
+
+test('readClaudeAuthSignals — absent or empty primaryApiKey is not a signal', () => {
+  assert.equal(readClaudeAuthSignals(fakeFs({
+    [AT('.claude.json')]: JSON.stringify({ numStartups: 3 }),
+  })).hasManagedApiKey, false);
+  assert.equal(readClaudeAuthSignals(fakeFs({
+    [AT('.claude.json')]: JSON.stringify({ primaryApiKey: '' }),
+  })).hasManagedApiKey, false);
+});
+
+test('readClaudeAuthSignals — apiKeyHelper in user settings counts, and is never executed', () => {
+  const s = readClaudeAuthSignals(fakeFs({
+    [AT('.claude','settings.json')]: JSON.stringify({ apiKeyHelper: 'op read op://vault/key' }),
+  }));
+  assert.equal(s.hasApiKeyHelper, true);
+});
+
+test('readClaudeAuthSignals — unreadable/malformed files yield no signals rather than throwing', () => {
+  assert.deepEqual(
+    readClaudeAuthSignals(fakeFs({ [AT('.claude.json')]: '{not json' })),
+    { hasManagedApiKey: false, hasApiKeyHelper: false },
+  );
+  assert.deepEqual(
+    readClaudeAuthSignals(fakeFs({})),
+    { hasManagedApiKey: false, hasApiKeyHelper: false },
+  );
 });

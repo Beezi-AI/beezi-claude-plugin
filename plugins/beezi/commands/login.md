@@ -31,20 +31,24 @@ a known plan, or when its output shows `source=anthropic_api_key` or
 `source=third_party` — those machines do not bill a subscription, so a tier
 question does not apply).
 
-Ask with the AskUserQuestion tool: "Which Claude subscription do you have?"
-with exactly these options: "Pro", "Max 5x", "Max 20x", "Team or Enterprise".
-If they pick "Team or Enterprise", ask one follow-up question with options
-"Team" and "Enterprise".
+Ask with the AskUserQuestion tool: "How does this machine pay for Claude?"
+with exactly these options: "Pro", "Max 5x", "Max 20x", "Team or Enterprise",
+"I use an API key (no subscription)". If they pick "Team or Enterprise", ask one
+follow-up question with options "Team" and "Enterprise".
+
+The API-key option matters: without it a machine paying per-token gets pinned to
+a subscription tier, and its spend and errors are then reported under that plan.
 
 Map the final answer through this table — no other values are valid:
 
-| Answer     | value        |
-| ---------- | ------------ |
-| Pro        | `pro`        |
-| Max 5x     | `max_5x`     |
-| Max 20x    | `max_20x`    |
-| Team       | `team`       |
-| Enterprise | `enterprise` |
+| Answer                | value        |
+| --------------------- | ------------ |
+| Pro                   | `pro`        |
+| Max 5x                | `max_5x`     |
+| Max 20x               | `max_20x`    |
+| Team                  | `team`       |
+| Enterprise            | `enterprise` |
+| I use an API key      | `api_key`    |
 
 Then run EXACTLY this command, substituting only `<value>`:
 

@@ -1186,3 +1186,61 @@ test('unreadable session name falls back to the previously-sent name', async (t)
   assert.equal(items[0].payload.session_name, 'Fix login bug', 'payload keeps the previous name');
   assert.equal(readState(dir, 'sess-name').sentSessionName, 'Fix login bug', 'state name not clobbered to null');
 });
+
+// ─── API-key billing evidence: a credit-balance error re-attributes the report ──
+
+test('a credit-balance billing_error re-attributes the segment to anthropic_api_key and persists the proof', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  // The machine looks like a Max 20x subscriber on disk: this is exactly the state that used to
+  // stamp `subscription` + `max_20x` onto a session actually paying with an API key.
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'billing.json'),
+    JSON.stringify({
+      version: 1,
+      source: 'subscription',
+      subscriptionType: 'max',
+      plan: 'max_20x',
+      selfReported: true,
+      capturedAt: new Date().toISOString(),
+    }),
+    'utf-8',
+  );
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('feature/task-1', 'claude-opus-5', { input_tokens: 10, output_tokens: 5 }, '2026-08-05T10:00:00.000Z', dir),
+    {
+      type: 'assistant',
+      gitBranch: 'feature/task-1',
+      cwd: dir,
+      timestamp: '2026-08-05T10:00:05.000Z',
+      isApiErrorMessage: true,
+      error: 'billing_error',
+      apiErrorStatus: 400,
+      message: {
+        content: [{ type: 'text', text: 'Your credit balance is too low to access the Anthropic API.' }],
+      },
+    },
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-evidence', transcript_path: transcript, cwd: dir },
+    {
+      getAccessToken: async () => 'tok',
+      gitImpl: fakeGitRepo('feature/task-1', 'https://host/org/repo.git'),
+      fetchImpl: fakeFetch(500), // keep the queue on disk so the payload can be inspected
+    },
+  );
+
+  const queued = readQueue(dir);
+  assert.equal(queued.length, 1, 'the usage segment is still reported');
+  assert.equal(queued[0].payload.billing_source, 'anthropic_api_key');
+  assert.equal(queued[0].payload.subscription_plan, undefined, 'no plan may ride an API-key report');
+  assert.equal(queued[0].payload.subscription_type, undefined);
+
+  const billing = JSON.parse(fs.readFileSync(path.join(dir, 'billing.json'), 'utf-8'));
+  assert.ok(billing.apiKeyEvidenceAt, 'the proof is persisted for later sessions');
+  assert.equal(billing.plan, 'max_20x', 'the dormant plan is kept, just not reported');
+});

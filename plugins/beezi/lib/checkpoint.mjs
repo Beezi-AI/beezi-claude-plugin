@@ -10,8 +10,13 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { postSessionError } from './session-error-report.mjs';
 import { computeSessionTimeline, postSessionTimeline } from './session-timeline.mjs';
-import { detectBillingSource } from './billing.mjs';
-import { readBillingConfig, subscriptionReportFields, thirdPartyReportFields } from './billing-config.mjs';
+import { isApiKeyBillingEvidence } from './billing.mjs';
+import {
+  readBillingConfig,
+  writeBillingConfig,
+  resolveBilling,
+  recordApiKeyEvidence,
+} from './billing-config.mjs';
 import { resolveSessionName } from './session-name.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { listSubagentTranscripts, buildTaskDescriptionMap } from './subagents.mjs';
@@ -71,9 +76,6 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   if (!token) return { enqueued: 0, flush: null };
 
   // Below the token gate: skip this work entirely on an unlinked machine.
-  const billingSource = detectBillingSource();
-  const subscriptionFields = subscriptionReportFields(billingSource, readBillingConfig());
-  const thirdPartyFields = thirdPartyReportFields(billingSource);
   const resolvedSessionName = resolveSessionName(session_id, transcript_path);
 
   // Memoized git shell-outs for this checkpoint: dir→root, root→remote, root→reflog/HEAD.
@@ -129,6 +131,20 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   }
   const { nextCursor, segments, apiErrorEvents = [] } = delta;
 
+  // Billing is resolved HERE, after the delta, not before it: a credit-balance error in this
+  // window is proof the session bills an API key, and that proof has to be in hand before the
+  // segments it belongs to are stamped. Persisted so later sessions resolve correctly too —
+  // the switch that produced it is invisible to process.env.
+  let billingConfig = readBillingConfig();
+  if (isApiKeyBillingEvidence(apiErrorEvents)) {
+    const recorded = recordApiKeyEvidence(billingConfig);
+    if (recorded) {
+      try { writeBillingConfig(recorded); } catch { /* best-effort */ }
+      billingConfig = recorded;
+    }
+  }
+  const billingFields = resolveBilling(billingConfig);
+
   let enqueued = 0;
   // The last enqueued payload becomes the "anchor" we can replay to push a later rename.
   let lastPayload = null;
@@ -167,9 +183,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           branch: seg.branch,
           from_line: seg.fromLine,
           to_line: seg.toLine,
-          billing_source: billingSource,
-          ...subscriptionFields,
-          ...thirdPartyFields,
+          ...billingFields,
           session_name: sessionName,
           ...(timezone ? { timezone } : {}),
           ...(extra || {}),

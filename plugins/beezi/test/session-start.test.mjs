@@ -45,6 +45,15 @@ function baseInput(overrides = {}) {
   return { session_id: 'test-session', cwd: '/some/path', ...overrides };
 }
 
+// Billing is resolved on every session start and appends its own nudge when it cannot tell how the
+// machine bills. Tests that assert on the repo/link message pin it to a quiet, resolved state so
+// that nudge can't bleed into their expected string.
+const quietBilling = {
+  resolveSource: () => 'subscription',
+  readBillingConfig: () => ({ source: 'subscription', plan: 'pro', capturedAt: new Date().toISOString() }),
+  isStale: () => false,
+};
+
 // ─── test 1: no token ────────────────────────────────────────────────────────
 
 test('1. no token → returns login reminder, no state file created, fetch never called', async (t) => {
@@ -73,6 +82,7 @@ test('2. resume guard — creates cursor=0 when state file absent', async (t) =>
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-init' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchOk({ connected: false }),
     gitImpl: fakeGit('https://host/repo.git'),
   });
@@ -95,6 +105,7 @@ test('3. resume guard — does NOT reset cursor when state file already exists',
 
   await runSessionStart(baseInput({ session_id: 'sess-resume' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchOk({ connected: false }),
     gitImpl: fakeGit('https://host/repo.git'),
   });
@@ -112,6 +123,7 @@ test('4. connected message — returns "repo connected to ..." with projectName'
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-connected' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchOk({ connected: true, projectName: 'Acme' }),
     gitImpl: fakeGit('https://host/repo.git'),
   });
@@ -127,6 +139,7 @@ test('5. not-connected message — returns "repo is not connected" when connecte
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-not-connected' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchOk({ connected: false }),
     gitImpl: fakeGit('https://host/repo.git'),
   });
@@ -142,6 +155,7 @@ test('6. not a git repo — gitImpl throws → returns null silently', async (t)
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-nogit' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchOk({ connected: true, projectName: 'X' }),
     gitImpl: () => { throw new Error('not a git repository'); },
   });
@@ -157,6 +171,7 @@ test('7. repo-status http failure (ok:false) → returns null', async (t) => {
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-http-fail' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchNotOk(),
     gitImpl: fakeGit('https://host/repo.git'),
   });
@@ -176,6 +191,7 @@ test('8. offline — fetchImpl throws → returns null, no error escapes', async
   await assert.doesNotReject(async () => {
     result = await runSessionStart(baseInput({ session_id: 'sess-offline' }), {
       getAccessToken: async () => 'tok',
+      ...quietBilling,
       fetchImpl: throwingFetch,
       gitImpl: fakeGit('https://host/repo.git'),
     });
@@ -210,6 +226,7 @@ test('9. flushQueue is invoked — seeds a queue file, verifies it is POSTed and
 
   await runSessionStart(baseInput({ session_id: 'sess-flush' }), {
     getAccessToken: async () => 'my-token',
+    ...quietBilling,
     fetchImpl: recordingFetch,
     gitImpl: fakeGit('https://host/repo.git'),
   });
@@ -259,6 +276,7 @@ test('11. rejected token — whoami 401 → warns but keeps the credentials', as
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-rejected' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     deleteCredentials: async () => { deleted = true; },
     fetchImpl,
     gitImpl: fakeGit('https://host/repo.git'),
@@ -289,9 +307,10 @@ test('12. stale subscription plan — appends /beezi:refresh nudge', async (t) =
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-stale' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchWhoamiOkNoRepo(),
     gitImpl: () => { throw new Error('not a git repo'); },
-    detectBillingSource: () => 'subscription',
+    resolveSource: () => 'subscription',
     readBillingConfig: () => ({ source: 'subscription', plan: 'pro', capturedAt: new Date().toISOString() }),
     isStale: () => true,
   });
@@ -307,9 +326,10 @@ test('13. fresh subscription plan — no nudge appended', async (t) => {
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-fresh' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchWhoamiOkNoRepo(),
     gitImpl: () => { throw new Error('not a git repo'); },
-    detectBillingSource: () => 'subscription',
+    resolveSource: () => 'subscription',
     readBillingConfig: () => ({ source: 'subscription', plan: 'pro', capturedAt: new Date().toISOString() }),
     isStale: () => false,
   });
@@ -325,14 +345,90 @@ test('14. non-subscription billing source — no nudge even when isStale() would
 
   const result = await runSessionStart(baseInput({ session_id: 'sess-nonsub' }), {
     getAccessToken: async () => 'tok',
+    ...quietBilling,
     fetchImpl: fakeFetchWhoamiOkNoRepo(),
     gitImpl: () => { throw new Error('not a git repo'); },
-    detectBillingSource: () => 'anthropic_api_key',
+    resolveSource: () => 'anthropic_api_key',
     readBillingConfig: () => ({ source: 'anthropic_api_key' }),
     isStale: () => true,
   });
 
   assert.equal(/\/beezi:refresh/.test(result ?? ''), false);
+});
+
+// ─── billing-source drift sync ───────────────────────────────────────────────
+
+test('14b. billing source changed since last session — billing.json is realigned to the env', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const stored = {
+    source: 'subscription',
+    subscriptionType: 'max',
+    rateLimitTier: 'default_claude_max_5x',
+    plan: 'max_5x',
+    selfReported: true,
+    capturedAt: new Date().toISOString(),
+  };
+  const writes = [];
+
+  const result = await runSessionStart(baseInput({ session_id: 'sess-drift' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fakeFetchWhoamiOkNoRepo(),
+    gitImpl: () => { throw new Error('not a git repo'); },
+    resolveSource: () => 'anthropic_api_key',
+    readBillingConfig: () => stored,
+    writeBillingConfig: (cfg) => writes.push(cfg),
+    isStale: () => false,
+  });
+
+  assert.equal(writes.length, 1, 'a changed billing source must rewrite billing.json');
+  assert.equal(writes[0].source, 'anthropic_api_key');
+  assert.equal(writes[0].plan, 'max_5x', 'the dormant plan must survive the switch');
+  assert.equal(writes[0].selfReported, true);
+  assert.equal(writes[0].capturedAt, stored.capturedAt, 'capturedAt belongs to the plan capture');
+  // Silent: the switch itself is not something the user has to act on.
+  assert.equal(/billing/i.test(result ?? ''), false);
+});
+
+test('14c. billing source unchanged — billing.json is left alone', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const writes = [];
+  await runSessionStart(baseInput({ session_id: 'sess-nodrift' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fakeFetchWhoamiOkNoRepo(),
+    gitImpl: () => { throw new Error('not a git repo'); },
+    resolveSource: () => 'subscription',
+    readBillingConfig: () => ({ source: 'subscription', plan: 'pro', capturedAt: new Date().toISOString() }),
+    writeBillingConfig: (cfg) => writes.push(cfg),
+    isStale: () => false,
+  });
+
+  assert.equal(writes.length, 0, 'a matching source must not rewrite the file');
+});
+
+test('14d. billing.json write failure does not break session start', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const result = await runSessionStart(baseInput({ session_id: 'sess-drift-fail' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fakeFetchWhoamiOkNoRepo(),
+    gitImpl: () => { throw new Error('not a git repo'); },
+    resolveSource: () => 'subscription',
+    readBillingConfig: () => ({ source: 'anthropic_api_key' }),
+    writeBillingConfig: () => { throw new Error('EACCES'); },
+    isStale: () => false,
+  });
+
+  // The sync is best-effort: an unwritable billing.json must not take the hook down with it.
+  assert.equal(result, null);
+  assert.notEqual(readStateFile(dir, 'sess-drift-fail'), null, 'session state is still written');
 });
 
 // ─── test 15: session cwd + transcript recorded in state (cwd-change recovery) ──
@@ -363,4 +459,31 @@ test('15. records cwd + transcript_path in state; resume refreshes mapping witho
   state = readStateFile(dir, 'sess-map');
   assert.equal(state.cursor, 42, 'cursor NOT reset on resume');
   assert.equal(state.cwd, '/resume/dir', 'mapping refreshed to the resume cwd');
+});
+
+// ─── unresolvable billing source → honest nudge ──────────────────────────────
+
+test('14e. unknown billing source — nudges the user instead of silently guessing subscription', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const writes = [];
+  const result = await runSessionStart(baseInput({ session_id: 'sess-unknown' }), {
+    getAccessToken: async () => 'tok',
+    fetchImpl: fakeFetchWhoamiOkNoRepo(),
+    gitImpl: () => { throw new Error('not a git repo'); },
+    resolveSource: () => 'unknown',
+    readBillingConfig: () => ({ source: 'subscription', plan: 'max_20x', selfReported: true }),
+    writeBillingConfig: (cfg) => writes.push(cfg),
+    isStale: () => true,
+  });
+
+  assert.match(result ?? '', /unknown/);
+  assert.match(result ?? '', /\/beezi:login/);
+  // The stale subscription nudge must NOT also fire — the plan is no longer the problem.
+  assert.equal(/\/beezi:refresh/.test(result ?? ''), false);
+  // And the file is realigned off the subscription claim it can no longer support.
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].source, 'unknown');
+  assert.equal(writes[0].plan, 'max_20x', 'the plan stays dormant for a switch back');
 });

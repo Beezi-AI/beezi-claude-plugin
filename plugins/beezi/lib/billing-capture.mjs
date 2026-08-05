@@ -1,4 +1,9 @@
-import { BillingSource, detectBillingSource, normalizePlan } from './billing.mjs';
+import {
+  BillingSource,
+  detectBillingSource,
+  resolveBillingSource,
+  normalizePlan,
+} from './billing.mjs';
 import { UserError } from './friendly-error.mjs';
 
 // The credential fields are short opaque labels. Anything token-shaped (an
@@ -39,13 +44,39 @@ export function parseArgs(argv) {
 // absent: Claude Code cannot run on subscription billing with a free plan.
 const SELF_REPORTED_PLANS = Object.freeze(['pro', 'max_5x', 'max_20x', 'team', 'enterprise']);
 
-export function buildConfig(args, env = process.env, now = new Date()) {
+// Not a plan — the way a user declares they are NOT on a subscription. Without it the tier
+// question is the only answer available, which pins a machine paying with an API key to a
+// subscription plan it does not have and buckets its spend and errors under that plan.
+const SELF_REPORTED_API_KEY = 'api_key';
+
+export function buildConfig(args, env = process.env, now = new Date(), account = null) {
   if (args.plan != null) {
     const plan = String(args.plan).trim().toLowerCase();
-    if (!SELF_REPORTED_PLANS.includes(plan)) {
-      throw new UserError(`Unknown plan '${args.plan}'. Valid: ${SELF_REPORTED_PLANS.join(', ')}.`);
+    if (plan === SELF_REPORTED_API_KEY) {
+      const envSource = detectBillingSource(env);
+      return {
+        version: 1,
+        // An env that positively names a provider still wins; otherwise take the user's word.
+        source: envSource === BillingSource.UNKNOWN ? BillingSource.ANTHROPIC_API_KEY : envSource,
+        subscriptionType: null,
+        rateLimitTier: null,
+        plan: null,
+        credentialsExpiresAt: null,
+        capturedAt: now.toISOString(),
+        capturedBy: safeField(args.via) ?? 'manual',
+        selfReported: true,
+      };
     }
-    const source = detectBillingSource(env);
+    if (!SELF_REPORTED_PLANS.includes(plan)) {
+      throw new UserError(
+        `Unknown plan '${args.plan}'. Valid: ${[...SELF_REPORTED_PLANS, SELF_REPORTED_API_KEY].join(', ')}.`,
+      );
+    }
+    // Naming a subscription tier IS the evidence: the user is telling us they bill a subscription,
+    // which is exactly the fact no local signal could establish. It resolves UNKNOWN, but it never
+    // overrides an env that positively says otherwise — an exported API key outranks the claim.
+    const envSource = detectBillingSource(env);
+    const source = envSource === BillingSource.UNKNOWN ? BillingSource.SUBSCRIPTION : envSource;
     const isSub = source === BillingSource.SUBSCRIPTION;
     return {
       version: 1,
@@ -64,7 +95,9 @@ export function buildConfig(args, env = process.env, now = new Date()) {
   const subscriptionType = safeField(args.subscriptionType);
   const rateLimitTier = safeField(args.rateLimitTier);
   const via = safeField(args.via) ?? 'manual';
-  const source = detectBillingSource(env);
+  // A readable oauthAccount is positive subscription evidence; without it (and without an env
+  // signal) the source stays unknown rather than being assumed.
+  const source = resolveBillingSource(env, account);
   const isSub = source === BillingSource.SUBSCRIPTION;
   // null/undefined/'' must stay null — Number(null) is 0, which would look like an
   // already-expired timestamp and force a permanent "stale" state.

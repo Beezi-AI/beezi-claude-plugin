@@ -9,8 +9,9 @@ try {
   // --from-claude: read the non-secret oauthAccount from ~/.claude.json ourselves,
   // deterministically. No tokens are read; the model does not supply any values.
   let args = parsed;
+  let account = null;
   if (parsed.fromClaude) {
-    const account = readClaudeAccount();
+    account = readClaudeAccount();
     if (!account) {
       console.log('Beezi: no Claude subscription info found in ~/.claude.json — nothing captured.');
       process.exit(0);
@@ -23,7 +24,7 @@ try {
     };
   }
 
-  const config = buildConfig(args);
+  const config = buildConfig(args, process.env, new Date(), account);
 
   if (parsed.fromClaude && shouldKeepExisting(config, readBillingConfig())) {
     console.log('Beezi: Claude account info still does not name a plan — keeping the self-reported plan.');

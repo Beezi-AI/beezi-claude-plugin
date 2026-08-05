@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectBillingSource, detectThirdPartyProvider } from '../lib/billing.mjs';
+import {
+  detectBillingSource,
+  detectThirdPartyProvider,
+  resolveBillingSource,
+  isApiKeyBillingEvidence,
+} from '../lib/billing.mjs';
 import { normalizePlan } from '../lib/billing.mjs';
 import { thirdPartyReportFields } from '../lib/billing-config.mjs';
 
@@ -24,8 +29,10 @@ test('detectBillingSource — anthropic_api_key when only the key is present', (
   assert.equal(detectBillingSource({ ANTHROPIC_API_KEY: 'sk-x' }), 'anthropic_api_key');
 });
 
-test('detectBillingSource — subscription when nothing is set', () => {
-  assert.equal(detectBillingSource({}), 'subscription');
+test('detectBillingSource — unknown when nothing is set (never guesses subscription)', () => {
+  // An API key configured inside Claude Code never reaches process.env, so "no signal" cannot be
+  // read as "subscription" — that guess is what mis-attributed API-key usage to a stale plan.
+  assert.equal(detectBillingSource({}), 'unknown');
 });
 
 test('detectBillingSource — third_party for Foundry', () => {
@@ -89,4 +96,57 @@ test('thirdPartyReportFields — provider key only for third-party billing', () 
   assert.deepEqual(thirdPartyReportFields('subscription', { CLAUDE_CODE_USE_BEDROCK: '1' }), {});
   // third-party billing with no identifiable provider env → omit the key rather than send unknown.
   assert.deepEqual(thirdPartyReportFields('third_party', {}), {});
+});
+
+// ─── resolveBillingSource: env → account → unknown ───────────────────────────
+
+const ACCOUNT = Object.freeze({ subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' });
+
+test('resolveBillingSource — a readable oauthAccount is the subscription evidence', () => {
+  assert.equal(resolveBillingSource({}, ACCOUNT), 'subscription');
+});
+
+test('resolveBillingSource — no env signal and no account stays unknown', () => {
+  assert.equal(resolveBillingSource({}, null), 'unknown');
+});
+
+test('resolveBillingSource — env outranks the account', () => {
+  // The account lingers after a subscription login; an exported key is the current truth.
+  assert.equal(resolveBillingSource({ ANTHROPIC_API_KEY: 'sk-x' }, ACCOUNT), 'anthropic_api_key');
+  assert.equal(resolveBillingSource({ CLAUDE_CODE_USE_BEDROCK: '1' }, ACCOUNT), 'third_party');
+});
+
+// ─── isApiKeyBillingEvidence ────────────────────────────────────────────────
+
+test('isApiKeyBillingEvidence — a credit-balance billing_error proves API-key billing', () => {
+  assert.equal(isApiKeyBillingEvidence([
+    { error: 'billing_error', text: 'Your credit balance is too low to access the Anthropic API.' },
+  ]), true);
+});
+
+test('isApiKeyBillingEvidence — unrelated errors prove nothing', () => {
+  assert.equal(isApiKeyBillingEvidence([]), false);
+  assert.equal(isApiKeyBillingEvidence([{ error: 'rate_limit', text: 'usage limit reached' }]), false);
+  // A subscription can hit a billing_error too; only the balance wording is API-key specific.
+  assert.equal(isApiKeyBillingEvidence([{ error: 'billing_error', text: 'payment method declined' }]), false);
+});
+
+// ─── an API key configured inside Claude Code (never in process.env) ─────────
+
+test('resolveBillingSource — a /login managed key resolves anthropic_api_key', () => {
+  assert.equal(resolveBillingSource({}, null, { hasManagedApiKey: true }), 'anthropic_api_key');
+});
+
+test('resolveBillingSource — a configured apiKeyHelper resolves anthropic_api_key', () => {
+  assert.equal(resolveBillingSource({}, null, { hasApiKeyHelper: true }), 'anthropic_api_key');
+});
+
+test('resolveBillingSource — an active subscription login outranks a configured key', () => {
+  // Mirrors Claude Code's own resolution: it reports oauth whenever a subscription login is
+  // active, even with an API key present.
+  assert.equal(resolveBillingSource({}, ACCOUNT, { hasManagedApiKey: true }), 'subscription');
+});
+
+test('resolveBillingSource — no account and no key signals stays unknown', () => {
+  assert.equal(resolveBillingSource({}, null, { hasManagedApiKey: false, hasApiKeyHelper: false }), 'unknown');
 });

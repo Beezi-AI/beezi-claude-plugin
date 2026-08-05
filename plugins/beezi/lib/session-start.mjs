@@ -16,8 +16,14 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { pruneStale } from './prune.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { whoami } from './whoami.mjs';
-import { BillingSource, detectBillingSource as _detectBillingSource } from './billing.mjs';
-import { readBillingConfig as _readBillingConfig, isStale as _isStale } from './billing-config.mjs';
+import { BillingSource } from './billing.mjs';
+import {
+  readBillingConfig as _readBillingConfig,
+  writeBillingConfig as _writeBillingConfig,
+  resolveSource as _resolveSource,
+  syncBillingSource,
+  isStale as _isStale,
+} from './billing-config.mjs';
 
 // Resume guard: create cursor=0 ONLY if absent; never reset an existing session's cursor.
 // Also records where the session lives (cwd + transcript path) so /beezi:track can find
@@ -101,8 +107,9 @@ export async function runSessionStart(input, deps = {}) {
   const getAccessToken = deps.getAccessToken ?? _getAccessToken;
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
   const gitImpl = deps.gitImpl ?? _git;
-  const detectBillingSource = deps.detectBillingSource ?? _detectBillingSource;
+  const resolveSource = deps.resolveSource ?? _resolveSource;
   const readBillingConfig = deps.readBillingConfig ?? _readBillingConfig;
+  const writeBillingConfig = deps.writeBillingConfig ?? _writeBillingConfig;
   const isStale = deps.isStale ?? _isStale;
 
   let token = null;
@@ -139,9 +146,30 @@ export async function runSessionStart(input, deps = {}) {
     if (dirty || removed > 0) saveRepoMap(map);
   } catch { /* best-effort */ }
 
+  // The user may have switched auth method since the last session (exporting an API key over a
+  // subscription login, or back). Env is authoritative, so realign billing.json to it before the
+  // staleness check reads it — otherwise the stored source stays wrong until the next
+  // /beezi:login or /beezi:refresh. Best-effort: a disk failure must not break session start.
+  let billingConfig = null;
+  let billingSource = BillingSource.UNKNOWN;
+  try {
+    billingConfig = readBillingConfig();
+    billingSource = resolveSource(billingConfig);
+    const synced = syncBillingSource(billingConfig, billingSource);
+    if (synced) {
+      writeBillingConfig(synced);
+      billingConfig = synced;
+    }
+  } catch { /* best-effort */ }
+
   let message = systemMessage;
-  if (detectBillingSource() === BillingSource.SUBSCRIPTION && isStale(readBillingConfig())) {
+  if (billingSource === BillingSource.SUBSCRIPTION && isStale(billingConfig)) {
     const nudge = 'Beezi: subscription plan info is missing or stale — run /beezi:refresh to update it.';
+    message = message ? `${message}\n${nudge}` : nudge;
+  } else if (billingSource === BillingSource.UNKNOWN) {
+    // Reported honestly as `unknown` rather than guessed. Only the user can resolve it, and
+    // without this they would never learn their usage is landing unattributed.
+    const nudge = 'Beezi: cannot determine how this machine bills Claude — usage is reported as "unknown". Run /beezi:login to set it.';
     message = message ? `${message}\n${nudge}` : nudge;
   }
   return message;
