@@ -22,9 +22,6 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { listSubagentTranscripts, buildTaskDescriptionMap } from './subagents.mjs';
 import { claimIntervals, mergeIntervals, subtractIntervals, totalMs } from './active-time.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
-import { readUsageUtilization as _readUsageUtilization } from './usage-utilization.mjs';
-import { readClaudeAccount as _readClaudeAccount } from './claude-account.mjs';
-import { maybePostUsageSnapshot as _maybePostUsageSnapshot } from './usage-snapshot-report.mjs';
 
 function loadState(id) {
   return readJson(path.join(stateDir(), `${id}.json`), {
@@ -148,28 +145,6 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   }
   const billingFields = resolveBilling(billingConfig);
 
-  // Subscription-usage stamp: account-level utilization correlated onto every payload of this
-  // checkpoint. Keys are omitted (not null) when unknown. usage_account_uuid is the CACHE's own
-  // account — after a switch it names the previous account until Claude Code refetches, which is
-  // the truth about whose numbers these are; account_uuid is who is logged in NOW.
-  const readUtilization = deps.readUsageUtilization ?? _readUsageUtilization;
-  const readAccount = deps.readClaudeAccount ?? _readClaudeAccount;
-  let utilization = null;
-  try { utilization = readUtilization(); } catch { utilization = null; }
-  let claudeAccount = null;
-  try { claudeAccount = readAccount(); } catch { claudeAccount = null; }
-  const usageStamp = {
-    ...(claudeAccount?.accountUuid ? { account_uuid: claudeAccount.accountUuid } : {}),
-    ...(utilization
-      ? {
-          usage_five_hour_pct: utilization.fiveHourPct,
-          usage_seven_day_pct: utilization.sevenDayPct,
-          usage_fetched_at: new Date(utilization.fetchedAtMs).toISOString(),
-          ...(utilization.accountUuid ? { usage_account_uuid: utilization.accountUuid } : {}),
-        }
-      : {}),
-  };
-
   let enqueued = 0;
   // The last enqueued payload becomes the "anchor" we can replay to push a later rename.
   let lastPayload = null;
@@ -184,7 +159,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   let covered = mergeIntervals(Array.isArray(state.coveredIntervals) ? state.coveredIntervals : []);
   let coveredDirty = false;
 
-  const enqueueSegments = (segs, segmentScope, extra = null, { includeContext = true } = {}) => {
+  const enqueueSegments = (segs, segmentScope, extra = null) => {
     for (const seg of segs) {
       // Main-transcript segments run through here first and so keep their full span; subagents bill
       // only the residual. Deterministic, and it puts the time on the thread that was blocked for
@@ -200,9 +175,6 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       if (!remote) continue;
       // A single write failure must not abort the window (which would leave the cursor
       // unadvanced and re-process everything forever) — skip that segment and continue.
-      // A subagent's context window is not the session's — its context fields never ship.
-      const { context_peak_tokens, context_final_tokens, context_final_model, ...statsSansContext } = seg.stats;
-      const stats = includeContext ? seg.stats : statsSansContext;
       try {
         const payload = {
           segmentId: `${segmentScope}:${seg.fromLine}-${seg.toLine}`,
@@ -212,11 +184,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           from_line: seg.fromLine,
           to_line: seg.toLine,
           ...billingFields,
-          ...usageStamp,
           session_name: sessionName,
           ...(timezone ? { timezone } : {}),
           ...(extra || {}),
-          ...stats,
+          ...seg.stats,
           duration_sec: durationSec,
         };
         enqueue(payload);
@@ -254,7 +225,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       agent_type: agentType,
       agent_name: toolUseId ? (taskDescriptions.get(toolUseId) ?? null) : null,
       spawn_depth: spawnDepth,
-    }, { includeContext: false });
+    });
     // A subagent that dies on an API error never ends the main turn, so no StopFailure fires
     // for it — its transcript is the only place that failure is recorded.
     apiErrorEvents.push(...(agentDelta.apiErrorEvents ?? []));
@@ -308,12 +279,6 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
         }
       }
     } catch { /* best-effort */ }
-
-    // Fleet utilization snapshot — deduped by (account, fetchedAt); best-effort like the
-    // timeline. StopFailure also runs with emitTimeline, so a turn that died on a rate-limit
-    // error still ships its snapshot — the moment it matters most.
-    const postSnapshot = deps.maybePostUsageSnapshot ?? _maybePostUsageSnapshot;
-    try { await postSnapshot(token, { fetchImpl }); } catch { /* best-effort */ }
   }
 
   // Claude Code renames a session after the first prompt. The new name normally rides on the

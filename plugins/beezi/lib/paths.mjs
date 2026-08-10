@@ -26,11 +26,6 @@ export function billingConfigFile() {
   return path.join(beeziHome(), 'billing.json');
 }
 
-// Last-sent usage-snapshot marker: { version, lastSent: { accountUuid, fetchedAtMs } }.
-export function usageSnapshotStateFile() {
-  return path.join(beeziHome(), 'usage-snapshot.json');
-}
-
 // Claude Code's config root — `~/.claude`, relocatable via CLAUDE_CONFIG_DIR. Single source
 // for the dirs the plugin reads out of Claude Code (transcripts, live session store).
 export function claudeHome() {
