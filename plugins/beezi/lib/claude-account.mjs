@@ -6,7 +6,7 @@ import path from 'node:path';
 // It is a plain file on every platform — including macOS, where the OAuth tokens live
 // in the Keychain — and its `oauthAccount` object carries the subscription metadata with
 // NO access/refresh token. Reading it is how we get plan info without touching a secret.
-function configCandidates(env, homedir) {
+export function configCandidates(env, homedir) {
   const out = [];
   if (env.CLAUDE_CONFIG_DIR) out.push(path.join(env.CLAUDE_CONFIG_DIR, '.claude.json'));
   out.push(path.join(homedir, '.claude.json'));
@@ -85,6 +85,8 @@ export function readClaudeAccount(deps = {}) {
     }
     if (!account || typeof account !== 'object') continue;
     return {
+      // Pseudonymous account id — which Claude account this machine is logged into. Non-secret.
+      accountUuid: typeof account.accountUuid === 'string' ? account.accountUuid : null,
       subscriptionType: deriveSubscriptionType(account),
       rateLimitTier: account.userRateLimitTier ?? account.organizationRateLimitTier ?? null,
       // ~/.claude.json carries no token expiry; staleness relies on capturedAt age instead.

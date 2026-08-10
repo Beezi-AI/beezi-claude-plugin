@@ -82,6 +82,14 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   const closeRun = () => {
     if (run) {
       const activeIntervals = buildActiveIntervals(run.timestamps, IDLE_GAP_SEC * 1000);
+      const stats = summarize(run.models, run.timestamps, run.lines, activeIntervals);
+      // Absent (not 0) when the window counted no assistant line, so zero-token segments
+      // don't ship a fake empty context.
+      if (run.contextFinal != null) {
+        stats.context_peak_tokens = run.contextPeak;
+        stats.context_final_tokens = run.contextFinal;
+        stats.context_final_model = run.contextFinalModel;
+      }
       segments.push({
         repoRoot: run.repoRoot,
         branch: run.branch,
@@ -90,7 +98,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
         // Deliberately outside `stats` (which is spread wholesale into the report payload): the
         // intervals feed the caller's cross-transcript union, they are not a reported field.
         activeIntervals,
-        stats: summarize(run.models, run.timestamps, run.lines, activeIntervals),
+        stats,
       });
       run = null;
     }
@@ -152,6 +160,15 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
       m.token_cache_read += u.cache_read_input_tokens || 0;
       m.token_cache_creation += cacheCreation;
       m.requests += 1;
+
+      // Context the request ran with = prompt-side tokens. Sidechains (title generation etc.)
+      // run tiny separate contexts and must not move the session's numbers.
+      if (line.isSidechain !== true) {
+        const contextTokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + cacheCreation;
+        run.contextPeak = Math.max(run.contextPeak ?? 0, contextTokens);
+        run.contextFinal = contextTokens;
+        run.contextFinalModel = model;
+      }
     }
   }
   closeRun();

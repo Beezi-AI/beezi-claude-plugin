@@ -46,6 +46,18 @@ test('readClaudeAccount — Max multiplier comes from rateLimitTier', () => {
   assert.equal(r.subscriptionType, 'max');
 });
 
+test('readClaudeAccount — exposes accountUuid from oauthAccount', () => {
+  const r = readClaudeAccount(
+    withAccount({ accountUuid: 'acc-123', seatTier: 'max', userRateLimitTier: 'default_claude_max_5x' }),
+  );
+  assert.equal(r.accountUuid, 'acc-123');
+});
+
+test('readClaudeAccount — accountUuid null when absent or non-string', () => {
+  assert.equal(readClaudeAccount(withAccount({ seatTier: 'pro' })).accountUuid, null);
+  assert.equal(readClaudeAccount(withAccount({ accountUuid: 42, seatTier: 'pro' })).accountUuid, null);
+});
+
 test('readClaudeAccount — falls back to organizationRateLimitTier', () => {
   const r = readClaudeAccount(
     withAccount({ organizationType: 'claude_team', organizationRateLimitTier: 'default_raven' }),

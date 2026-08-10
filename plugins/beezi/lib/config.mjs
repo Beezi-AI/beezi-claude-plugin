@@ -21,6 +21,7 @@ export const ENDPOINTS = Object.freeze({
   reposStatus: "/repos/status",
   whoami: "/me/claude-code/whoami",
   machine: "/me/claude-code/machine",
+  usageSnapshot: "/me/claude-code/usage",
 });
 
 export const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
