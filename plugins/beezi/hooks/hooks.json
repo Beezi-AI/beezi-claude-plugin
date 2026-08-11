@@ -1,22 +1,22 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs"], "timeout": 10 } ] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/track-prompt.mjs", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/track-prompt.mjs"], "timeout": 10 } ] }
     ],
     "PostToolUse": [
-      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/checkpoint.mjs", "timeout": 10 } ] }
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/checkpoint.mjs"], "timeout": 10 } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/stop.mjs", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/stop.mjs"], "timeout": 10 } ] }
     ],
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/report.mjs", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/report.mjs"], "timeout": 10 } ] }
     ],
     "StopFailure": [
-      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/stop-failure.mjs", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/stop-failure.mjs"], "timeout": 10 } ] }
     ]
   }
 }
