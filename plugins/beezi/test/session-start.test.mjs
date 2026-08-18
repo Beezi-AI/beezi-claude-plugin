@@ -487,3 +487,157 @@ test('14e. unknown billing source — nudges the user instead of silently guessi
   assert.equal(writes[0].source, 'unknown');
   assert.equal(writes[0].plan, 'max_20x', 'the plan stays dormant for a switch back');
 });
+
+test('14f. a custom gateway names itself in the nudge — the user is asked what it bills', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const prev = process.env.ANTHROPIC_BASE_URL;
+  process.env.ANTHROPIC_BASE_URL = 'https://gw.corp.example';
+  t.after(() => {
+    if (prev === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = prev;
+  });
+
+  const result = await runSessionStart(baseInput({ session_id: 'sess-gateway' }), {
+    getAccessToken: async () => 'tok',
+    fetchImpl: fakeFetchWhoamiOkNoRepo(),
+    gitImpl: () => { throw new Error('not a git repo'); },
+    resolveSource: () => 'unknown',
+    readBillingConfig: () => null,
+    writeBillingConfig: () => {},
+  });
+
+  // The generic "cannot determine" wording leaves the user with nothing to act on; naming the
+  // gateway tells them why we cannot know and that only they can answer it.
+  assert.match(result ?? '', /gateway|custom API endpoint/i);
+  assert.match(result ?? '', /\/beezi:login/);
+});
+
+// ─── tenant tracking policy (whoami capture + gating + hints) ────────────────
+
+import { readTrackingState, writeTrackingState, TrackingMode } from '../lib/tracking.mjs';
+
+// Routes whoami and repos/status separately: whoami is a GET with no body, repos/status a POST.
+function routedFetch({ who = {}, repo = { connected: false } } = {}) {
+  const calls = [];
+  const impl = async (url, opts = {}) => {
+    calls.push({ url, opts });
+    if (String(url).includes('/whoami')) return { ok: true, status: 200, json: async () => who };
+    return { ok: true, status: 200, json: async () => repo };
+  };
+  return { impl, calls };
+}
+
+test('16. whoami tracking fields are persisted to tracking.json before the flush', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const fetch = routedFetch({
+    who: { email: 'dev@acme.com', tenantTier: 'audit', trackingMode: 'backfill_only', backfillCompleted: false },
+  });
+
+  await runSessionStart(baseInput({ session_id: 'sess-track' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fetch.impl,
+    gitImpl: fakeGit('https://host/repo.git'),
+  });
+
+  const state = readTrackingState();
+  assert.equal(state.trackingMode, 'backfill_only');
+  assert.equal(state.tenantTier, 'audit');
+  assert.equal(state.backfillCompleted, false);
+});
+
+test('17. audit mode: repo "will be tracked" line is replaced by the audit hint', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const fetch = routedFetch({
+    who: { tenantTier: 'audit', trackingMode: 'backfill_only', backfillCompleted: false },
+    repo: { connected: true, projectName: 'Acme' },
+  });
+
+  const message = await runSessionStart(baseInput({ session_id: 'sess-audit-msg' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fetch.impl,
+    gitImpl: fakeGit('https://host/repo.git'),
+  });
+
+  assert.ok(!String(message).includes('will be tracked'), 'the tracked promise must not appear');
+  assert.match(String(message), /audit mode — new sessions are not tracked/);
+  assert.match(String(message), /\/beezi:login/);
+});
+
+test('18. audit mode suppresses the billing nudges', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const fetch = routedFetch({
+    who: { tenantTier: 'audit', trackingMode: 'backfill_only', backfillCompleted: false },
+  });
+
+  const message = await runSessionStart(baseInput({ session_id: 'sess-nudge' }), {
+    getAccessToken: async () => 'tok',
+    resolveSource: () => 'subscription',
+    readBillingConfig: () => ({ source: 'subscription', plan: 'pro', capturedAt: new Date().toISOString() }),
+    isStale: () => true,
+    fetchImpl: fetch.impl,
+    gitImpl: fakeGit('https://host/repo.git'),
+  });
+
+  assert.ok(!String(message).includes('/beezi:refresh'), 'stale-plan nudge is noise for a dark tenant');
+});
+
+test('19. a live tenant with an unfinished pull gets the one-line audit offer', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const fetch = routedFetch({
+    who: { tenantTier: 'pro', trackingMode: 'live', backfillCompleted: false },
+    repo: { connected: true, projectName: 'Acme' },
+  });
+
+  const message = await runSessionStart(baseInput({ session_id: 'sess-live-hint' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fetch.impl,
+    gitImpl: fakeGit('https://host/repo.git'),
+  });
+
+  assert.match(String(message), /repo connected to "Acme"/);
+  assert.match(String(message), /run \/beezi:login once to include your past sessions/i);
+});
+
+test('20. old server (no policy fields) behaves exactly like today — no hints, tracking allowed', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const fetch = routedFetch({
+    who: { email: 'dev@acme.com', name: 'Dev' },
+    repo: { connected: true, projectName: 'Acme' },
+  });
+
+  const message = await runSessionStart(baseInput({ session_id: 'sess-old-server' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fetch.impl,
+    gitImpl: fakeGit('https://host/repo.git'),
+  });
+
+  assert.equal(message, 'Beezi: repo connected to "Acme". Task-branch sessions will be tracked.');
+});
+
+test('21. completed pull on a live tenant → no audit hint', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const fetch = routedFetch({
+    who: { tenantTier: 'pro', trackingMode: 'live', backfillCompleted: true },
+    repo: { connected: true, projectName: 'Acme' },
+  });
+
+  const message = await runSessionStart(baseInput({ session_id: 'sess-done' }), {
+    getAccessToken: async () => 'tok',
+    ...quietBilling,
+    fetchImpl: fetch.impl,
+    gitImpl: fakeGit('https://host/repo.git'),
+  });
+
+  assert.equal(message, 'Beezi: repo connected to "Acme". Task-branch sessions will be tracked.');
+});

@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from 'child_process';
 
 // A branch is tracked only when it carries a `.../task-<id>` segment. The capture group
 // yields the `task-<id>` token (see taskFromBranch).
@@ -37,6 +37,6 @@ export function currentBranch(cwd, gitImpl = git) {
 
 // The `task-<id>` token for a task branch, or null when the branch doesn't fit.
 export function taskFromBranch(branch) {
-  const match = TASK_BRANCH_RE.exec(branch ?? '');
+  const match = TASK_BRANCH_RE.exec(branch == null ? '' : branch);
   return match ? match[1] : null;
 }

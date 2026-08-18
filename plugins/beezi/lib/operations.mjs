@@ -52,8 +52,8 @@ function resultBytes(content) {
   if (Array.isArray(content)) {
     let bytes = 0;
     for (const block of content) {
-      const text = typeof block?.text === 'string' ? block.text : null;
-      bytes += Buffer.byteLength(text ?? JSON.stringify(block ?? ''), 'utf-8');
+      const text = block != null && typeof block.text === 'string' ? block.text : null;
+      bytes += Buffer.byteLength(text == null ? JSON.stringify(block == null ? '' : block) : text, 'utf-8');
     }
     return bytes;
   }
@@ -67,10 +67,10 @@ function resultBytes(content) {
 export function computeOperations(lines) {
   const bytesById = new Map();
   for (const line of lines) {
-    const content = line?.message?.content;
+    const content = line == null || line.message == null ? undefined : line.message.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
-      if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
+      if (block == null || block.type !== 'tool_result' || !block.tool_use_id) continue;
       bytesById.set(block.tool_use_id, resultBytes(block.content));
     }
   }
@@ -82,16 +82,17 @@ export function computeOperations(lines) {
   const plugins = {};
 
   const addPlugin = (name, est) => {
-    const p = (plugins[name] ??= { count: 0, est_tokens: 0 });
+    if (plugins[name] == null) plugins[name] = { count: 0, est_tokens: 0 };
+    const p = plugins[name];
     p.count += 1;
     p.est_tokens += est;
   };
 
   for (const line of lines) {
-    const content = line?.message?.content;
+    const content = line == null || line.message == null ? undefined : line.message.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
-      if (block?.type !== 'tool_use') continue;
+      if (block == null || block.type !== 'tool_use') continue;
       const category = categoryOf(block.name);
       const est = Math.round((bytesById.get(block.id) || 0) / 4);
       const cat = totals[category];
@@ -100,13 +101,15 @@ export function computeOperations(lines) {
 
       if (category === 'mcp') {
         const server = mcpServer(block.name);
-        const s = (cat.by_server[server] ??= { count: 0, est_tokens: 0 });
+        if (cat.by_server[server] == null) cat.by_server[server] = { count: 0, est_tokens: 0 };
+        const s = cat.by_server[server];
         s.count += 1;
         s.est_tokens += est;
         addPlugin('unknown', est); // MCP server → plugin is not knowable from the transcript
       } else if (category === 'skill') {
-        const skillId = typeof block.input?.skill === 'string' ? block.input.skill : 'unknown';
-        const s = (cat.by_skill[skillId] ??= { count: 0, est_tokens: 0 });
+        const skillId = block.input != null && typeof block.input.skill === 'string' ? block.input.skill : 'unknown';
+        if (cat.by_skill[skillId] == null) cat.by_skill[skillId] = { count: 0, est_tokens: 0 };
+        const s = cat.by_skill[skillId];
         s.count += 1;
         s.est_tokens += est;
         addPlugin(skillPlugin(skillId), est);

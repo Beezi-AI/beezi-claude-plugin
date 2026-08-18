@@ -12,8 +12,9 @@ function writeFixture(dir, lines) {
   return filePath;
 }
 
-// Helper: assistant line factory.
-function assistantLine(branch, model, usage, timestamp, isSidechain = false, cwd = '/some/path') {
+// Helper: assistant line factory. `effort` mirrors Claude Code's top-level field; omitted by
+// default so pre-effort fixtures stay byte-identical.
+function assistantLine(branch, model, usage, timestamp, isSidechain = false, cwd = '/some/path', effort = undefined) {
   return {
     type: 'assistant',
     gitBranch: branch,
@@ -21,6 +22,7 @@ function assistantLine(branch, model, usage, timestamp, isSidechain = false, cwd
     timestamp,
     isSidechain,
     message: { model, usage },
+    ...(effort != null ? { effort } : {}),
   };
 }
 
@@ -756,4 +758,526 @@ test('no rate-limit events in a clean window', (t) => {
   ]);
   const { apiErrorEvents } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
   assert.equal(apiErrorEvents.length, 0);
+});
+
+// ─── context peak / final ────────────────────────────────────────────────────
+
+test('context — peak survives auto-compact, final tracks the last counted line', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'claude-fable-5', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 100000, cache_creation_input_tokens: 1000,
+    }, '2024-01-01T10:00:00.000Z'),
+    assistantLine('main', 'claude-fable-5', {
+      input_tokens: 2, output_tokens: 8, cache_read_input_tokens: 220000, cache_creation_input_tokens: 2000,
+    }, '2024-01-01T10:01:00.000Z'),
+    // Auto-compact drops the context — peak must survive, final must follow.
+    assistantLine('main', 'claude-fable-5', {
+      input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 50000, cache_creation_input_tokens: 500,
+    }, '2024-01-01T10:02:00.000Z'),
+  ]);
+
+  const { segments } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
+  const stats = segments[0].stats;
+  assert.equal(stats.context_peak_tokens, 222002);
+  assert.equal(stats.context_final_tokens, 50503);
+  assert.equal(stats.context_final_model, 'claude-fable-5');
+});
+
+test('context — sidechain assistant lines are excluded', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'claude-fable-5', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 200000, cache_creation_input_tokens: 0,
+    }, '2024-01-01T10:00:00.000Z'),
+    // Tiny sidechain (title generation) — must move neither peak nor final.
+    assistantLine('main', 'claude-haiku-4-5', {
+      input_tokens: 500, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, '2024-01-01T10:00:30.000Z', true),
+  ]);
+
+  const { segments } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
+  const stats = segments[0].stats;
+  assert.equal(stats.context_peak_tokens, 200010);
+  assert.equal(stats.context_final_tokens, 200010);
+  assert.equal(stats.context_final_model, 'claude-fable-5');
+});
+
+test('context — fields are ABSENT when no assistant line was counted', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    { type: 'user', gitBranch: 'main', cwd: '/some/path', timestamp: '2024-01-01T10:00:00.000Z', message: { content: 'hello' } },
+  ]);
+
+  const { segments } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
+  for (const seg of segments) {
+    assert.equal('context_peak_tokens' in seg.stats, false);
+    assert.equal('context_final_tokens' in seg.stats, false);
+    assert.equal('context_final_model' in seg.stats, false);
+  }
+});
+
+test('context — block-line dedup: same message id counts context once', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 100000, cache_creation_input_tokens: 0 };
+  const withId = (ts) => ({
+    type: 'assistant', gitBranch: 'main', cwd: '/some/path', timestamp: ts,
+    message: { id: 'msg-1', model: 'claude-fable-5', usage },
+  });
+  const file = writeFixture(dir, [withId('2024-01-01T10:00:00.000Z'), withId('2024-01-01T10:00:01.000Z')]);
+
+  const { segments } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d });
+  const stats = segments[0].stats;
+  assert.equal(stats.context_peak_tokens, 100010);
+  assert.equal(stats.token_input, 10);
+});
+
+test('effort — mixed efforts on one model bucket separately and partition the tally', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'claude-opus-4-8', {
+      input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 10, cache_creation_input_tokens: 5,
+    }, '2024-01-01T10:00:00.000Z', false, '/some/path', 'high'),
+    assistantLine('main', 'claude-opus-4-8', {
+      input_tokens: 200, output_tokens: 75, cache_read_input_tokens: 20, cache_creation_input_tokens: 8,
+    }, '2024-01-01T10:01:00.000Z', false, '/some/path', 'max'),
+  ]);
+
+  const { segments } = computeDelta(file, 0);
+  const model = segments[0].stats.models['claude-opus-4-8'];
+
+  // Parent tally is unchanged by the split.
+  assert.equal(model.token_input, 300);
+  assert.equal(model.requests, 2);
+
+  const high = model.by_effort.high;
+  const max = model.by_effort.max;
+  assert.deepEqual(high, {
+    token_input: 100, token_output: 50, token_cache_read: 10, token_cache_creation: 5, requests: 1,
+  });
+  assert.deepEqual(max, {
+    token_input: 200, token_output: 75, token_cache_read: 20, token_cache_creation: 8, requests: 1,
+  });
+  assert.equal(Object.keys(model.by_effort).length, 2, 'no stray buckets');
+});
+
+test('effort — lines without the field land in the unknown bucket', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'model-a', {
+      input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, '2024-01-01T10:00:00.000Z'),
+  ]);
+
+  const { segments } = computeDelta(file, 0);
+  const model = segments[0].stats.models['model-a'];
+  assert.deepEqual(model.by_effort.unknown, {
+    token_input: 100, token_output: 10, token_cache_read: 0, token_cache_creation: 0, requests: 1,
+  });
+});
+
+test('effort — known and missing efforts on one model: buckets sum to the model totals', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'model-a', {
+      input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 3, cache_creation_input_tokens: 1,
+    }, '2024-01-01T10:00:00.000Z', false, '/some/path', 'xhigh'),
+    assistantLine('main', 'model-a', {
+      input_tokens: 40, output_tokens: 4, cache_read_input_tokens: 2, cache_creation_input_tokens: 0,
+    }, '2024-01-01T10:01:00.000Z'),
+  ]);
+
+  const { segments } = computeDelta(file, 0);
+  const model = segments[0].stats.models['model-a'];
+  const buckets = Object.values(model.by_effort);
+  const sum = (field) => buckets.reduce((acc, b) => acc + b[field], 0);
+  assert.ok(model.by_effort.xhigh, 'known bucket exists');
+  assert.ok(model.by_effort.unknown, 'unknown bucket exists');
+  assert.equal(sum('token_input'), model.token_input);
+  assert.equal(sum('token_output'), model.token_output);
+  assert.equal(sum('token_cache_read'), model.token_cache_read);
+  assert.equal(sum('token_cache_creation'), model.token_cache_creation);
+  assert.equal(sum('requests'), model.requests);
+});
+
+test('effort — block-line dedup: duplicate message id buckets once', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const dupLine = {
+    type: 'assistant',
+    gitBranch: 'main',
+    cwd: '/some/path',
+    timestamp: '2024-01-01T10:00:00.000Z',
+    effort: 'high',
+    message: {
+      id: 'msg_1',
+      model: 'claude-haiku-4-5',
+      usage: {
+        input_tokens: 100, output_tokens: 50,
+        cache_read_input_tokens: 10, cache_creation_input_tokens: 5,
+      },
+    },
+  };
+
+  const file = writeFixture(dir, [dupLine, dupLine, dupLine]);
+  const { segments } = computeDelta(file, 0);
+  const model = segments[0].stats.models['claude-haiku-4-5'];
+  assert.equal(model.by_effort.high.requests, 1, 'one bucketed request, not three');
+  assert.equal(model.by_effort.high.token_input, 100, 'bucket input counted once');
+  assert.equal(model.by_effort.unknown, undefined, 'no unknown bucket for effort-carrying lines');
+});
+
+test('effort — two models keep independent by_effort maps', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'model-a', {
+      input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, '2024-01-01T10:00:00.000Z', false, '/some/path', 'high'),
+    assistantLine('main', 'model-b', {
+      input_tokens: 200, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, '2024-01-01T10:01:00.000Z', false, '/some/path', 'max'),
+  ]);
+
+  const { segments } = computeDelta(file, 0);
+  const { models } = segments[0].stats;
+  assert.deepEqual(Object.keys(models['model-a'].by_effort), ['high']);
+  assert.deepEqual(Object.keys(models['model-b'].by_effort), ['max']);
+});
+
+// ─── session span: the tail Claude Code writes after the human walks away ────
+//
+// Claude Code stamps bookkeeping lines (away_summary recaps, queue operations, hook/attachment
+// output on --resume) long after the last real turn. They used to set the segment's ended_at,
+// so a session "ended" 49 minutes into idle — or, on a resume, the next day.
+
+test('span — a trailing away_summary does not extend ended_at into the idle tail', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const work1 = '2026-07-15T13:11:11.000Z';
+  const work2 = '2026-07-15T13:12:11.185Z';
+  const away = '2026-07-15T14:01:18.729Z'; // 49 min after the last turn
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, work1),
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, work2),
+    // Real recap lines carry gitBranch/cwd, so they land inside the run they trail.
+    { type: 'system', subtype: 'away_summary', content: 'recap', gitBranch: 'main', cwd: '/some/path', timestamp: away },
+  ]);
+
+  // branchAt mirrors production (per-repo reflog): the branch does not come off the line.
+  const { segments } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d, branchAt: () => 'main' });
+  assert.equal(segments.length, 1);
+  const { stats } = segments[0];
+  assert.equal(stats.started_at, work1);
+  assert.equal(stats.ended_at, work2, 'session ends at the last real turn, not at the recap');
+  assert.equal(stats.duration_sec, 60);
+  assert.equal(segments[0].toLine, 3, 'line range is untouched — segmentId must stay stable');
+});
+
+test('span — resume artefacts the next day do not extend ended_at', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const work1 = '2026-07-22T17:51:38.000Z';
+  const work2 = '2026-07-22T17:52:46.299Z';
+  // Everything Claude Code appends when the session is resumed ~19h later.
+  const resume = '2026-07-23T12:24:54.484Z';
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, work1),
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, work2),
+    { type: 'attachment', attachment: { type: 'date_change', newDate: '2026-07-23' }, cwd: '/some/path', timestamp: resume },
+    { type: 'queue-operation', operation: 'remove', timestamp: '2026-07-23T12:24:54.851Z' },
+    { type: 'attachment', attachment: { type: 'edited_text_file' }, cwd: '/some/path', timestamp: '2026-07-23T12:24:54.850Z' },
+  ]);
+
+  const { segments } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d, branchAt: () => 'main' });
+  assert.equal(segments.length, 1);
+  const { stats } = segments[0];
+  assert.equal(stats.ended_at, work2, 'the resume tail is bookkeeping, not activity');
+  // 68.3s of real work + the 0.37s the three resume stamps span. duration_sec is deliberately
+  // NOT filtered by isTimingAnchor — only the span is — so this stays exactly what it was
+  // before the span fix.
+  assert.equal(stats.duration_sec, 69);
+});
+
+test('span — a lone timestamped line still reports its own instant', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const only = '2026-07-15T13:11:11.000Z';
+  const file = writeFixture(dir, [
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, only),
+  ]);
+
+  const { stats } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d }).segments[0];
+  assert.equal(stats.started_at, only);
+  assert.equal(stats.ended_at, only);
+  assert.equal(stats.duration_sec, 0);
+});
+
+test('span — bookkeeping stamps are excluded from the span but NOT from duration_sec', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const work = '2026-07-15T13:00:00.000Z';
+  // A task reminder injected 60s into a long turn: real evidence the agent was working, so it
+  // must keep bridging the gap for duration_sec even though it never marks the session's end.
+  const reminder = '2026-07-15T13:01:00.000Z';
+  const done = '2026-07-15T13:02:00.000Z';
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, work),
+    { type: 'attachment', attachment: { type: 'task_reminder' }, gitBranch: 'main', cwd: '/some/path', timestamp: reminder },
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, done),
+  ]);
+
+  const { stats } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d, branchAt: () => 'main' }).segments[0];
+  assert.equal(stats.duration_sec, 120, 'the attachment still bridges the turn');
+  assert.equal(stats.started_at, work);
+  assert.equal(stats.ended_at, done);
+});
+
+// ─── teardown vs real work: simulated cases, one per shape found in the corpus ───────────────
+//
+// Every row here is modelled on a real local transcript. The NEGATIVE cases matter most: 8
+// errored tool_results land after an idle gap and 7 of them are genuine session time, so a
+// broader "errored result = teardown" rule would silently eat real work. These pin that boundary.
+
+const TEARDOWN_TEXT =
+  'Tool permission request failed: AbortError: Tool permission stream closed before response received';
+
+// Two turns of work, then one trailing line after a long gap. Returns the reported span.
+function spanAfterTrailing(dir, trailingLine) {
+  const w1 = '2026-07-22T17:51:38.000Z';
+  const w2 = '2026-07-22T17:52:46.299Z';
+  const file = writeFixture(dir, [
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, w1),
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, w2),
+    trailingLine,
+  ]);
+  const { segments } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d, branchAt: () => 'main' });
+  return { span: segments[0].stats, lastWork: w2 };
+}
+
+const errorResult = (text, timestamp) => ({
+  type: 'user',
+  gitBranch: 'main',
+  cwd: '/some/path',
+  timestamp,
+  toolUseResult: { stdout: '' },
+  message: { role: 'user', content: [{ type: 'tool_result', content: text, is_error: true }] },
+});
+
+test('teardown — the permission stream-closed result never ends the session (afa6f965)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // 1112 minutes later — the session was reopened the next day.
+  const { span, lastWork } = spanAfterTrailing(dir, errorResult(TEARDOWN_TEXT, '2026-07-23T12:24:54.484Z'));
+  assert.equal(span.ended_at, lastWork, 'stream-closed teardown is not session time');
+});
+
+test('teardown — a tool that ran and timed out IS session time (dd6e1682)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const at = '2026-07-22T17:57:46.299Z'; // +5min, matching the real "timed out after 5m 0s"
+  const { span } = spanAfterTrailing(dir, errorResult('Exit code 143\nCommand timed out after 5m 0s', at));
+  assert.equal(span.ended_at, at, 'a real tool run that failed still ends the session');
+});
+
+test('teardown — a human rejecting a permission after 95min IS session time (ad8996c1)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const at = '2026-07-22T19:27:46.299Z'; // +95min
+  const { span } = spanAfterTrailing(
+    dir,
+    errorResult("The user doesn't want to proceed with this tool use. The tool use was rejected", at),
+  );
+  assert.equal(span.ended_at, at, 'the human answered — they were there');
+});
+
+test('teardown — a failed command exit code IS session time (4a7db9ee)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const at = '2026-07-22T17:58:46.299Z';
+  const { span } = spanAfterTrailing(dir, errorResult('Exit code 128', at));
+  assert.equal(span.ended_at, at);
+});
+
+test('teardown — a batch mixing teardown with a real result stays session time', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // Parallel tool calls answer in one batch: one died with the stream, the other really ran.
+  const at = '2026-07-23T12:24:54.484Z';
+  const { span } = spanAfterTrailing(dir, {
+    type: 'user',
+    gitBranch: 'main',
+    cwd: '/some/path',
+    timestamp: at,
+    message: {
+      role: 'user',
+      content: [
+        { type: 'tool_result', content: TEARDOWN_TEXT, is_error: true },
+        { type: 'tool_result', content: 'total 12\ndrwxr-xr-x', is_error: false },
+      ],
+    },
+  });
+  assert.equal(span.ended_at, at, 'one genuine result makes the whole batch a genuine moment');
+});
+
+test('teardown — agents_killed remains an anchor', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // Considered for the deny list and deliberately left out: 0 of 6 trail a session in the corpus,
+  // and the stamp coincides with the human pressing Esc, which is a real moment.
+  const killed = '2026-07-22T17:57:46.299Z';
+  const { span } = spanAfterTrailing(dir, {
+    type: 'system', subtype: 'agents_killed', gitBranch: 'main', cwd: '/some/path', timestamp: killed,
+  });
+  assert.equal(span.ended_at, killed, 'agents_killed still marks a moment');
+});
+
+test('teardown — a <synthetic> placeholder does not end the session (02a54415)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // model:'<synthetic>' means Claude Code filled the assistant slot itself — no model call, no
+  // tokens. It records that nothing happened. Left out of the deny list until the local-command
+  // rule exposed 02a54415, whose transcript ends on one 8 minutes past the last real turn.
+  const { span, lastWork } = spanAfterTrailing(dir, {
+    type: 'assistant',
+    gitBranch: 'main',
+    cwd: '/some/path',
+    timestamp: '2026-07-22T18:00:46.299Z',
+    message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'No response requested.' }] },
+  });
+  assert.equal(span.ended_at, lastWork, 'a placeholder is not a turn');
+});
+
+// ─── local slash commands: solid housekeeping vs a command that does something ───────────────
+//
+// The rule needs no lookahead. A command that spawns work is followed within milliseconds by its
+// expansion and the assistant turn, and THOSE anchor the session. A "solid" command (no user
+// input, nothing follows) leaves nothing behind, so the wait after it is skipped.
+
+const commandEcho = (name, args, timestamp) => ({
+  type: 'user',
+  gitBranch: 'main',
+  cwd: '/some/path',
+  timestamp,
+  message: {
+    role: 'user',
+    content: `<command-name>/${name}</command-name>\n<command-message>${name}</command-message>\n<command-args>${args}</command-args>`,
+  },
+});
+
+test('command — a solid /clear does not open the session hours early (cec9640d)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // Modelled on the real worst case: /clear at 08:33, first real prompt at 12:28.
+  const work = '2026-08-05T12:28:42.551Z';
+  const file = writeFixture(dir, [
+    commandEcho('clear', '', '2026-08-05T08:33:06.311Z'),
+    { type: 'system', subtype: 'local_command', gitBranch: 'main', cwd: '/some/path', timestamp: '2026-08-05T08:33:13.346Z',
+      message: { role: 'user', content: '<local-command-stdout></local-command-stdout>' } },
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, work),
+  ]);
+
+  const { stats } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d, branchAt: () => 'main' }).segments[0];
+  assert.equal(stats.started_at, work, '236 minutes of nothing are not session time');
+});
+
+test('command — a command that spawns work IS tracked from the work (/code-review)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // The echo is denied, but the expansion is followed immediately by a real assistant turn, so
+  // the session is timed from the moment the work began — milliseconds later, not hours.
+  const cmd = '2026-08-10T09:35:18.100Z';
+  const spawn = '2026-08-10T09:35:18.300Z';
+  const later = '2026-08-10T10:02:28.778Z';
+  const file = writeFixture(dir, [
+    commandEcho('code-review', 'https://dev.azure.com/org/repo', cmd),
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, spawn),
+    assistantLine('main', 'm', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, later),
+  ]);
+
+  const { stats } = computeDelta(file, 0, { cwd: '/some/path', repoRootOf: (d) => d, branchAt: () => 'main' }).segments[0];
+  assert.equal(stats.started_at, spawn, 'work that follows the command anchors it');
+  assert.equal(stats.ended_at, later, 'and the whole fan-out stays inside the span');
+});
+
+test('command — a solid command at the END does not extend the session (/plugin)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // 8 local transcripts close on a system:local_command from /plugin or /reload-plugins.
+  const { span, lastWork } = spanAfterTrailing(dir, commandEcho('plugin', '', '2026-07-22T19:43:46.299Z'));
+  assert.equal(span.ended_at, lastWork, 'housekeeping after the work is not session time');
+});
+
+test('command — injected meta lines are not anchors at either end', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  // A system-reminder (5b4bc730) and the resume marker are both isMeta injections, stamped when
+  // the session is assembled rather than when a human speaks.
+  const { span, lastWork } = spanAfterTrailing(dir, {
+    type: 'user',
+    isMeta: true,
+    gitBranch: 'main',
+    cwd: '/some/path',
+    timestamp: '2026-07-22T18:05:46.299Z',
+    message: { role: 'user', content: '<system-reminder>The user named this session "ping".</system-reminder>' },
+  });
+  assert.equal(span.ended_at, lastWork);
 });

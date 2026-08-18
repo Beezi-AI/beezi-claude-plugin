@@ -1,4 +1,4 @@
-import path from 'node:path';
+import path from 'path';
 
 // A string's line count, tolerating one trailing newline. Empty/undefined → 0.
 function lineCount(s) {
@@ -30,10 +30,11 @@ export function computeCodeChanges(lines) {
   };
 
   for (const line of lines) {
-    const content = line?.message?.content;
+    const message = line == null ? undefined : line.message;
+    const content = message == null ? undefined : message.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
-      if (block?.type !== 'tool_use' || !EDIT_TOOLS.has(block.name)) continue;
+      if (block == null || block.type !== 'tool_use' || !EDIT_TOOLS.has(block.name)) continue;
       const input = block.input || {};
       const filePath = input.file_path || input.notebook_path || null;
       touch(filePath);

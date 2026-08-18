@@ -1,5 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'fs';
+import path from 'path';
 
 // Read the sibling agent-<id>.meta.json Claude Code writes next to each subagent transcript.
 // Holds { agentType, spawnDepth, toolUseId }. Missing/malformed meta yields nulls so the
@@ -10,9 +10,9 @@ function readAgentMeta(dir, agentId) {
   try {
     const meta = JSON.parse(fs.readFileSync(path.join(dir, `${agentId}.meta.json`), 'utf-8'));
     return {
-      agentType: typeof meta?.agentType === 'string' ? meta.agentType : null,
-      spawnDepth: typeof meta?.spawnDepth === 'number' ? meta.spawnDepth : null,
-      toolUseId: typeof meta?.toolUseId === 'string' ? meta.toolUseId : null,
+      agentType: meta != null && typeof meta.agentType === 'string' ? meta.agentType : null,
+      spawnDepth: meta != null && typeof meta.spawnDepth === 'number' ? meta.spawnDepth : null,
+      toolUseId: meta != null && typeof meta.toolUseId === 'string' ? meta.toolUseId : null,
     };
   } catch {
     return { agentType: null, spawnDepth: null, toolUseId: null };
@@ -39,11 +39,12 @@ export function buildTaskDescriptionMap(transcriptPath) {
     } catch {
       continue;
     }
-    const content = rec?.message?.content;
+    const message = rec == null ? undefined : rec.message;
+    const content = message == null ? undefined : message.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
-      if (block?.type !== 'tool_use' || block.name !== 'Task' || !block.id) continue;
-      const desc = block.input?.description;
+      if (block == null || block.type !== 'tool_use' || block.name !== 'Task' || !block.id) continue;
+      const desc = block.input == null ? undefined : block.input.description;
       if (typeof desc === 'string' && desc.trim()) map.set(block.id, desc.trim());
     }
   }

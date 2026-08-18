@@ -17,13 +17,14 @@ function setHome(dir) {
   process.env.BEEZI_HOME = dir;
 }
 
-function assistantLine(branch, model, usage, timestamp, cwd) {
+function assistantLine(branch, model, usage, timestamp, cwd, effort) {
   return {
     type: 'assistant',
     gitBranch: branch,
     ...(cwd === undefined ? {} : { cwd }),
     timestamp,
     message: { model, usage },
+    ...(effort === undefined ? {} : { effort }),
   };
 }
 
@@ -190,7 +191,7 @@ test('3. task-branch segment enqueued with correct segmentId, remote, branch, li
   setHome(dir2);
 
   const transcript2 = writeTranscript(dir2, [
-    assistantLine('feature/task-1', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:00.000Z'),
+    assistantLine('feature/task-1', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:00.000Z', undefined, 'high'),
   ]);
 
   await runCheckpoint(
@@ -214,6 +215,11 @@ test('3. task-branch segment enqueued with correct segmentId, remote, branch, li
   assert.equal(payload.to_line, 1);
   assert.equal(payload.token_total, 150); // 100 + 50
   assert.ok(payload.models && payload.models['model-a'], 'models.model-a must exist');
+  assert.deepEqual(
+    payload.models['model-a'].by_effort,
+    { high: { token_input: 100, token_output: 50, token_cache_read: 0, token_cache_creation: 0, requests: 1 } },
+    'by_effort rides the wire inside the models entry',
+  );
 });
 
 // ─── test 4: non-task branch now enqueued (all-branches), cursor advances ────
@@ -879,7 +885,7 @@ test('20. subagent transcript usage is enqueued as its own segment', async (t) =
     assistantLine('main', 'claude-fable-5', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:00.000Z'),
   ]);
   writeSubagentTranscript(dir, 'sess-20', 'agent-abc123', [
-    assistantLine('main', 'claude-sonnet-5', { input_tokens: 200, output_tokens: 80, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:30.000Z'),
+    assistantLine('main', 'claude-sonnet-5', { input_tokens: 200, output_tokens: 80, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:30.000Z', undefined, 'xhigh'),
   ]);
   fs.writeFileSync(
     path.join(dir, 'sess-20', 'subagents', 'agent-abc123.meta.json'),
@@ -909,6 +915,10 @@ test('20. subagent transcript usage is enqueued as its own segment', async (t) =
   assert.equal(agent.payload.sessionId, 'sess-20', 'subagent work bills to the parent session');
   assert.equal(agent.payload.token_total, 280, 'subagent tokens counted (200+80)');
   assert.ok(agent.payload.models['claude-sonnet-5'], 'subagent model reported');
+  assert.equal(
+    agent.payload.models['claude-sonnet-5'].by_effort.xhigh.requests, 1,
+    'subagent enqueue path carries by_effort',
+  );
   assert.equal(agent.payload.branch, 'main');
   assert.equal(agent.payload.remote, 'https://host/org/repo.git');
   assert.equal(agent.payload.is_subagent, true, 'subagent segment is flagged');
@@ -1243,4 +1253,560 @@ test('a credit-balance billing_error re-attributes the segment to anthropic_api_
   const billing = JSON.parse(fs.readFileSync(path.join(dir, 'billing.json'), 'utf-8'));
   assert.ok(billing.apiKeyEvidenceAt, 'the proof is persisted for later sessions');
   assert.equal(billing.plan, 'max_20x', 'the dormant plan is kept, just not reported');
+});
+
+// ─── import seams (sink / skipFlush / collectSessionErrors / persistState) ───
+
+// The bulk import (/beezi:import) drives runCheckpoint per past session and batches delivery
+// itself, so each of its side effects has to be redirectable.
+
+test('28. options.sink receives every payload and the disk queue stays empty', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-13T10:00:00.000Z'),
+  ]);
+
+  const sunk = [];
+  const { enqueued } = await runCheckpoint(
+    { session_id: 'sess-sink', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl: fakeFetch(200) },
+    { sink: (p) => sunk.push(p), skipFlush: true },
+  );
+
+  assert.equal(enqueued, 1);
+  assert.equal(sunk.length, 1, 'payload reached the sink');
+  assert.equal(sunk[0].sessionId, 'sess-sink');
+  assert.equal(readQueue(dir).length, 0, 'nothing written to the disk queue');
+});
+
+test('29. options.skipFlush returns flush null and never calls fetch', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  let fetchCalled = false;
+  const fetchImpl = async () => { fetchCalled = true; return { status: 200 }; };
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-13T10:00:00.000Z'),
+  ]);
+
+  const { flush } = await runCheckpoint(
+    { session_id: 'sess-noflush', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl },
+    { sink: () => {}, skipFlush: true },
+  );
+
+  assert.equal(flush, null);
+  assert.equal(fetchCalled, false, 'skipFlush must issue no HTTP at all');
+});
+
+test('30. options.collectSessionErrors buffers rate-limit reports instead of POSTing them', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const urls = [];
+  const fetchImpl = async (url) => { urls.push(String(url)); return { status: 200 }; };
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-13T10:00:00.000Z'),
+    { type: 'assistant', isApiErrorMessage: true, error: 'rate_limit', timestamp: '2026-07-13T10:05:00.000Z', message: { content: [{ type: 'text', text: 'limit reached' }] } },
+  ]);
+
+  const { sessionErrors } = await runCheckpoint(
+    { session_id: 'sess-rl', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl },
+    { sink: () => {}, skipFlush: true, collectSessionErrors: true },
+  );
+
+  assert.equal(sessionErrors.length, 1, 'the rate-limit event was buffered');
+  assert.equal(sessionErrors[0].sessionId, 'sess-rl');
+  assert.equal(sessionErrors[0].error, 'rate_limit');
+  assert.ok(!urls.some((u) => u.includes('/sessions/errors')), '/sessions/errors must not be called');
+});
+
+// The import builds payloads first and delivers them afterwards. Advancing the cursor here would
+// consume the lines before the server accepted them, so a failed delivery would leave the session
+// both unledgered and unreadable — the re-run would find nothing left to send.
+test('31. options.persistState false leaves the cursor unadvanced', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-13T10:00:00.000Z'),
+  ]);
+
+  const sunk = [];
+  await runCheckpoint(
+    { session_id: 'sess-nostate', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl: fakeFetch(200) },
+    { sink: (p) => sunk.push(p), skipFlush: true, persistState: false },
+  );
+
+  assert.equal(sunk.length, 1, 'the segment was still produced');
+  assert.equal(readState(dir, 'sess-nostate'), null, 'no state file written');
+});
+
+test('32. the default path is unchanged — queue written, state persisted, flush ran', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-13T10:00:00.000Z'),
+  ]);
+
+  const { flush, sessionErrors } = await runCheckpoint(
+    { session_id: 'sess-default', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl: fakeFetch(200) },
+  );
+
+  assert.equal(flush.flushed, 1, 'flush still runs by default');
+  assert.deepEqual(sessionErrors, [], 'sessionErrors is always an array');
+  assert.ok(readState(dir, 'sess-default'), 'state still persisted');
+});
+
+import { writeTrackingState, readTrackingState, TrackingMode } from '../lib/tracking.mjs';
+import { QUEUE_HOLD_MS } from '../lib/checkpoint.mjs';
+
+function fakeJsonFetch(replies) {
+  let i = 0;
+  const calls = [];
+  const impl = async (url, opts) => {
+    calls.push({ url, opts });
+    const reply = replies[Math.min(i, replies.length - 1)];
+    i += 1;
+    return { status: reply.status, json: async () => reply.body ?? {} };
+  };
+  return { impl, calls };
+}
+
+// ─── tenant tracking gate + 403 queue handling + payload clamps ─────────────
+
+test('33. tracking disabled → runCheckpoint does zero work and reports gated', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  writeTrackingState({ trackingMode: TrackingMode.DISABLED });
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 10, output_tokens: 5 }, '2026-07-13T10:00:00.000Z', dir),
+  ]);
+  let fetchCalled = false;
+
+  const result = await runCheckpoint(
+    { session_id: 'gated-1', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGit('https://host/org/repo.git'), fetchImpl: async () => { fetchCalled = true; return { status: 200 }; } },
+  );
+
+  assert.equal(result.gated, true);
+  assert.equal(result.enqueued, 0);
+  assert.equal(fetchCalled, false);
+  assert.deepEqual(readQueue(dir), []);
+  assert.equal(readState(dir, 'gated-1'), null);
+});
+
+test('34. backfill_only blocks live hooks exactly like disabled', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  writeTrackingState({ trackingMode: TrackingMode.BACKFILL_ONLY });
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 10, output_tokens: 5 }, '2026-07-13T10:00:00.000Z', dir),
+  ]);
+
+  const result = await runCheckpoint(
+    { session_id: 'gated-2', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGit('https://host/org/repo.git'), fetchImpl: fakeFetch(200) },
+  );
+
+  assert.equal(result.gated, true);
+  assert.deepEqual(readQueue(dir), []);
+});
+
+test('35. skipLiveTrackingGate runs the full checkpoint even when disabled (the audit path)', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  writeTrackingState({ trackingMode: TrackingMode.BACKFILL_ONLY });
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 10, output_tokens: 5 }, '2026-07-13T10:00:00.000Z', dir),
+  ]);
+  const sunk = [];
+
+  const result = await runCheckpoint(
+    { session_id: 'gated-3', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git') },
+    { sink: (p) => sunk.push(p), skipFlush: true, persistState: false, skipLiveTrackingGate: true },
+  );
+
+  assert.equal(result.gated, undefined);
+  assert.equal(sunk.length, 1);
+});
+
+test('36. flushQueue 403 TRACKING_DISABLED: holds the files, stops the loop, records the state', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const qdir = path.join(dir, 'queue');
+  fs.mkdirSync(qdir, { recursive: true });
+  fs.writeFileSync(path.join(qdir, 'a.json'), JSON.stringify({ segmentId: 'a' }), 'utf-8');
+  fs.writeFileSync(path.join(qdir, 'b.json'), JSON.stringify({ segmentId: 'b' }), 'utf-8');
+  fs.writeFileSync(path.join(qdir, 'c.json'), JSON.stringify({ segmentId: 'c' }), 'utf-8');
+
+  const fetch = fakeJsonFetch([
+    { status: 403, body: { statusCode: 403, code: 'TRACKING_DISABLED', message: 'audit mode' } },
+  ]);
+
+  const result = await flushQueue('tok', { fetchImpl: fetch.impl });
+
+  assert.equal(result.trackingDisabled, true);
+  assert.equal(fetch.calls.length, 1, 'the storm stops after the first 403');
+  assert.equal(readQueue(dir).length, 3, 'files are HELD for the 3-day window, not deleted');
+  assert.equal(readTrackingState().trackingMode, TrackingMode.DISABLED);
+});
+
+test('37. the 3-day hold sweep expires only old files while tracking is off', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  writeTrackingState({ trackingMode: TrackingMode.DISABLED });
+  const qdir = path.join(dir, 'queue');
+  fs.mkdirSync(qdir, { recursive: true });
+  fs.writeFileSync(path.join(qdir, 'fresh.json'), JSON.stringify({ segmentId: 'fresh' }), 'utf-8');
+  fs.writeFileSync(path.join(qdir, 'old.json'), JSON.stringify({ segmentId: 'old' }), 'utf-8');
+  const past = (Date.now() - QUEUE_HOLD_MS - 60_000) / 1000;
+  fs.utimesSync(path.join(qdir, 'old.json'), past, past);
+  let fetchCalled = false;
+
+  const result = await flushQueue('tok', { fetchImpl: async () => { fetchCalled = true; return { status: 200 }; } });
+
+  assert.equal(fetchCalled, false, 'a dark workspace posts nothing');
+  assert.equal(result.trackingDisabled, true);
+  assert.equal(result.expired, 1);
+  assert.deepEqual(readQueue(dir).map((f) => f.name), ['fresh.json']);
+});
+
+test('38. a code-less 403 (seat revoked) keeps the file and counts as failed', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const qdir = path.join(dir, 'queue');
+  fs.mkdirSync(qdir, { recursive: true });
+  fs.writeFileSync(path.join(qdir, 'a.json'), JSON.stringify({ segmentId: 'a' }), 'utf-8');
+
+  const fetch = fakeJsonFetch([
+    { status: 403, body: { statusCode: 403, message: 'Your seat was revoked', error: 'Forbidden' } },
+  ]);
+
+  const result = await flushQueue('tok', { fetchImpl: fetch.impl });
+
+  assert.equal(result.failed, 1);
+  assert.equal(result.trackingDisabled, false);
+  assert.equal(readQueue(dir).length, 1, 'a reversible refusal must not destroy the report');
+  assert.equal(readTrackingState(), null, 'no tracking flip on a code-less 403');
+});
+
+test('39. over-long branch, agent_name and agent_type are clamped to the server caps', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const longBranch = 'feature/' + 'b'.repeat(300);
+  const longDescription = 'd'.repeat(300);
+  const longType = 'x'.repeat(150);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine(longBranch, 'model-a', { input_tokens: 10, output_tokens: 5 }, '2026-07-13T10:00:00.000Z', dir),
+    {
+      type: 'assistant',
+      gitBranch: longBranch,
+      cwd: dir,
+      timestamp: '2026-07-13T10:00:01.000Z',
+      message: {
+        model: 'model-a',
+        content: [{ type: 'tool_use', name: 'Task', id: 'toolu_1', input: { description: longDescription } }],
+      },
+    },
+  ]);
+  const subDir = path.join(path.dirname(transcript), 'clamp-1', 'subagents');
+  fs.mkdirSync(subDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(subDir, 'agent-a1.jsonl'),
+    JSON.stringify(assistantLine(longBranch, 'model-a', { input_tokens: 7, output_tokens: 3 }, '2026-07-13T10:00:02.000Z', dir)),
+    'utf-8',
+  );
+  fs.writeFileSync(
+    path.join(subDir, 'agent-a1.meta.json'),
+    JSON.stringify({ agentType: longType, spawnDepth: 1, toolUseId: 'toolu_1' }),
+    'utf-8',
+  );
+
+  const sunk = [];
+  await runCheckpoint(
+    { session_id: 'clamp-1', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo(longBranch, 'https://host/org/repo.git') },
+    { sink: (p) => sunk.push(p), skipFlush: true, persistState: false },
+  );
+
+  assert.ok(sunk.length >= 2, 'main and subagent segments were built');
+  for (const payload of sunk) {
+    assert.ok(payload.branch.length <= 255, 'branch of ' + payload.branch.length + ' exceeds the cap');
+  }
+  const agentPayload = sunk.find((p) => p.is_subagent);
+  assert.ok(agentPayload, 'the subagent segment was built');
+  assert.equal(agentPayload.agent_name.length, 200);
+  assert.equal(agentPayload.agent_type.length, 100);
+});
+
+test('40. an audit run (persistState:false) never rewrites the billing config from old evidence', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  fs.writeFileSync(
+    path.join(dir, 'billing.json'),
+    JSON.stringify({
+      version: 1,
+      source: 'subscription',
+      subscriptionType: 'max',
+      plan: 'max_20x',
+      selfReported: true,
+      capturedAt: new Date().toISOString(),
+    }),
+    'utf-8',
+  );
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 10, output_tokens: 5 }, '2026-01-05T10:00:00.000Z', dir),
+    {
+      type: 'assistant',
+      gitBranch: 'main',
+      cwd: dir,
+      timestamp: '2026-01-05T10:00:05.000Z',
+      isApiErrorMessage: true,
+      error: 'billing_error',
+      apiErrorStatus: 400,
+      message: {
+        content: [{ type: 'text', text: 'Your credit balance is too low to access the Anthropic API.' }],
+      },
+    },
+  ]);
+
+  const sunk = [];
+  await runCheckpoint(
+    { session_id: 'audit-billing', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git') },
+    { sink: (p) => sunk.push(p), skipFlush: true, collectSessionErrors: true, persistState: false, skipLiveTrackingGate: true },
+  );
+
+  const billing = JSON.parse(fs.readFileSync(path.join(dir, 'billing.json'), 'utf-8'));
+  assert.equal(billing.apiKeyEvidenceAt, undefined, 'months-old evidence must not stamp the live config');
+  assert.ok(sunk.length >= 1, 'the historical usage still reports');
+});
+
+// The whole value of the retrospective pull: payloads must carry the transcript's own span —
+// the server dates a session at ingest wall-clock when these are absent, which would stamp
+// months of history "today".
+test('41. audit-built payloads carry the transcript-derived started_at/ended_at', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 10, output_tokens: 5 }, '2025-11-02T09:00:00.000Z', dir),
+    assistantLine('main', 'model-a', { input_tokens: 4, output_tokens: 2 }, '2025-11-02T10:30:00.000Z', dir),
+  ]);
+
+  const sunk = [];
+  await runCheckpoint(
+    { session_id: 'span-1', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git') },
+    { sink: (p) => sunk.push(p), skipFlush: true, persistState: false, skipLiveTrackingGate: true },
+  );
+
+  assert.equal(sunk.length, 1);
+  assert.equal(sunk[0].started_at, '2025-11-02T09:00:00.000Z');
+  assert.equal(sunk[0].ended_at, '2025-11-02T10:30:00.000Z');
+});
+
+// …and that span stops at the last real turn. Claude Code appends an away_summary recap once the
+// human walks off (the last timestamped record in 107 of 231 local transcripts), so a backfilled
+// session used to be reported as ending tens of minutes deep into its own idle tail.
+test('41b. the away recap does not push the payload ended_at into the idle tail', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', { input_tokens: 10, output_tokens: 5 }, '2025-11-02T09:00:00.000Z', dir),
+    assistantLine('main', 'model-a', { input_tokens: 4, output_tokens: 2 }, '2025-11-02T09:01:00.000Z', dir),
+    { type: 'system', subtype: 'away_summary', content: 'recap', gitBranch: 'main', cwd: dir, timestamp: '2025-11-02T09:50:00.000Z' },
+  ]);
+
+  const sunk = [];
+  await runCheckpoint(
+    { session_id: 'span-away', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git') },
+    { sink: (p) => sunk.push(p), skipFlush: true, persistState: false, skipLiveTrackingGate: true },
+  );
+
+  assert.equal(sunk.length, 1);
+  assert.equal(sunk[0].started_at, '2025-11-02T09:00:00.000Z');
+  assert.equal(sunk[0].ended_at, '2025-11-02T09:01:00.000Z', 'ends at the last turn, not the recap');
+  // The billed clock is untouched by the span filter — still the full 60s of real work.
+  assert.equal(sunk[0].duration_sec, 60);
+});
+
+// A window holding nothing BUT bookkeeping has no anchors at all, so it has no span to report.
+// It must not reach the wire regardless: no tokens and no active clock means nothing to bill.
+test('41c. a bookkeeping-only window emits no payload', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    { type: 'system', subtype: 'away_summary', content: 'recap', gitBranch: 'main', cwd: dir, timestamp: '2025-11-02T09:50:00.000Z' },
+    { type: 'queue-operation', operation: 'remove', timestamp: '2025-11-02T09:50:01.000Z' },
+  ]);
+
+  const sunk = [];
+  await runCheckpoint(
+    { session_id: 'span-bookkeeping', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git') },
+    { sink: (p) => sunk.push(p), skipFlush: true, persistState: false, skipLiveTrackingGate: true },
+  );
+
+  assert.equal(sunk.length, 0, 'no tokens and no active clock — nothing to report');
+});
+
+// ─── usage stamp + context strip + snapshot post ─────────────────────────────
+
+const UTIL_FIXTURE = {
+  fetchedAtMs: 1785953089424,
+  accountUuid: 'acc-1',
+  fiveHourPct: 1,
+  fiveHourResetsAt: '2026-08-05T22:19:59.360Z',
+  sevenDayPct: 20,
+  sevenDayResetsAt: '2026-08-10T12:00:00.360Z',
+  limits: [{ kind: 'session', percent: 1 }],
+  raw: {},
+};
+const ACCOUNT_FIXTURE = { accountUuid: 'acc-1', subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x' };
+const USAGE_FIXTURE = { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+const USAGE_STAMP_KEYS = ['account_uuid', 'usage_account_uuid', 'usage_five_hour_pct', 'usage_seven_day_pct', 'usage_fetched_at'];
+
+function usageDeps(extra = {}) {
+  return {
+    getAccessToken: async () => 'tok',
+    gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'),
+    fetchImpl: fakeFetch(503), // keeps queue files on disk for inspection
+    readUsageUtilization: () => UTIL_FIXTURE,
+    readClaudeAccount: () => ACCOUNT_FIXTURE,
+    maybePostUsageSnapshot: async () => ({ reported: false, reason: 'test' }),
+    ...extra,
+  };
+}
+
+test('usage stamp — rides every payload when the caches are readable', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint({ session_id: 'sess-u1', transcript_path: transcript, cwd: dir }, usageDeps());
+  const queue = readQueue(dir);
+  assert.equal(queue.length, 1);
+  const p = queue[0].payload;
+  assert.equal(p.account_uuid, 'acc-1');
+  assert.equal(p.usage_account_uuid, 'acc-1');
+  assert.equal(p.usage_five_hour_pct, 1);
+  assert.equal(p.usage_seven_day_pct, 20);
+  assert.equal(p.usage_fetched_at, new Date(1785953089424).toISOString());
+});
+
+test('usage stamp — no stamp keys at all when both caches are unreadable', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint(
+    { session_id: 'sess-u2', transcript_path: transcript, cwd: dir },
+    usageDeps({
+      readUsageUtilization: () => { throw new Error('boom'); },
+      readClaudeAccount: () => { throw new Error('boom'); },
+    }),
+  );
+  const p = readQueue(dir)[0].payload;
+  for (const key of USAGE_STAMP_KEYS) {
+    assert.equal(key in p, false, `${key} must be absent, not null`);
+  }
+});
+
+test('usage stamp — context fields ride main segments, stripped from subagent segments', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  const subDir = path.join(path.dirname(transcript), 'sess-u3', 'subagents');
+  fs.mkdirSync(subDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(subDir, 'agent-a1.jsonl'),
+    JSON.stringify(assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:30.000Z')),
+    'utf-8',
+  );
+  await runCheckpoint({ session_id: 'sess-u3', transcript_path: transcript, cwd: dir }, usageDeps());
+  const queue = readQueue(dir).map((q) => q.payload);
+  const main = queue.find((p) => !p.is_subagent);
+  const sub = queue.find((p) => p.is_subagent === true);
+  assert.ok(main, 'main payload exists');
+  assert.ok(sub, 'subagent payload exists');
+  assert.equal(main.context_peak_tokens, 100);
+  assert.equal(main.context_final_tokens, 100);
+  assert.equal(main.context_final_model, 'model-a');
+  assert.equal('context_peak_tokens' in sub, false);
+  assert.equal('context_final_tokens' in sub, false);
+  assert.equal('context_final_model' in sub, false);
+  assert.equal(sub.token_input, 100, 'subagent token fields stay intact');
+});
+
+test('usage stamp — snapshot post fires only with emitTimeline, via the deps seam', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  let calls = 0;
+  const deps = usageDeps({ maybePostUsageSnapshot: async () => { calls += 1; return { reported: true }; } });
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint({ session_id: 'sess-u4', transcript_path: transcript, cwd: dir }, deps);
+  assert.equal(calls, 0, 'plain checkpoint must not post a snapshot');
+  await runCheckpoint({ session_id: 'sess-u4', transcript_path: transcript, cwd: dir }, deps, { emitTimeline: true });
+  assert.equal(calls, 1, 'turn-end checkpoint posts once');
+});
+
+// ─── CLAUDE.md size rides the report ────────────────────────────────────────
+
+test('claude_md_lines — reported from the segment repo root, omitted when the repo has none', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  fs.writeFileSync(path.join(dir, 'CLAUDE.md'), '# Rules\n\nBe careful.\n', 'utf-8');
+
+  const deps = {
+    getAccessToken: async () => 'tok',
+    gitImpl: fakeGitRepo('feature/task-1', 'https://host/org/repo.git'),
+    fetchImpl: fakeFetch(503), // keep the queue file so the payload is readable
+  };
+  const transcript = writeTranscript(dir, [
+    assistantLine('feature/task-1', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint({ session_id: 'sess-md', transcript_path: transcript, cwd: dir }, deps);
+
+  const items = readQueue(dir);
+  assert.equal(items.length, 1, 'exactly one queue file');
+  assert.equal(items[0].payload.claude_md_lines, 3);
+
+  // Same setup, no CLAUDE.md: the key must be absent rather than 0, which the server reads as
+  // an empty-but-present file.
+  const bare = makeTmpDir(t);
+  setHome(bare);
+  const transcript2 = writeTranscript(bare, [
+    assistantLine('feature/task-1', 'model-a', { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint({ session_id: 'sess-md2', transcript_path: transcript2, cwd: bare }, deps);
+
+  const bareItems = readQueue(bare);
+  assert.equal(bareItems.length, 1, 'exactly one queue file');
+  assert.equal('claude_md_lines' in bareItems[0].payload, false);
 });

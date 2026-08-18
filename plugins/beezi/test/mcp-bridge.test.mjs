@@ -150,3 +150,106 @@ test('handleLine drops non-JSON input without writing', async () => {
   assert.equal(calls.length, 0);
   assert.equal(out.length, 0);
 });
+
+// ── lazy link: an unlinked machine must still hand Claude Code a healthy server ──
+
+// Harness with a MUTABLE token and captured interval callbacks, for the login-mid-session flow.
+function lazyBridgeWith({ responses = [] } = {}) {
+  const calls = [];
+  const out = [];
+  const ticks = [];
+  const state = { token: null, cleared: 0 };
+  const bridge = createBridge({
+    url: URL_UNDER_TEST,
+    getAccessToken: async () => state.token,
+    fetchImpl: async (url, init) => {
+      calls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
+      const next = responses.shift();
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    timeoutMs: 1000,
+    setIntervalImpl: (fn) => { ticks.push(fn); return { unref() {} }; },
+    clearIntervalImpl: () => { state.cleared += 1; },
+  });
+  return { bridge, calls, out, ticks, state };
+}
+
+test('unlinked initialize succeeds locally instead of failing the server', async () => {
+  const { bridge, calls, out, ticks } = lazyBridgeWith();
+  await bridge.handleMessage(INIT);
+  assert.equal(calls.length, 0, 'nothing forwarded without a token');
+  assert.equal(out.length, 1);
+  assert.equal(out[0].id, 0);
+  assert.equal(out[0].result.protocolVersion, '2025-06-18');
+  assert.equal(out[0].result.capabilities.tools.listChanged, true);
+  assert.equal(ticks.length, 1, 'credential watcher started');
+});
+
+test('unlinked tools/list is empty; tools/call still explains /beezi:login', async () => {
+  const { bridge, out } = lazyBridgeWith();
+  await bridge.handleMessage(INIT);
+  await bridge.handleMessage({ jsonrpc: '2.0', id: 5, method: 'tools/list' });
+  assert.deepEqual(out[1], { jsonrpc: '2.0', id: 5, result: { tools: [] } });
+  await bridge.handleMessage(CALL);
+  assert.match(out[2].error.message, /\/beezi:login/);
+});
+
+test('watcher: login mid-session replays the handshake and announces the tools', async () => {
+  const { bridge, calls, out, ticks, state } = lazyBridgeWith({
+    responses: [
+      sseRes([INIT_RESULT], { headers: { 'mcp-session-id': 's1' } }),
+      new Response(null, { status: 202 }),
+      jsonRes(CALL_RESULT),
+    ],
+  });
+  await bridge.handleMessage(INIT);
+
+  await ticks[0](); // no token yet — nothing happens
+  assert.equal(calls.length, 0);
+
+  state.token = 'tok';
+  await ticks[0]();
+  assert.equal(calls[0].body.method, 'initialize');
+  assert.equal(calls[1].body.method, 'notifications/initialized');
+  const listChanged = out.find((m) => m.method === 'notifications/tools/list_changed');
+  assert.ok(listChanged, 'client told to re-fetch the tool list');
+  assert.ok(!out.some((m) => m.id === 0 && m.result?.capabilities && out.indexOf(m) > 0),
+    'replayed initialize response stays hidden');
+  assert.equal(state.cleared, 1, 'watcher stopped after linking');
+
+  await bridge.handleMessage(CALL);
+  assert.equal(calls[2].body.method, 'tools/call');
+  assert.equal(calls[2].headers['mcp-session-id'], 's1');
+  assert.deepEqual(out.at(-1), CALL_RESULT);
+});
+
+test('a request after login links even before the watcher fires', async () => {
+  const { bridge, calls, out, state } = lazyBridgeWith({
+    responses: [
+      sseRes([INIT_RESULT], { headers: { 'mcp-session-id': 's2' } }),
+      new Response(null, { status: 202 }),
+      jsonRes({ jsonrpc: '2.0', id: 7, result: { tools: [{ name: 'draft_ticket' }] } }),
+    ],
+  });
+  await bridge.handleMessage(INIT);
+  state.token = 'tok';
+
+  await bridge.handleMessage({ jsonrpc: '2.0', id: 7, method: 'tools/list' });
+  assert.equal(calls[0].body.method, 'initialize', 'handshake replayed first');
+  assert.equal(calls[2].body.method, 'tools/list');
+  assert.equal(out.at(-1).result.tools[0].name, 'draft_ticket');
+});
+
+test('linked startup is unchanged: initialize forwards and no watcher starts', async () => {
+  const { bridge, calls, out, ticks, state } = lazyBridgeWith({
+    responses: [sseRes([INIT_RESULT])],
+  });
+  state.token = 'tok';
+  await bridge.handleMessage(INIT);
+  assert.equal(calls[0].body.method, 'initialize');
+  assert.deepEqual(out, [INIT_RESULT]);
+  assert.equal(ticks.length, 0, 'no watcher while linked');
+});

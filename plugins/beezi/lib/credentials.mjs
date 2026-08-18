@@ -1,10 +1,14 @@
-import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
-import path from 'node:path';
+import { execFileSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 import { credentialsFile } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 
-const SERVICE = 'beezi-analytics';
+import { envSuffix } from './paths.mjs';
+
+// Per-environment credential entry ('beezi-analytics-dev' on the dev variant), so a dev login
+// can never overwrite the prod or staging token.
+const SERVICE = `beezi-analytics${envSuffix()}`;
 const ACCOUNT = 'token';
 
 // Absolute path to PowerShell — never a bare name. On Windows a bare `powershell.exe`
@@ -20,7 +24,7 @@ const POWERSHELL = process.env.SystemRoot
 function defaultRun(file, args, input) {
   try {
     const stdout = execFileSync(file, args, {
-      input: input ?? undefined,
+      input: input == null ? undefined : input,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'ignore'],
       windowsHide: true,
@@ -28,7 +32,7 @@ function defaultRun(file, args, input) {
       timeout: 5000,
       killSignal: 'SIGKILL',
     });
-    return { ok: true, stdout: stdout ?? '' };
+    return { ok: true, stdout: stdout == null ? '' : stdout };
   } catch {
     return { ok: false, stdout: '' };
   }
@@ -82,7 +86,7 @@ function secretToolBackend(run) {
     },
     set(token) {
       // secret-tool reads the secret from stdin — keeps it out of the process list.
-      return run('secret-tool', ['store', '--label=beezi-analytics', ...attrs], token).ok
+      return run('secret-tool', ['store', `--label=${SERVICE}`, ...attrs], token).ok
         ? 'the OS secret service (libsecret)' : false;
     },
     delete() {
@@ -224,8 +228,8 @@ function fileBackend() {
 
 // Preferred backend chain for the platform; the plaintext file is always the tail.
 function backends(deps) {
-  const run = deps.run ?? defaultRun;
-  const platform = deps.platform ?? process.platform;
+  const run = deps.run == null ? defaultRun : deps.run;
+  const platform = deps.platform == null ? process.platform : deps.platform;
   const file = fileBackend();
   if (platform === 'darwin') return [macBackend(run), file];
   if (platform === 'linux') return [secretToolBackend(run), file];

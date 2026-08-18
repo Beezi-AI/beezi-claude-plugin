@@ -26,7 +26,7 @@ export function isStale(config, now = Date.now(), staleMs = STALE_MS) {
   // invalidate it; the user re-runs /beezi:login when their tier changes.
   if (config.selfReported) return false;
   if (typeof config.credentialsExpiresAt === 'number' && config.credentialsExpiresAt <= now) return true;
-  const capturedAt = Date.parse(config.capturedAt ?? '');
+  const capturedAt = Date.parse(config.capturedAt == null ? '' : config.capturedAt);
   if (Number.isNaN(capturedAt)) return true;
   return now - capturedAt > staleMs;
 }
@@ -35,9 +35,9 @@ export function isStale(config, now = Date.now(), staleMs = STALE_MS) {
 export function subscriptionReportFields(billingSource, config) {
   if (billingSource !== BillingSource.SUBSCRIPTION || !config) return {};
   return {
-    subscription_type: config.subscriptionType ?? null,
-    rate_limit_tier: config.rateLimitTier ?? null,
-    subscription_plan: config.plan ?? null,
+    subscription_type: config.subscriptionType == null ? null : config.subscriptionType,
+    rate_limit_tier: config.rateLimitTier == null ? null : config.rateLimitTier,
+    subscription_plan: config.plan == null ? null : config.plan,
   };
 }
 
@@ -62,7 +62,7 @@ export function thirdPartyReportFields(billingSource, env = process.env) {
 const API_KEY_EVIDENCE_MS = 24 * 60 * 60 * 1000;
 
 export function hasFreshApiKeyEvidence(config, now = Date.now()) {
-  const at = Date.parse(config?.apiKeyEvidenceAt ?? '');
+  const at = Date.parse(config == null || config.apiKeyEvidenceAt == null ? '' : config.apiKeyEvidenceAt);
   if (Number.isNaN(at)) return false;
   return now - at <= API_KEY_EVIDENCE_MS && at <= now;
 }
@@ -72,15 +72,15 @@ export function hasFreshApiKeyEvidence(config, now = Date.now()) {
 // the evidence has to survive even on a machine that never ran /beezi:login.
 export function recordApiKeyEvidence(config, now = new Date()) {
   if (hasFreshApiKeyEvidence(config, now.getTime())) return null;
-  return { version: 1, ...(config ?? {}), apiKeyEvidenceAt: now.toISOString() };
+  return { version: 1, ...(config == null ? {} : config), apiKeyEvidenceAt: now.toISOString() };
 }
 
 // The single source-of-truth resolution, shared by the session-start hook and every checkpoint so
 // the two can never disagree about what this machine is billing.
 export function resolveSource(config, env = process.env, deps = {}) {
-  const readAccount = deps.readClaudeAccount ?? readClaudeAccount;
-  const readSignals = deps.readClaudeAuthSignals ?? readClaudeAuthSignals;
-  const now = deps.now ?? Date.now();
+  const readAccount = deps.readClaudeAccount == null ? readClaudeAccount : deps.readClaudeAccount;
+  const readSignals = deps.readClaudeAuthSignals == null ? readClaudeAuthSignals : deps.readClaudeAuthSignals;
+  const now = deps.now == null ? Date.now() : deps.now;
   const fromEnv = detectBillingSourceFromEnv(env);
   if (fromEnv !== BillingSource.UNKNOWN) return fromEnv;
   if (hasFreshApiKeyEvidence(config, now)) return BillingSource.ANTHROPIC_API_KEY;
@@ -96,7 +96,7 @@ export function resolveSource(config, env = process.env, deps = {}) {
   // that works on a machine exposing no observable signal at all, which is why the nudge points
   // there — but it is unverifiable testimony, so anything above overrules it, and an API-key
   // balance error (checked above) revokes it outright.
-  const declared = config?.selfReported === true ? config.source : null;
+  const declared = config != null && config.selfReported === true ? config.source : null;
   if (
     declared === BillingSource.SUBSCRIPTION
     || declared === BillingSource.ANTHROPIC_API_KEY

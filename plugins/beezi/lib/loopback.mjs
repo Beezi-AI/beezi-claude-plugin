@@ -1,4 +1,4 @@
-import http from 'node:http';
+import http from 'http';
 import { UserError } from './friendly-error.mjs';
 
 const CLOSE_PAGE = '<!doctype html><meta charset="utf-8"><title>Beezi</title>'

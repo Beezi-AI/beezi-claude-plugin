@@ -2,13 +2,16 @@
 // own the status/body handling; throws on network error or timeout (caller catches).
 // The timeout guards the hook's 10s budget — a hung server must not stall the turn.
 import { machineHeaders } from './machine-identity.mjs';
+import { resolveFetch } from './fetch-compat.mjs';
+import { resolveAbortController } from './abort-compat.mjs';
 
 const DEFAULT_TIMEOUT_MS = 3000;
 
 export async function postJson(url, token, body, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const controller = new AbortController();
+  const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
+  const timeoutMs = deps.timeoutMs == null ? DEFAULT_TIMEOUT_MS : deps.timeoutMs;
+  const AbortControllerImpl = resolveAbortController();
+  const controller = new AbortControllerImpl();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, {

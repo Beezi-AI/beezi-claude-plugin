@@ -271,3 +271,84 @@ test('resolveSource — API-key evidence revokes a self-reported subscription', 
   };
   assert.equal(resolveSource(config, {}, { ...noAccount, now }), 'anthropic_api_key');
 });
+
+// ─── Claude Desktop's injected base URL, through the real resolution path ────
+// The reported regression, at the level session-start.mjs and checkpoint.mjs actually call:
+// Claude Desktop injects ANTHROPIC_BASE_URL=https://api.anthropic.com into every session it
+// spawns, which used to outrank the oauthAccount and relabel a Team seat as gateway billing.
+
+const DESKTOP_ENV = Object.freeze({ ANTHROPIC_BASE_URL: 'https://api.anthropic.com' });
+
+const TEAM_CONFIG = Object.freeze({
+  version: 1,
+  source: 'subscription',
+  subscriptionType: 'team',
+  rateLimitTier: null,
+  plan: 'team',
+  selfReported: true,
+});
+
+test('resolveBilling — a Claude Desktop session reports the subscription plan, not a gateway', () => {
+  assert.deepEqual(resolveBilling(TEAM_CONFIG, DESKTOP_ENV, withAccount), {
+    billing_source: 'subscription',
+    subscription_type: 'team',
+    rate_limit_tier: null,
+    subscription_plan: 'team',
+  });
+});
+
+test('resolveSource — a machine already flipped to third_party heals on the next desktop session', () => {
+  // What an affected machine looks like before the fix reaches it: the SessionStart sync rewrote
+  // `source` while preserving the plan. With a readable account it must resolve back to
+  // subscription, which is what makes syncBillingSource realign billing.json.
+  const flipped = { ...TEAM_CONFIG, source: 'third_party', sourceUpdatedAt: '2026-08-01T00:00:00.000Z' };
+  assert.equal(resolveSource(flipped, DESKTOP_ENV, withAccount), 'subscription');
+  assert.deepEqual(syncBillingSource(flipped, 'subscription', new Date(0)), {
+    ...flipped,
+    source: 'subscription',
+    sourceUpdatedAt: '1970-01-01T00:00:00.000Z',
+  });
+});
+
+test('resolveBilling — a gateway paid with an API key still reports gateway through the same path', () => {
+  const gatewayEnv = { ANTHROPIC_BASE_URL: 'https://gw.corp.example', ANTHROPIC_API_KEY: 'sk-x' };
+  assert.deepEqual(resolveBilling(TEAM_CONFIG, gatewayEnv, withAccount), {
+    billing_source: 'third_party',
+    third_party_provider: 'gateway',
+  });
+});
+
+test('resolveBilling — a declared tier survives a proxy in front of the API', () => {
+  // The route says nothing about the payer, so the machine cannot settle this alone — but once the
+  // user has said their subscription pays, that answer holds through the gateway.
+  assert.deepEqual(resolveBilling(TEAM_CONFIG, { ANTHROPIC_BASE_URL: 'https://proxy.example' }, withAccount), {
+    billing_source: 'subscription',
+    subscription_type: 'team',
+    rate_limit_tier: null,
+    subscription_plan: 'team',
+  });
+});
+
+test('resolveSource — a custom gateway with no declaration stays unknown so the user is asked', () => {
+  const gatewayEnv = { ANTHROPIC_BASE_URL: 'https://gw.corp.example' };
+  assert.equal(resolveSource(null, gatewayEnv, withAccount), 'unknown');
+  // A stored source that was never declared by the user is not testimony either.
+  assert.equal(resolveSource({ source: 'subscription', plan: 'team' }, gatewayEnv, withAccount), 'unknown');
+});
+
+test('resolveBilling — a declared gateway reports third-party billing and names the route', () => {
+  const declared = { source: 'third_party', plan: null, selfReported: true };
+  assert.deepEqual(resolveBilling(declared, { ANTHROPIC_BASE_URL: 'https://gw.corp.example' }, withAccount), {
+    billing_source: 'third_party',
+    third_party_provider: 'gateway',
+  });
+});
+
+test('resolveBilling — an undeclared gateway machine reports unknown and nothing else', () => {
+  // The new reporting state these users sit in until they answer /beezi:login: no plan claimed,
+  // no provider named. Previously they were sent as third_party + gateway.
+  assert.deepEqual(
+    resolveBilling({ source: 'subscription', plan: 'team' }, { ANTHROPIC_BASE_URL: 'https://gw.corp.example' }, withAccount),
+    { billing_source: 'unknown' },
+  );
+});

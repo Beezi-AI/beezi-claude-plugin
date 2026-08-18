@@ -1,6 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { reportSessionError, readErrorContext } from '../lib/stop-failure.mjs';
+
+// Isolate from the developer's real ~/.beezi — a machine linked to an audit-mode workspace
+// carries a tracking.json that would trip the live-tracking gate inside reportSessionError.
+process.env.BEEZI_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'stop-failure-test-'));
 
 function captureFetch(status = 200) {
   const calls = [];
@@ -110,4 +117,21 @@ test('readErrorContext returns nulls when transcript is missing/unreadable', () 
     }),
     empty,
   );
+});
+
+// /sessions/errors carries the tracking gate server-side; this path posts outside runCheckpoint
+// so it needs its own client gate — a dark tenant would otherwise 403 on every StopFailure.
+test('reportSessionError no-ops when tracking is not live', async () => {
+  let fetchCalled = false;
+  const res = await reportSessionError(
+    { session_id: 's1', error: 'rate_limit' },
+    {
+      isLiveTrackingAllowedImpl: () => false,
+      getAccessToken: async () => 'tok',
+      fetchImpl: async () => { fetchCalled = true; return { status: 200 }; },
+    },
+  );
+
+  assert.deepEqual(res, { reported: false, reason: 'tracking-disabled' });
+  assert.equal(fetchCalled, false);
 });

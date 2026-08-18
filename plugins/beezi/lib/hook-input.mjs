@@ -1,4 +1,4 @@
-import fs from 'node:fs';
+import fs from 'fs';
 
 export function isGitCheckpointCommand(cmd) {
   return /git\s+(commit|switch|checkout)\b/.test(cmd);

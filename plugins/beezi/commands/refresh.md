@@ -12,4 +12,6 @@ The script reads only the non-secret account info from `~/.claude.json` (never a
 token, never the credentials file) and stores the plan. Report its one-line output
 verbatim. If it says nothing was captured, tell the user their Claude subscription
 info was not found. If the output says the self-reported plan was kept, report
-that verbatim to the user.
+that verbatim to the user. If the output contains `gateway=custom`, tell the user
+this machine goes through a custom API endpoint, so only they can say what it
+bills — point them at `/beezi:login`, which asks.

@@ -1,15 +1,22 @@
 {
   "name": "beezi",
-  "owner": { "name": "Beezi" },
+  "owner": {
+    "name": "Beezi"
+  },
   "description": "Beezi's Claude plugin marketplace.",
   "plugins": [
     {
       "name": "beezi",
       "source": "./plugins/beezi",
-      "description": "Reports Claude Code session token analytics for Beezi task branches.",
-      "version": "0.6.0",
+      "description": "Reports Claude Code session token analytics for Beezi task branches and gives you a personal usage summary on demand.",
+      "version": "0.9.0",
       "author": { "name": "Beezi" },
-      "keywords": ["analytics", "token-usage", "beezi", "telemetry"],
+      "keywords": [
+        "analytics",
+        "token-usage",
+        "beezi",
+        "telemetry"
+      ],
       "category": "analytics"
     },
     {
@@ -17,7 +24,9 @@
       "source": "./plugins/beezi-web",
       "description": "Beezi AI ticket drafting for Claude on claude.ai - sign in with your Beezi account, draft tickets, then create them on your board (Jira / Azure DevOps) or in Beezi",
       "version": "0.1.1",
-      "author": { "name": "Beezi" }
+      "author": {
+        "name": "Beezi"
+      }
     }
   ]
 }

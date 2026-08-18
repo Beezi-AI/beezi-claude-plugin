@@ -14,10 +14,12 @@ const FORCE_EXIT_MS = 2000;
 
 export async function exitClean(code = 0, deps = {}) {
   const getDispatcher =
-    deps.getDispatcher ?? (() => globalThis[Symbol.for('undici.globalDispatcher.1')]);
-  const exit = deps.exit ?? ((c) => process.exit(c));
-  const setExitCode = deps.setExitCode ?? ((c) => { process.exitCode = c; });
-  const schedule = deps.schedule ?? ((fn, ms) => setTimeout(fn, ms).unref());
+    deps.getDispatcher == null
+      ? (() => globalThis[Symbol.for('undici.globalDispatcher.1')])
+      : deps.getDispatcher;
+  const exit = deps.exit == null ? ((c) => process.exit(c)) : deps.exit;
+  const setExitCode = deps.setExitCode == null ? ((c) => { process.exitCode = c; }) : deps.setExitCode;
+  const schedule = deps.schedule == null ? ((fn, ms) => setTimeout(fn, ms).unref()) : deps.schedule;
 
   const dispatcher = getDispatcher();
   if (dispatcher) {
@@ -26,5 +28,5 @@ export async function exitClean(code = 0, deps = {}) {
   }
 
   setExitCode(code);
-  schedule(() => exit(code), deps.forceExitAfterMs ?? FORCE_EXIT_MS);
+  schedule(() => exit(code), deps.forceExitAfterMs == null ? FORCE_EXIT_MS : deps.forceExitAfterMs);
 }

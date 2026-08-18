@@ -1,5 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'fs';
+import path from 'path';
 import {
   getCredentials as _getCredentials,
   setCredentials as _setCredentials,
@@ -51,18 +51,18 @@ function releaseLock() {
 // leaves us guessing — so a 401 from the API is better evidence of expiry than our own clock.
 // Callers that get a 401 should retry once behind this flag before reporting a rejected link.
 export async function getAccessToken(deps = {}, options = {}) {
-  const getCreds = deps.getCredentials ?? _getCredentials;
-  const setCreds = deps.setCredentials ?? _setCredentials;
-  const deleteCreds = deps.deleteCredentials ?? _deleteCredentials;
-  const refresh = deps.refreshTokens ?? _refreshTokens;
-  const now = deps.now ?? Date.now;
-  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const getCreds = deps.getCredentials == null ? _getCredentials : deps.getCredentials;
+  const setCreds = deps.setCredentials == null ? _setCredentials : deps.setCredentials;
+  const deleteCreds = deps.deleteCredentials == null ? _deleteCredentials : deps.deleteCredentials;
+  const refresh = deps.refreshTokens == null ? _refreshTokens : deps.refreshTokens;
+  const now = deps.now == null ? Date.now : deps.now;
+  const sleep = deps.sleep == null ? ((ms) => new Promise((r) => setTimeout(r, ms))) : deps.sleep;
 
   let creds;
   try { creds = await getCreds(deps); } catch { return null; }
   if (!creds) return null;
   setMachineClientId(creds.client_id);
-  const looksFresh = (c) => (c?.expires_at ?? 0) - now() > SKEW_MS;
+  const looksFresh = (c) => (c == null || c.expires_at == null ? 0 : c.expires_at) - now() > SKEW_MS;
   if (!options.forceRefresh && looksFresh(creds)) return creds.access_token;
 
   if (!acquireLock()) {
@@ -90,12 +90,12 @@ export async function getAccessToken(deps = {}, options = {}) {
     // Transient failure (network, timeout, unreadable error body). Report "no usable token"
     // rather than returning the expired one: callers treat a 401 as a revoked link and drop
     // the credentials, so a stale token turns a blip into a permanent logout.
-    if (!r.tokens?.access_token) return null;
+    if (r.tokens == null || !r.tokens.access_token) return null;
     const next = {
       ...creds,
       access_token: r.tokens.access_token,
-      refresh_token: r.tokens.refresh_token ?? creds.refresh_token,
-      expires_at: now() + (r.tokens.expires_in ?? DEFAULT_EXPIRES_IN_S) * 1000,
+      refresh_token: r.tokens.refresh_token == null ? creds.refresh_token : r.tokens.refresh_token,
+      expires_at: now() + (r.tokens.expires_in == null ? DEFAULT_EXPIRES_IN_S : r.tokens.expires_in) * 1000,
     };
     await setCreds(next, deps);
     return next.access_token;

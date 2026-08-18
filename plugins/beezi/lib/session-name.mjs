@@ -1,5 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'fs';
+import path from 'path';
 import { claudeSessionsDir } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
 
@@ -80,8 +80,13 @@ export function sessionNameFrom(transcriptPath) {
   const chunks = readChunks(transcriptPath);
   if (!chunks) return null;
   const { head, tail } = chunks;
-  const scan = (key) => lastTitleIn(tail, key) ?? (tail === head ? null : lastTitleIn(head, key));
-  const title = scan('customTitle') ?? scan('aiTitle');
+  const scan = (key) => {
+    const fromTail = lastTitleIn(tail, key);
+    if (fromTail != null) return fromTail;
+    return tail === head ? null : lastTitleIn(head, key);
+  };
+  const custom = scan('customTitle');
+  const title = custom == null ? scan('aiTitle') : custom;
   if (title) return title;
 
   // The summary line and first prompt live near the start of the transcript.
@@ -94,20 +99,22 @@ export function sessionNameFrom(transcriptPath) {
     if (!summary && line.type === 'summary' && typeof line.summary === 'string') {
       summary = line.summary.trim().slice(0, MAX) || null;
     } else if (!firstUser && line.type === 'user') {
-      const text = typeof line.message?.content === 'string'
-        ? line.message.content
-        : Array.isArray(line.message?.content)
-          ? line.message.content.map((c) => c.text ?? '').join(' ')
+      const content = line.message == null ? undefined : line.message.content;
+      const text = typeof content === 'string'
+        ? content
+        : Array.isArray(content)
+          ? content.map((c) => (c.text == null ? '' : c.text)).join(' ')
           : '';
       if (text.trim()) firstUser = text.trim().slice(0, MAX);
     }
   }
-  return summary ?? firstUser;
+  return summary == null ? firstUser : summary;
 }
 
 // Session display name: prefer Claude Code's live session store (real names only — the derived
 // placeholder is skipped), falling back to the transcript's custom-title / ai-title / summary /
 // first user prompt.
 export function resolveSessionName(sessionId, transcriptPath) {
-  return sessionNameFromStore(sessionId) ?? sessionNameFrom(transcriptPath);
+  const fromStore = sessionNameFromStore(sessionId);
+  return fromStore == null ? sessionNameFrom(transcriptPath) : fromStore;
 }

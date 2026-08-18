@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { computeSessionTimeline, postSessionTimeline } from '../lib/session-timeline.mjs';
+import { computeSessionTimeline, postSessionTimeline, BREAK_GAP_SEC } from '../lib/session-timeline.mjs';
 
 const BASE_MS = Date.parse('2026-07-14T10:00:00.000Z');
 const ts = (offsetSec) => new Date(BASE_MS + offsetSec * 1000).toISOString();
@@ -286,4 +286,370 @@ test('postSessionTimeline guards missing fields and reports 2xx as success', asy
   assert.equal(ok.reported, true);
   assert.equal(ok.status, 200);
   assert.ok(capturedUrl.endsWith('/sessions/timeline'));
+});
+
+// ─── the tail Claude Code writes after the human walks away ──────────────────
+//
+// away_summary recaps, queue operations and resume attachments are stamped long after the last
+// real turn. Anchoring on them ended the session inside its own idle tail — a session whose last
+// visible band was a 49-minute idle block, and on --resume a band spanning the night.
+
+test('a trailing away_summary neither anchors a period nor extends the axis', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'away.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(30) },
+    { type: 'system', subtype: 'turn_duration', durationMs: 30000, timestamp: ts(31) },
+    // The recap — written 49 minutes after the human stopped.
+    { type: 'system', subtype: 'away_summary', content: 'recap', timestamp: ts(2971) },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-away');
+  assert.ok(tl);
+  assert.equal(tl.ended_at, ts(31), 'axis ends at the last real turn');
+  assert.ok(!tl.periods.some((p) => p.state === 'idle'), 'no idle band for the recap tail');
+  assert.equal(tl.periods[tl.periods.length - 1].ended_at, ts(31));
+});
+
+test('resume attachments and queue operations do not anchor the axis', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'resume.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(30) },
+    // ~19h later the session is resumed; Claude Code replays hook/attachment bookkeeping.
+    { type: 'attachment', attachment: { type: 'date_change', newDate: '2026-07-15' }, timestamp: ts(68400) },
+    { type: 'queue-operation', operation: 'remove', timestamp: ts(68401) },
+    { type: 'attachment', attachment: { type: 'edited_text_file' }, timestamp: ts(68402) },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-resume');
+  assert.ok(tl);
+  assert.equal(tl.ended_at, ts(30), 'the overnight resume tail is not session time');
+  assert.equal(tl.periods.length, 1);
+  assert.equal(tl.periods[0].state, 'working');
+});
+
+test('an idle gap that ends at real work keeps its band', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'idle-then-work.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(10) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'after idle' }] }, timestamp: ts(1000) },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-idle');
+  assert.deepEqual(tl.periods.map((p) => p.state), ['working', 'idle']);
+  assert.equal(tl.ended_at, ts(1000));
+});
+
+// ─── teardown vs real work on the timeline ───────────────────────────────────
+
+const TEARDOWN_TEXT =
+  'Tool permission request failed: AbortError: Tool permission stream closed before response received';
+
+test('the permission stream-closed result does not become a trailing idle band', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'teardown.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(30) },
+    // Reopened the next day: the pending permission request is torn down.
+    {
+      type: 'user',
+      toolUseResult: { stdout: '' },
+      message: { content: [{ type: 'tool_result', content: TEARDOWN_TEXT, is_error: true }] },
+      timestamp: ts(66728),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-teardown');
+  assert.equal(tl.ended_at, ts(30), 'axis stops at the last real turn');
+  assert.deepEqual(tl.periods.map((p) => p.state), ['working'], 'no 18.5h idle band');
+});
+
+test('a real tool_result after a long gap still closes the session normally', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'real-result.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'run the build' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'building' }] }, timestamp: ts(30) },
+    // A build that genuinely ran for 5 minutes and failed — real session time.
+    {
+      type: 'user',
+      toolUseResult: { stdout: '' },
+      message: { content: [{ type: 'tool_result', content: 'Exit code 143\nCommand timed out after 5m 0s', is_error: true }] },
+      timestamp: ts(330),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-real');
+  assert.equal(tl.ended_at, ts(330), 'the build really did run until then');
+  assert.ok(tl.periods.some((p) => p.state === 'idle'), 'the >5min tool wait is still an idle band');
+});
+
+test('a session ending on a real user prompt stays waiting_user, not trimmed', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'ends-on-prompt.jsonl');
+  // Modelled on d60c5cbf: the human types something after 50min and the session ends there.
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(30) },
+    { type: 'user', message: { content: '.сдуфк' }, timestamp: ts(3030) },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-prompt');
+  assert.equal(tl.ended_at, ts(3030), 'the human was there — that is the session end');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'waiting_user');
+});
+
+// ─── break: abandoned and resumed, rather than waited on ─────────────────────
+
+test('a gap past the break threshold is charted as break, not waiting_user', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'break.jsonl');
+  // Modelled on fcebb7fd: work stops, the human returns 29h later and types.
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(30) },
+    { type: 'user', message: { content: 'next day' }, timestamp: ts(30 + 29 * 3600) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'sure' }] }, timestamp: ts(60 + 29 * 3600) },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-break');
+  assert.deepEqual(tl.periods.map((p) => p.state), ['working', 'break', 'working']);
+  const brk = tl.periods[1];
+  assert.deepEqual([brk.started_at, brk.ended_at], [ts(30), ts(30 + 29 * 3600)]);
+  // Nothing is deleted — the axis still describes real wall clock.
+  assert.equal(tl.started_at, ts(0));
+  assert.equal(tl.ended_at, ts(60 + 29 * 3600));
+});
+
+test('a long pause that crosses midnight but is short stays waiting_user', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'midnight.jsonl');
+  // 23:50 -> 00:20. A date boundary is crossed, but it is 30 minutes of stepping away.
+  const base = Date.parse('2026-07-14T23:45:00.000Z');
+  const at = (sec) => new Date(base + sec * 1000).toISOString();
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: at(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: at(300) },
+    { type: 'user', message: { content: 'back' }, timestamp: at(300 + 30 * 60) },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-midnight');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'waiting_user', 'crossing a day is not the test');
+  assert.ok(!tl.periods.some((p) => p.state === 'break'));
+});
+
+test('just under the threshold is still waiting_user; just over is a break', (t) => {
+  const dir = makeTmpDir(t);
+  const mk = (gapSec, name) => {
+    const p = path.join(dir, name);
+    writeJsonl(p, [
+      { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts(30) },
+      { type: 'user', message: { content: 'back' }, timestamp: ts(30 + gapSec) },
+    ]);
+    return computeSessionTimeline(p, 'sess-' + name);
+  };
+  assert.equal(mk(BREAK_GAP_SEC - 1, 'under.jsonl').periods.pop().state, 'waiting_user');
+  assert.equal(mk(BREAK_GAP_SEC, 'over.jsonl').periods.pop().state, 'break');
+});
+
+test('a long wait on a background subagent is not a break', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'long-agent.jsonl');
+  // The main thread is silent for 8h because its own subagent is running — real work.
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'spawning' }] }, timestamp: ts(30) },
+    { type: 'user', message: { content: '<task-notification>\n<task-id>abc</task-id>' }, timestamp: ts(30 + 8 * 3600) },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-agent');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'idle', 'blocked on a subagent, not abandoned');
+  assert.ok(!tl.periods.some((p) => p.state === 'break'));
+});
+
+// ─── AskUserQuestion: the answer is a tool_result, but the wait was the human's ───────────────
+
+test('an AskUserQuestion wait is waiting_user, not idle', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'ask.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_ask1', name: 'AskUserQuestion', input: {} }] },
+      timestamp: ts(30),
+    },
+    // The human deliberates for 22 minutes, then answers.
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_ask1', content: 'Option A' }] },
+      timestamp: ts(30 + 22 * 60),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-ask');
+  const last = tl.periods[tl.periods.length - 1];
+  assert.equal(last.state, 'waiting_user', 'the agent was blocked on the human');
+  assert.deepEqual([last.started_at, last.ended_at], [ts(30), ts(30 + 22 * 60)]);
+});
+
+test('an ordinary tool_result after a long gap is still idle, not waiting_user', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'bash.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'run the build' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_bash1', name: 'Bash', input: {} }] },
+      timestamp: ts(30),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_bash1', content: 'done' }] },
+      timestamp: ts(30 + 22 * 60),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-bash');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'idle', 'a build running is not the human deciding');
+});
+
+test('an AskUserQuestion abandoned past the break threshold is still a break', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'ask-break.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'do X' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_ask2', name: 'AskUserQuestion', input: {} }] },
+      timestamp: ts(30),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_ask2', content: 'Option B' }] },
+      timestamp: ts(30 + 8 * 3600),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-ask-break');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'break', 'they went home, not deliberated for 8h');
+});
+
+// ─── plan approval and declined permissions are the human's time ─────────────
+
+test('waiting for a plan to be approved is waiting_user, not planning', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'plan-approve.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'design it' }, timestamp: ts(0) },
+    { type: 'permission-mode', permissionMode: 'plan' },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'thinking' }] }, timestamp: ts(30) },
+    // The plan is presented — planning is over, the human now owns the clock.
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_plan1', name: 'ExitPlanMode', input: {} }] },
+      timestamp: ts(60),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_plan1', content: 'approved' }] },
+      timestamp: ts(60 + 4 * 60),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-plan');
+  const last = tl.periods[tl.periods.length - 1];
+  assert.equal(last.state, 'waiting_user', 'the agent was blocked on the human, not planning');
+  assert.deepEqual([last.started_at, last.ended_at], [ts(60), ts(60 + 4 * 60)]);
+  // The work BEFORE the plan was presented is still planning.
+  assert.ok(tl.periods.some((p) => p.state === 'planning'), 'plan-mode work is untouched');
+});
+
+test('a declined permission prompt is waiting_user at any duration', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'declined.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'edit the file' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_edit1', name: 'Edit', input: {} }] },
+      timestamp: ts(30),
+    },
+    // 95 minutes of the human thinking about it, then saying no.
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: {
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_edit1',
+            is_error: true,
+            content: "The user doesn't want to proceed with this tool use. The tool use was rejected",
+          },
+        ],
+      },
+      timestamp: ts(30 + 95 * 60),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-declined');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'waiting_user', 'they answered — they were there');
+});
+
+test('a plan abandoned past the break threshold is still a break', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'plan-break.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'design it' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_plan2', name: 'ExitPlanMode', input: {} }] },
+      timestamp: ts(30),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_plan2', content: 'approved' }] },
+      timestamp: ts(30 + 9 * 3600),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-plan-break');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'break', 'they went home mid-plan');
+});
+
+test('an ordinary failed tool_result is still idle, not a user decision', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'failed-tool.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'run it' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_bash9', name: 'Bash', input: {} }] },
+      timestamp: ts(30),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_bash9', is_error: true, content: 'Exit code 128' }],
+      },
+      timestamp: ts(30 + 22 * 60),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-failed');
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'idle', 'a tool that ran and failed is not the human');
 });

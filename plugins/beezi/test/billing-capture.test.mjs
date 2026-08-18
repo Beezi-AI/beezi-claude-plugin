@@ -191,3 +191,51 @@ test('buildConfig — an exported API key overrules a claimed subscription tier'
   assert.equal(cfg.source, 'anthropic_api_key');
   assert.equal(cfg.plan, null, 'no plan may survive a non-subscription source');
 });
+
+// ─── self-reporting what a custom gateway bills ─────────────────────────────
+// A gateway route cannot be resolved locally: it may carry this machine's own subscription
+// credential or one the gateway holds. The user is asked, exactly as an unresolvable tier is.
+
+test('buildConfig — --plan gateway declares provider billing, with no plan attached', () => {
+  const cfg = buildConfig({ plan: 'gateway', via: 'login-user' }, {}, new Date('2026-08-18T00:00:00.000Z'));
+  assert.equal(cfg.source, 'third_party');
+  assert.equal(cfg.plan, null);
+  assert.equal(cfg.subscriptionType, null);
+  assert.equal(cfg.rateLimitTier, null);
+  assert.equal(cfg.selfReported, true);
+  assert.equal(cfg.capturedBy, 'login-user');
+});
+
+test('buildConfig — a declared tier survives a custom gateway (the proxy bills the subscription)', () => {
+  const cfg = buildConfig(
+    { plan: 'team', via: 'login-user' },
+    { ANTHROPIC_BASE_URL: 'https://gw.corp.example' },
+    new Date(),
+  );
+  assert.equal(cfg.source, 'subscription');
+  assert.equal(cfg.plan, 'team');
+  assert.equal(cfg.selfReported, true);
+});
+
+test('buildConfig — a gateway with no credential captures as unknown so login can ask', () => {
+  const cfg = buildConfig(
+    { subscriptionType: 'team', via: 'login' },
+    { ANTHROPIC_BASE_URL: 'https://gw.corp.example' },
+    new Date(),
+    { subscriptionType: 'team' },
+  );
+  assert.equal(cfg.source, 'unknown');
+  assert.equal(cfg.plan, null);
+});
+
+test('shouldKeepExisting — keeps a declared gateway when the fresh capture learned nothing', () => {
+  // Without this, every /beezi:refresh on a gateway machine wipes the answer and re-asks.
+  const fresh = { source: 'unknown', plan: null };
+  assert.equal(shouldKeepExisting(fresh, { selfReported: true, source: 'third_party', plan: null }), true);
+  assert.equal(shouldKeepExisting(fresh, { selfReported: true, source: 'anthropic_api_key', plan: null }), true);
+});
+
+test('shouldKeepExisting — a fresh capture that names a provider overwrites the declaration', () => {
+  const fresh = { source: 'third_party', plan: null };
+  assert.equal(shouldKeepExisting(fresh, { selfReported: true, source: 'third_party', plan: null }), false);
+});

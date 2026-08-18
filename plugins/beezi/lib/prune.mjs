@@ -1,5 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'fs';
+import path from 'path';
 import { queueDir, stateDir } from './paths.mjs';
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;

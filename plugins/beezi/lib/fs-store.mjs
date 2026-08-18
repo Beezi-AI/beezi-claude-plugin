@@ -1,5 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'fs';
+import path from 'path';
 
 // Read + parse a JSON file, or return `fallback` on any read/parse failure.
 export function readJson(filePath, fallback = null) {

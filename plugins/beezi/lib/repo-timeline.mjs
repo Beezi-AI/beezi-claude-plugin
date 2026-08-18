@@ -1,4 +1,4 @@
-import path from 'node:path';
+import path from 'path';
 import { matchKnownRoot, findRepoRootByWalk } from './repo-map.mjs';
 
 // Match a `cd`/`pushd` (optionally `cd /d`) at a command boundary; capture the target,
@@ -52,7 +52,8 @@ function lastCdTarget(command, cwd) {
 // The active-repo signal for a line: dir of the LAST tool_use block that carries one,
 // else null (caller carries the previous active repo forward).
 export function extractPathSignal(line, cwd) {
-  const content = line?.message?.content;
+  const message = line == null ? undefined : line.message;
+  const content = message == null ? undefined : message.content;
   if (!Array.isArray(content)) return null;
   let dir = null;
   for (const block of content) {

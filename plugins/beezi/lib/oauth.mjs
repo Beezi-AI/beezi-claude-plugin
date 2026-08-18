@@ -1,7 +1,9 @@
-import crypto from 'node:crypto';
-import os from 'node:os';
+import crypto from 'crypto';
+import os from 'os';
 import { apiOrigin, PROTECTED_RESOURCE_PATH } from './config.mjs';
 import { UserError } from './friendly-error.mjs';
+import { resolveFetch } from './fetch-compat.mjs';
+import { resolveAbortController } from './abort-compat.mjs';
 
 // Clerk development instances cold-start well past 5s; measured 5.6s–20s on first contact.
 // Only the interactive login commands can afford to wait that long.
@@ -14,7 +16,8 @@ const TIMEOUT_MS = 15000;
 const REFRESH_TIMEOUT_MS = 7000;
 
 async function fetchWithTimeout(fetchImpl, url, init, timeoutMs = TIMEOUT_MS) {
-  const controller = new AbortController();
+  const AbortControllerImpl = resolveAbortController();
+  const controller = new AbortControllerImpl();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetchImpl(url, { ...init, signal: controller.signal });
@@ -32,8 +35,8 @@ export function pkcePair() {
 // Same discovery chain MCP clients use: the portal's RFC 9728 protected-resource
 // document names the Clerk issuer; the issuer's own metadata names the endpoints.
 export async function discover(deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const origin = deps.origin ?? apiOrigin();
+  const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
+  const origin = deps.origin == null ? apiOrigin() : deps.origin;
 
   const prRes = await fetchWithTimeout(fetchImpl, `${origin}${PROTECTED_RESOURCE_PATH}`);
   if (!prRes.ok) {
@@ -42,7 +45,7 @@ export async function discover(deps = {}) {
     );
   }
   const pr = await prRes.json();
-  const issuer = pr.authorization_servers?.[0];
+  const issuer = pr.authorization_servers == null ? undefined : pr.authorization_servers[0];
   if (!issuer) {
     throw new UserError('OAuth discovery failed: portal metadata lists no authorization server.');
   }
@@ -67,8 +70,8 @@ export async function discover(deps = {}) {
 
 // Dynamic client registration (RFC 7591): one public client per machine.
 export async function registerClient(registrationEndpoint, redirectUri, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-  const hostname = deps.hostname ?? os.hostname();
+  const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
+  const hostname = deps.hostname == null ? os.hostname() : deps.hostname;
   const res = await fetchWithTimeout(fetchImpl, registrationEndpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -97,7 +100,7 @@ async function postForm(fetchImpl, url, params, timeoutMs) {
 }
 
 export async function exchangeCode({ tokenEndpoint, clientId, redirectUri, code, verifier }, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const res = await postForm(fetchImpl, tokenEndpoint, {
     grant_type: 'authorization_code',
     code,
@@ -112,13 +115,13 @@ export async function exchangeCode({ tokenEndpoint, clientId, redirectUri, code,
 // Returns {tokens} on success, {invalidGrant: true} when the grant was revoked
 // (machine unlinked / user deactivated), {tokens: null} on transient failure.
 export async function refreshTokens({ tokenEndpoint, clientId, refreshToken }, deps = {}) {
-  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   try {
     const res = await postForm(fetchImpl, tokenEndpoint, {
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: clientId,
-    }, deps.timeoutMs ?? REFRESH_TIMEOUT_MS);
+    }, deps.timeoutMs == null ? REFRESH_TIMEOUT_MS : deps.timeoutMs);
     if (res.ok) return { tokens: await res.json() };
     if (res.status === 400 || res.status === 401) {
       let body = {};

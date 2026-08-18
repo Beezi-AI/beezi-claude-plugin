@@ -28,6 +28,10 @@ async function main() {
   console.log('✓ Beezi: this machine is linked.');
   if (who.name) console.log(`  Account: ${who.name}${who.email ? ` <${who.email}>` : ''}`);
   else if (who.email) console.log(`  Account: ${who.email}`);
+  if (who.tenantTier) console.log(`  Plan tier: ${who.tenantTier}`);
+  if (who.trackingMode) {
+    console.log(`  Tracking: ${who.trackingMode}${who.backfillCompleted ? ' (history pull complete)' : ''}`);
+  }
 }
 
 main().catch((error) => {
