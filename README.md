@@ -5,7 +5,7 @@ tickets on your board without leaving the conversation.
 
 | Plugin | Platform | What you get |
 | --- | --- | --- |
-| `beezi` | Claude Code (terminal) | Automatic session analytics per Beezi task branch + ticket drafting |
+| `beezi` | Claude Code (terminal) | Automatic session analytics per Beezi task branch |
 | `beezi-web` | Claude on claude.ai | Ticket drafting |
 
 Both plugins sign in with your own Beezi account — you must already be a Beezi user, and
@@ -39,20 +39,12 @@ is tracked automatically; you don't need to run anything else.
 | `/beezi:track` | Force-save this session's analytics mid-session. |
 | `/beezi:refresh` | Re-capture your Claude subscription plan for accurate cost reporting. |
 
-### Ticket drafting
-
-Ask Claude to draft or create a ticket — the bundled `create-ticket` skill connects to the
-Beezi server, drafts a ticket grounded in the repo you're working in, and creates it on
-your board (Jira / Azure DevOps) or in Beezi once you approve the draft. Ticket drafting
-uses the same machine link as analytics — once you've run `/beezi:login`, there is
-nothing extra to authorize.
-
 ### Optional configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BEEZI_API_URL` | `https://beezi-api-prod.azurewebsites.net/api` | Beezi API base URL. |
-| `BEEZI_MCP_URL` | `https://beezi-api-prod.azurewebsites.net/api/mcp` | Beezi server for ticket drafting. |
+| `BEEZI_MCP_URL` | `https://beezi-api-prod.azurewebsites.net/api/mcp` | Beezi MCP server base URL. |
 | `BEEZI_HOME` | `~/.beezi` | Local state root (queue, cursors, credentials). |
 
 ## Claude on claude.ai — `beezi-web`
@@ -62,7 +54,7 @@ nothing extra to authorize.
 3. Sign in with your Beezi account when the `beezi` connector asks (it appears under
    **Settings → Connectors**).
 
-Then ask Claude to draft or create a ticket, the same as above.
+Then ask Claude to draft or create a ticket.
 
 ## Privacy
 
