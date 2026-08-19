@@ -1,8 +1,0 @@
-{
-    "mcpServers": {
-        "beezi": {
-            "type": "http",
-            "url": "https://beezi-api-prod.azurewebsites.net/api/mcp/sse"
-        }
-    }
-}
