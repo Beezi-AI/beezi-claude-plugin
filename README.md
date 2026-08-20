@@ -15,7 +15,7 @@ everything happens as you, on your tenant.
 ### 1. Install
 
 ```
-/plugin marketplace add https://github.com/Beezi-AI/beezi-claude-code
+/plugin marketplace add https://github.com/Beezi-AI/beezi-claude-plugin
 /plugin install beezi@beezi
 ```
 
