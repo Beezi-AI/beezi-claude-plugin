@@ -19,8 +19,8 @@ export function statuslineShimFile(platform = process.platform) {
 }
 
 // The statusLine object that was replaced, kept for uninstall: { statusLine: <object|null> }.
-function originalFile() {
-  return path.join(beeziHome(), 'statusline-original.json');
+function originalFile(home = beeziHome()) {
+  return path.join(home, 'statusline-original.json');
 }
 
 function settingsFile() {
@@ -30,11 +30,15 @@ function settingsFile() {
 const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const psQuote = (s) => `'${String(s).replace(/'/g, `''`)}'`;
 
-// Any Beezi variant's shim (~/.beezi/statusline.sh, ~/.beezi-staging/statusline.ps1, a
-// powershell.exe invocation wrapping one, …). Never chained — wrapping a wrapper would stack
-// captures on every re-login.
-const isBeeziShim = (command) =>
-  typeof command === 'string' && /[/\\]\.beezi[^/\\]*[/\\]statusline\.(sh|ps1)(?:"|$)/.test(command);
+// The file path of any Beezi variant's shim (~/.beezi/statusline.sh, ~/.beezi-staging/
+// statusline.ps1, the path quoted after -File in a powershell.exe invocation), or null when the
+// command is not one of ours. A shim is never chained — wrapping a wrapper would stack captures
+// on every re-login — so its home is where the status line it replaced is on record instead.
+const beeziShimPath = (command) => {
+  if (typeof command !== 'string') return null;
+  const m = command.match(/(?:^|["\s])([^"]*?[/\\]\.beezi[^/\\]*[/\\]statusline\.(?:sh|ps1))(?:"|$)/);
+  return m == null ? null : m[1];
+};
 
 const commandUsesShim = (command, shim) => typeof command === 'string' && command.includes(shim);
 
@@ -42,6 +46,43 @@ const commandUsesShim = (command, shim) => typeof command === 'string' && comman
 function commandOf(statusLine) {
   if (statusLine == null || statusLine.type !== 'command') return null;
   return typeof statusLine.command === 'string' ? statusLine.command : null;
+}
+
+// Walks shims back to the status line the user actually wrote: a variant's shim stands for
+// whatever ITS home has on record, which on a machine running several variants can be another
+// shim again. `visited` stops a pair of variants that point at each other from looping. ourShim
+// is matched by path, so a BEEZI_HOME outside the usual ~/.beezi* naming still resolves.
+function resolveOriginal(statusLine, visited, ourShim) {
+  let line = statusLine;
+  while (line != null) {
+    const command = commandOf(line);
+    const shim = commandUsesShim(command, ourShim) ? ourShim : beeziShimPath(command);
+    if (shim == null) return line;
+    if (visited.has(shim)) return null;
+    visited.add(shim);
+    const stored = readJson(originalFile(path.dirname(shim)));
+    line = stored == null ? null : stored.statusLine;
+  }
+  return null;
+}
+
+// Records kept by the other variants installed on this machine. A variant that installed over
+// another one's shim before this fix left no record of its own, so a sibling's is the only
+// surviving copy of the line the user had.
+function siblingRecords() {
+  const home = beeziHome();
+  const parent = path.dirname(home);
+  let names;
+  try {
+    names = fs.readdirSync(parent);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => name.startsWith('.beezi') && path.join(parent, name) !== home)
+    .map((name) => readJson(originalFile(path.join(parent, name))))
+    .filter((stored) => stored != null)
+    .map((stored) => stored.statusLine);
 }
 
 // Where the capture script lives: marketplace cache layout is <plugin>/<version>/…, so a glob
@@ -143,25 +184,31 @@ export function installStatusline(deps = {}) {
   const shim = statuslineShimFile(platform);
   const alreadyOurs = commandUsesShim(currentCommand, shim);
 
-  // Re-install keeps the ORIGINAL original; a foreign Beezi shim is replaced, never chained.
-  let chain = null;
-  if (alreadyOurs || isBeeziShim(currentCommand)) {
-    const stored = readJson(originalFile());
-    chain = commandOf(stored == null ? null : stored.statusLine);
-  } else {
-    chain = currentCommand;
+  // Re-install keeps the ORIGINAL original, and installing over another variant's shim inherits
+  // the record that shim stands for; falling back to the siblings recovers a line an install
+  // from before this resolution existed dropped on the floor.
+  const visited = new Set();
+  const ours = readJson(originalFile());
+  let original = resolveOriginal(current, visited, shim);
+  if (original == null) original = resolveOriginal(ours == null ? null : ours.statusLine, visited, shim);
+  if (original == null) {
+    for (const record of siblingRecords()) {
+      original = resolveOriginal(record, visited, shim);
+      if (original != null) break;
+    }
   }
+  const chain = commandOf(original);
 
   fs.mkdirSync(beeziHome(), { recursive: true, mode: 0o700 });
   fs.writeFileSync(shim, platform === 'win32' ? psShimContent(chain, deps) : shShimContent(chain, deps));
   if (platform !== 'win32') fs.chmodSync(shim, 0o755);
 
-  if (alreadyOurs) {
-    return { ok: true, message: 'Beezi: status line already installed — live usage capture is on.' };
+  if (ours == null || !alreadyOurs) {
+    writeJsonSecure(originalFile(), { statusLine: original });
   }
 
-  if (!isBeeziShim(currentCommand)) {
-    writeJsonSecure(originalFile(), { statusLine: current == null ? null : current });
+  if (alreadyOurs) {
+    return { ok: true, message: 'Beezi: status line already installed — live usage capture is on.' };
   }
   settings.statusLine = {
     type: 'command',
@@ -188,7 +235,7 @@ export function uninstallStatusline(deps = {}) {
 
   if (pointsAtUs) {
     const stored = readJson(originalFile());
-    const orig = stored == null ? null : stored.statusLine;
+    const orig = resolveOriginal(stored == null ? null : stored.statusLine, new Set(), shim);
     if (orig) settings.statusLine = orig;
     else delete settings.statusLine;
     writeSettings(settings);

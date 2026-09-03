@@ -163,3 +163,65 @@ test('uninstallStatusline — a status line the user changed since is not touche
   assert.deepEqual(readSettings(settings).statusLine, theirs);
   assert.equal(fs.existsSync(statuslineShimFile()), false, 'shim still cleaned up');
 });
+
+// Dev machines run several Beezi variants (~/.beezi, ~/.beezi-staging, ~/.beezi-local). Each keeps
+// its own statusline-original.json, so a variant installing over another variant's shim has to
+// inherit that record instead of reading the shim as "nothing to wrap".
+function variant(root, name, statusLine) {
+  const home = path.join(root, name);
+  fs.mkdirSync(home, { recursive: true });
+  const shim = path.join(home, 'statusline.sh');
+  fs.writeFileSync(shim, '#!/bin/sh\n');
+  if (statusLine !== undefined) {
+    fs.writeFileSync(path.join(home, 'statusline-original.json'), JSON.stringify({ statusLine }));
+  }
+  return shim;
+}
+
+test("installStatusline — inherits the original from another variant's shim", (t) => {
+  const { beezi, settings } = useTmpDirs(t);
+  const theirs = { type: 'command', command: '~/.claude/statusline.sh', padding: 1 };
+  const stagingShim = variant(path.dirname(beezi), '.beezi-staging', theirs);
+  fs.writeFileSync(settings, JSON.stringify({ statusLine: { type: 'command', command: stagingShim, padding: 1 } }));
+
+  const r = installStatusline(deps);
+  assert.equal(r.ok, true);
+  assert.match(r.message, /wrapped/);
+
+  const shim = fs.readFileSync(statuslineShimFile(), 'utf-8');
+  assert.ok(shim.includes("BEEZI_STATUSLINE_CHAIN='~/.claude/statusline.sh'"),
+    'chain inherited from the sibling variant');
+  const stored = JSON.parse(fs.readFileSync(path.join(beezi, 'statusline-original.json'), 'utf-8'));
+  assert.deepEqual(stored.statusLine, theirs, 'uninstall would restore the real line, not a shim');
+});
+
+test('installStatusline — recovers an original a previous install dropped', (t) => {
+  const { beezi } = useTmpDirs(t);
+  const theirs = { type: 'command', command: '~/.claude/statusline.sh', padding: 1 };
+  variant(path.dirname(beezi), '.beezi-staging', theirs);
+  installStatusline(deps);
+  fs.rmSync(path.join(beezi, 'statusline-original.json'));
+
+  const r = installStatusline(deps);
+  assert.equal(r.ok, true);
+
+  const shim = fs.readFileSync(statuslineShimFile(), 'utf-8');
+  assert.ok(shim.includes("BEEZI_STATUSLINE_CHAIN='~/.claude/statusline.sh'"),
+    'chain recovered from the sibling record');
+  const stored = JSON.parse(fs.readFileSync(path.join(beezi, 'statusline-original.json'), 'utf-8'));
+  assert.deepEqual(stored.statusLine, theirs);
+});
+
+test('installStatusline — variants pointing at each other never loop', (t) => {
+  const { beezi, settings } = useTmpDirs(t);
+  const root = path.dirname(beezi);
+  const aShim = path.join(root, '.beezi-a', 'statusline.sh');
+  const bShim = variant(root, '.beezi-b', { type: 'command', command: aShim });
+  variant(root, '.beezi-a', { type: 'command', command: bShim });
+  fs.writeFileSync(settings, JSON.stringify({ statusLine: { type: 'command', command: aShim } }));
+
+  const r = installStatusline(deps);
+  assert.equal(r.ok, true);
+  const shim = fs.readFileSync(statuslineShimFile(), 'utf-8');
+  assert.ok(!shim.includes('BEEZI_STATUSLINE_CHAIN'), 'a cycle of shims resolves to nothing to wrap');
+});
