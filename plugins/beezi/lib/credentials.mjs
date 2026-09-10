@@ -1,241 +1,86 @@
-import { execFileSync } from 'child_process';
 import fs from 'fs';
-import path from 'path';
-import { credentialsFile } from './paths.mjs';
-import { readJson, writeJsonSecure } from './fs-store.mjs';
+import {
+  credentialService, legacyCredentialService, homeSuffix,
+  credentialControlFile, credentialGenerationFile, credentialsFile,
+} from './paths.mjs';
+import { writeJsonSecure } from './fs-store.mjs';
+import { backendsFor, backendByName } from './credential-backends.mjs';
+import { acquireCredentialLock, releaseCredentialLock, holdsCredentialLock, LOCK_WAIT_MS } from './credential-lock.mjs';
+import { UserError } from './friendly-error.mjs';
 
-import { envSuffix } from './paths.mjs';
+// Generation-versioned store. Each credential set is an immutable entry gen-<n> in one backend;
+// control.json (atomic temp+rename) names the committed generation and the backend holding it.
+// Readers follow the control record and never fall back to another generation or backend copy.
 
-// Per-environment credential entry ('beezi-analytics-dev' on the dev variant), so a dev login
-// can never overwrite the prod or staging token.
-const SERVICE = `beezi-analytics${envSuffix()}`;
-const ACCOUNT = 'token';
+export const CREDENTIAL_STATUS = Object.freeze({
+  READY: 'ready',
+  NONE: 'none',
+  UNAVAILABLE: 'unavailable',
+  STORAGE_CONFLICT: 'storage_conflict',
+});
 
-// Absolute path to PowerShell — never a bare name. On Windows a bare `powershell.exe`
-// is resolved against the child's current directory first, so an attacker file dropped
-// in a repo the user opens could be executed (and would receive the plaintext token on
-// stdin). Pinning the system path closes that hijack.
-const POWERSHELL = process.env.SystemRoot
-  ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  : 'powershell.exe';
+export const UNAVAILABLE_REASONS = Object.freeze({
+  BACKEND_UNREADABLE: 'backend_unreadable',
+  ENTRY_MALFORMED: 'entry_malformed',
+  BACKEND_MISSING: 'backend_missing',
+  CONTROL_UNREADABLE: 'control_unreadable',
+  LOCKED: 'locked',
+});
 
-// Run a command with no shell (argv array), optional stdin. Never throws — returns
-// { ok, stdout } so callers can fall back to the file store on any failure.
-function defaultRun(file, args, input) {
+export const COMMIT_STATUS = Object.freeze({
+  COMMITTED: 'committed',
+  SUPERSEDED: 'superseded',
+  LOCK_LOST: 'lock_lost',
+});
+
+export const DELETE_STATUS = Object.freeze({
+  DELETED: 'deleted',
+  SUPERSEDED: 'superseded',
+  LOCK_LOST: 'lock_lost',
+});
+
+const CONTROL_VERSION = 1;
+// The login/logout wrappers are interactive and can afford to queue behind a whole hook refresh.
+const WRAPPER_LOCK_WAIT_MS = 10_000;
+const BUSY_MESSAGE = 'Credentials are being updated by another Beezi process. Try again in a moment.';
+
+const lockWait = (deps, fallback) => (deps.lockWaitMs == null ? fallback : deps.lockWaitMs);
+
+function generationEntry(generation) {
+  const service = credentialService();
+  const account = `gen-${generation}`;
+  return { service, account, target: `${service}/${account}`, file: credentialGenerationFile(generation) };
+}
+
+function legacyEntry() {
+  const service = legacyCredentialService();
+  return { service, account: 'token', target: service, file: credentialsFile() };
+}
+
+// { value } for a parsed record, { value: null } when absent, { unreadable: true } otherwise.
+function readControl() {
+  let raw;
   try {
-    const stdout = execFileSync(file, args, {
-      input: input == null ? undefined : input,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'ignore'],
-      windowsHide: true,
-      // Bound the spawn: a locked keychain / hung helper must not block the hook.
-      timeout: 5000,
-      killSignal: 'SIGKILL',
-    });
-    return { ok: true, stdout: stdout == null ? '' : stdout };
-  } catch {
-    return { ok: false, stdout: '' };
+    raw = fs.readFileSync(credentialControlFile(), 'utf-8');
+  } catch (error) {
+    return error != null && error.code === 'ENOENT' ? { value: null } : { unreadable: true };
   }
+  try {
+    const value = JSON.parse(raw);
+    if (value && typeof value === 'object' && 'generation' in value) return { value };
+  } catch { /* corrupt */ }
+  return { unreadable: true };
 }
 
-// Turn a run() result into a trimmed token, or null.
-function tokenFrom(r) {
-  const t = r.ok ? r.stdout.trim() : '';
-  return t || null;
+function writeControl(generation, backend, highestGeneration) {
+  writeJsonSecure(credentialControlFile(), {
+    version: CONTROL_VERSION, generation, backend, highestGeneration, committedAt: Date.now(),
+  });
 }
 
-// ── file store: the always-available fallback, and where the Windows DPAPI
-//    ciphertext is kept (0600; on Windows the user profile ACL also applies). ──
-
-function fileRead() {
-  return readJson(credentialsFile());
-}
-
-function fileWrite(obj) {
-  writeJsonSecure(credentialsFile(), obj);
-}
-
-function fileDelete() {
-  try { fs.unlinkSync(credentialsFile()); } catch { /* already absent */ }
-}
-
-// ── backends. Each: { available(), get() -> string|null, set(token) -> boolean, delete() }.
-
-function macBackend(run) {
-  return {
-    available: () => true, // `security` ships with macOS
-    get() {
-      return tokenFrom(run('security', ['find-generic-password', '-s', SERVICE, '-a', ACCOUNT, '-w']));
-    },
-    set(token) {
-      return run('security', ['add-generic-password', '-U', '-s', SERVICE, '-a', ACCOUNT, '-w', token]).ok
-        ? 'the macOS keychain' : false;
-    },
-    delete() {
-      run('security', ['delete-generic-password', '-s', SERVICE, '-a', ACCOUNT]);
-    },
-  };
-}
-
-function secretToolBackend(run) {
-  const attrs = ['service', SERVICE, 'account', ACCOUNT];
-  return {
-    available: () => run('secret-tool', ['--version']).ok, // libsecret often absent
-    get() {
-      return tokenFrom(run('secret-tool', ['lookup', ...attrs]));
-    },
-    set(token) {
-      // secret-tool reads the secret from stdin — keeps it out of the process list.
-      return run('secret-tool', ['store', `--label=${SERVICE}`, ...attrs], token).ok
-        ? 'the OS secret service (libsecret)' : false;
-    },
-    delete() {
-      run('secret-tool', ['clear', ...attrs]);
-    },
-  };
-}
-
-// Windows: the primary store is the Credential Manager, reached via a P/Invoke to advapi32
-// (CredWrite/CredRead/CredDelete) — the token then appears under Control Panel → Credential
-// Manager → Windows Credentials, keyed by SERVICE. The `cmdkey` CLI can *store* but not read
-// a secret back, so we call the Win32 API directly through PowerShell. Should that ever fail
-// (locked-down box, PowerShell missing) we fall back to DPAPI (user-bound OS crypto) with the
-// ciphertext kept in the 0600 file, and finally to a plaintext 0600 file.
-const DPAPI_ENC = "$in=[Console]::In.ReadToEnd();Add-Type -AssemblyName System.Security;"
-  + "$b=[Text.Encoding]::UTF8.GetBytes($in);"
-  + "$e=[Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser');"
-  + '[Convert]::ToBase64String($e)';
-const DPAPI_DEC = "$in=[Console]::In.ReadToEnd().Trim();Add-Type -AssemblyName System.Security;"
-  + "$b=[Convert]::FromBase64String($in);"
-  + "$d=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser');"
-  + '[Text.Encoding]::UTF8.GetString($d)';
-
-function powershell(run, script, input) {
-  return run(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', script], input);
-}
-
-// ── Windows Credential Manager via advapi32 P/Invoke (the primary Windows store) ──
-// The CREDENTIAL struct is shared by the read and write scripts. CharSet=Unicode marshals
-// TargetName/UserName as wide strings; the secret blob is written/read as UTF-16 so it
-// round-trips any character (verified against '&', '=', '.').
-const CRED_STRUCT = `
-[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-public struct CREDENTIAL {
-  public uint Flags; public uint Type;
-  public string TargetName; public string Comment;
-  public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
-  public uint CredentialBlobSize; public IntPtr CredentialBlob;
-  public uint Persist; public uint AttributeCount; public IntPtr Attributes;
-  public string TargetAlias; public string UserName;
-}`;
-
-// Reads the secret from stdin (never an argv element, so it can't leak via the process list),
-// writes a GENERIC credential with LOCAL_MACHINE persistence, prints 'OK' on success.
-const CRED_WRITE = `$in=[Console]::In.ReadToEnd()
-Add-Type @"
-using System; using System.Runtime.InteropServices;
-public class BeeziCredW {
-  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-  public static extern bool CredWrite([In] ref CREDENTIAL c, uint flags);${CRED_STRUCT}
-}
-"@
-$bytes=[Text.Encoding]::Unicode.GetBytes($in)
-$blob=[Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
-[Runtime.InteropServices.Marshal]::Copy($bytes,0,$blob,$bytes.Length)
-$c=New-Object BeeziCredW+CREDENTIAL
-$c.Type=1; $c.TargetName='${SERVICE}'; $c.UserName='${ACCOUNT}'
-$c.CredentialBlob=$blob; $c.CredentialBlobSize=$bytes.Length; $c.Persist=2
-$ok=[BeeziCredW]::CredWrite([ref]$c,0)
-[Runtime.InteropServices.Marshal]::FreeHGlobal($blob)
-if($ok){'OK'}else{exit 1}`;
-
-// Reads the GENERIC credential back and writes the plaintext secret to stdout; exits non-zero
-// when the target is absent (fresh machine, or token stored by the DPAPI fallback instead).
-const CRED_READ = `Add-Type @"
-using System; using System.Runtime.InteropServices;
-public class BeeziCredR {
-  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-  public static extern bool CredRead(string target, uint type, uint flags, out IntPtr cred);
-  [DllImport("advapi32.dll")] public static extern void CredFree(IntPtr cred);${CRED_STRUCT}
-}
-"@
-$ptr=[IntPtr]::Zero
-if(-not [BeeziCredR]::CredRead('${SERVICE}',1,0,[ref]$ptr)){exit 1}
-$cred=[Runtime.InteropServices.Marshal]::PtrToStructure($ptr,[Type][BeeziCredR+CREDENTIAL])
-$size=$cred.CredentialBlobSize
-if($size -gt 0){
-  $bytes=New-Object byte[] $size
-  [Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob,$bytes,0,$size)
-  [Console]::Out.Write([Text.Encoding]::Unicode.GetString($bytes))
-}
-[BeeziCredR]::CredFree($ptr)`;
-
-const CRED_DELETE = `Add-Type @"
-using System; using System.Runtime.InteropServices;
-public class BeeziCredD {
-  [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-  public static extern bool CredDelete(string target, uint type, uint flags);
-}
-"@
-[void][BeeziCredD]::CredDelete('${SERVICE}',1,0)`;
-
-function credManBackend(run) {
-  return {
-    available: () => true, // advapi32 + PowerShell ship with Windows; failures fall through
-    get() {
-      return tokenFrom(powershell(run, CRED_READ));
-    },
-    set(token) {
-      const r = powershell(run, CRED_WRITE, token);
-      return r.ok && r.stdout.trim() === 'OK' ? 'the Windows Credential Manager' : false;
-    },
-    delete() {
-      powershell(run, CRED_DELETE);
-    },
-  };
-}
-
-function dpapiFileBackend(run) {
-  return {
-    available: () => true, // PowerShell ships with Windows; DPAPI failures fall back below
-    get() {
-      const obj = fileRead();
-      if (!obj) return null;
-      if (typeof obj.enc === 'string') return tokenFrom(powershell(run, DPAPI_DEC, obj.enc));
-      return typeof obj.token === 'string' ? obj.token : null; // plaintext (DPAPI was down at set)
-    },
-    set(token) {
-      const r = powershell(run, DPAPI_ENC, token);
-      if (r.ok && r.stdout.trim()) { fileWrite({ enc: r.stdout.trim() }); return 'Windows DPAPI (encrypted at rest)'; }
-      fileWrite({ token }); // DPAPI unavailable → plaintext, still 0600
-      return 'a restricted local file';
-    },
-    delete: fileDelete,
-  };
-}
-
-function fileBackend() {
-  return {
-    available: () => true,
-    get() {
-      const obj = fileRead();
-      return obj && typeof obj.token === 'string' ? obj.token : null;
-    },
-    set(token) { fileWrite({ token }); return 'a restricted local file'; },
-    delete: fileDelete,
-  };
-}
-
-// Preferred backend chain for the platform; the plaintext file is always the tail.
-function backends(deps) {
-  const run = deps.run == null ? defaultRun : deps.run;
-  const platform = deps.platform == null ? process.platform : deps.platform;
-  const file = fileBackend();
-  if (platform === 'darwin') return [macBackend(run), file];
-  if (platform === 'linux') return [secretToolBackend(run), file];
-  if (platform === 'win32') return [credManBackend(run), dpapiFileBackend(run), file];
-  return [file];
-}
+const highestOf = (control) => (
+  control.value && typeof control.value.highestGeneration === 'number' ? control.value.highestGeneration : 0
+);
 
 // The backends store an opaque string. Since the Clerk OAuth migration that
 // string is a JSON credentials object: { client_id, redirect_uri,
@@ -250,31 +95,228 @@ function parseCredentials(raw) {
   }
 }
 
+// Best-effort removal of a generation that is no longer committed.
+function retireEntry(record, deps) {
+  const b = backendByName(record.backend, deps);
+  if (b == null || !b.available()) return;
+  try { b.delete(generationEntry(record.generation)); } catch { /* orphan; never read again */ }
+}
+
+// A lock handle plus exactly one of expectedGeneration / force, so "no check" is never implicit.
+function casGuard(options) {
+  if (options.lock == null || typeof options.lock.nonce !== 'string') {
+    throw new TypeError('A credential lock handle is required.');
+  }
+  const force = options.force === true;
+  if ((options.expectedGeneration !== undefined) === force) {
+    throw new TypeError('Pass exactly one of expectedGeneration or force.');
+  }
+  return { force, expectedGeneration: options.expectedGeneration };
+}
+
+// ── legacy migration ──────────────────────────────────────────────────────────────────────────
+
+// The stores the pre-generation plugin wrote: the OS entry (default home only — a custom
+// BEEZI_HOME never owned the shared entry, and inheriting it would let two namespaces refresh one
+// grant) and <home>/credentials.json through the first file-capable backend, which understands
+// both the DPAPI and plaintext forms.
+function legacySources(deps) {
+  const sources = [];
+  let fileSeen = false;
+  for (const b of backendsFor(deps)) {
+    if (b.kind === 'os') {
+      if (homeSuffix() === '') sources.push(b);
+    } else if (!fileSeen) {
+      fileSeen = true;
+      sources.push(b);
+    }
+  }
+  return sources;
+}
+
+function readLegacyCopies(deps) {
+  const entry = legacyEntry();
+  const copies = [];
+  for (const b of legacySources(deps)) {
+    if (!b.available()) continue;
+    const credentials = parseCredentials(b.get(entry));
+    if (credentials) copies.push({ source: b.name, credentials });
+  }
+  return copies;
+}
+
+const canonical = (credentials) => JSON.stringify(Object.keys(credentials).sort().map((k) => [k, credentials[k]]));
+
+// First read with no control record. One credential set (or identical copies) becomes generation
+// 1 under the lock; the legacy copies stay for any pre-generation process still running. Nothing
+// is persisted when nothing is found, so a legacy entry behind a locked keychain is never sealed
+// out. Differing copies are left alone and reported: a login resolves them with a new generation.
+async function migrateLegacy(deps, heldLock) {
+  const copies = readLegacyCopies(deps);
+  if (copies.length === 0) return { status: CREDENTIAL_STATUS.NONE };
+  if (new Set(copies.map((c) => canonical(c.credentials))).size > 1) {
+    return { status: CREDENTIAL_STATUS.STORAGE_CONFLICT, sources: copies.map((c) => c.source) };
+  }
+  const lock = heldLock == null ? await acquireCredentialLock({ waitMs: lockWait(deps, LOCK_WAIT_MS) }, deps) : heldLock;
+  if (lock == null) return { status: CREDENTIAL_STATUS.UNAVAILABLE, reason: UNAVAILABLE_REASONS.LOCKED };
+  try {
+    if (readControl().value != null) return readCredentials(deps, { lock }); // published while we waited
+    const r = await commitCredentials(copies[0].credentials, { lock, expectedGeneration: null }, deps);
+    if (r.status === COMMIT_STATUS.COMMITTED) {
+      // `migrated` marks the one read that performed the migration: a pre-generation process may
+      // still be running, so the caller owes the user a restart notice.
+      return {
+        status: CREDENTIAL_STATUS.READY, generation: r.generation, backend: r.backend, credentials: copies[0].credentials, migrated: true,
+      };
+    }
+    if (readControl().value != null) return readCredentials(deps, { lock });
+    return { status: CREDENTIAL_STATUS.UNAVAILABLE, reason: UNAVAILABLE_REASONS.LOCKED };
+  } finally {
+    if (heldLock == null) releaseCredentialLock(lock);
+  }
+}
+
+// ── public store API ──────────────────────────────────────────────────────────────────────────
+
+// { status: 'ready', generation, backend, credentials, migrated? } | { status: 'none' }
+// | { status: 'unavailable', reason, generation?, backend? } | { status: 'storage_conflict', sources }.
+// `options.lock` lets a caller that already holds the namespace lock reread without re-acquiring.
+export async function readCredentials(deps = {}, options = {}) {
+  const control = readControl();
+  if (control.unreadable) {
+    return { status: CREDENTIAL_STATUS.UNAVAILABLE, reason: UNAVAILABLE_REASONS.CONTROL_UNREADABLE };
+  }
+  if (control.value == null) return migrateLegacy(deps, options.lock);
+  const { generation, backend } = control.value;
+  if (generation == null) return { status: CREDENTIAL_STATUS.NONE };
+  const unavailable = (reason) => ({ status: CREDENTIAL_STATUS.UNAVAILABLE, reason, generation, backend });
+  const b = backendByName(backend, deps);
+  if (b == null) return unavailable(UNAVAILABLE_REASONS.BACKEND_MISSING);
+  if (!b.available()) return unavailable(UNAVAILABLE_REASONS.BACKEND_UNREADABLE);
+  const raw = b.get(generationEntry(generation));
+  if (!raw) return unavailable(UNAVAILABLE_REASONS.BACKEND_UNREADABLE);
+  const credentials = parseCredentials(raw);
+  if (!credentials) return unavailable(UNAVAILABLE_REASONS.ENTRY_MALFORMED);
+  return { status: CREDENTIAL_STATUS.READY, generation, backend, credentials };
+}
+
+// Writes `credentials` as the next generation into the first backend that accepts it, then
+// publishes the control record — only while the caller still owns the lock, and only if the
+// committed generation still equals `expectedGeneration` (null = none committed) unless `force`.
+// { status: 'committed', generation, backend, where } | { status: 'superseded', generation }
+// | { status: 'lock_lost' }.
+export async function commitCredentials(credentials, options = {}, deps = {}) {
+  const guard = casGuard(options);
+  if (!holdsCredentialLock(options.lock)) return { status: COMMIT_STATUS.LOCK_LOST };
+  const control = readControl();
+  if (control.unreadable && !guard.force) return { status: COMMIT_STATUS.SUPERSEDED, generation: null };
+  const current = control.value == null ? null : control.value.generation;
+  if (!guard.force && guard.expectedGeneration !== current) {
+    return { status: COMMIT_STATUS.SUPERSEDED, generation: current };
+  }
+  const generation = highestOf(control) + 1;
+  const entry = generationEntry(generation);
+  const raw = JSON.stringify(credentials);
+  let backend = null;
+  let where = null;
+  for (const b of backendsFor(deps)) {
+    if (!b.available()) continue;
+    where = b.set(entry, raw);
+    if (where) { backend = b; break; }
+  }
+  if (backend == null) throw new Error('No credential backend accepted the write.');
+  // The entry stays as an orphan on purpose: never read (no control record names it) and
+  // overwritten by name by the next commit, whereas a by-name delete here could remove an entry
+  // a concurrent holder just wrote under the same number.
+  if (!holdsCredentialLock(options.lock)) return { status: COMMIT_STATUS.LOCK_LOST };
+  writeControl(generation, backend.name, generation);
+  if (typeof current === 'number') retireEntry(control.value, deps);
+  return { status: COMMIT_STATUS.COMMITTED, generation, backend: backend.name, where };
+}
+
+// Publishes "nothing committed" (keeping the generation counter), then removes the entry — in
+// that order, so a crash in between leaves no permanently unavailable generation. Same
+// lock/expectedGeneration/force contract as commitCredentials.
+// { status: 'deleted', generation } | { status: 'superseded', generation } | { status: 'lock_lost' }.
+export async function deleteCredentialGeneration(options = {}, deps = {}) {
+  const guard = casGuard(options);
+  if (!holdsCredentialLock(options.lock)) return { status: DELETE_STATUS.LOCK_LOST };
+  const control = readControl();
+  if (control.unreadable && !guard.force) return { status: DELETE_STATUS.SUPERSEDED, generation: null };
+  const current = control.value == null ? null : control.value.generation;
+  if (!guard.force && guard.expectedGeneration !== current) {
+    return { status: DELETE_STATUS.SUPERSEDED, generation: current };
+  }
+  writeControl(null, null, highestOf(control));
+  if (typeof current === 'number') retireEntry(control.value, deps);
+  return { status: DELETE_STATUS.DELETED, generation: current };
+}
+
+// ── pre-generation accessors, kept for login/logout until they are rewired ────────────────────
+
+// The committed credentials, or null for every other status.
 export async function getCredentials(deps = {}) {
-  for (const b of backends(deps)) {
-    if (!b.available()) continue;
-    const raw = b.get();
-    if (raw) return parseCredentials(raw);
-  }
-  return null;
+  const r = await readCredentials(deps);
+  return r.status === CREDENTIAL_STATUS.READY ? r.credentials : null;
 }
 
-// Returns a human-readable description of where the credentials were actually
-// stored, so the caller can report accurately (keychain vs a local file)
-// instead of always claiming the keychain.
-export async function setCredentials(creds, deps = {}) {
-  const raw = JSON.stringify(creds);
-  for (const b of backends(deps)) {
-    if (!b.available()) continue;
-    const where = b.set(raw);
-    if (where) return where;
+// Login's final write: queues behind any refresh, then replaces whatever is committed. Returns a
+// human-readable description of where the credentials were actually stored.
+export async function setCredentials(credentials, deps = {}) {
+  const lock = await acquireCredentialLock({ waitMs: lockWait(deps, WRAPPER_LOCK_WAIT_MS) }, deps);
+  if (lock == null) throw new UserError(BUSY_MESSAGE);
+  try {
+    const r = await commitCredentials(credentials, { lock, force: true }, deps);
+    if (r.status !== COMMIT_STATUS.COMMITTED) throw new UserError(BUSY_MESSAGE);
+    return r.where;
+  } finally {
+    releaseCredentialLock(lock);
   }
-  return 'a restricted local file';
 }
 
+// Logout: removes the committed generation and this namespace's legacy copies.
 export async function deleteCredentials(deps = {}) {
-  // Clear every backend that could hold it (keychain + file), best-effort.
-  for (const b of backends(deps)) {
-    if (b.available()) { try { b.delete(); } catch { /* ignore */ } }
+  const lock = await acquireCredentialLock({ waitMs: lockWait(deps, WRAPPER_LOCK_WAIT_MS) }, deps);
+  if (lock == null) throw new UserError(BUSY_MESSAGE);
+  try {
+    await deleteCredentialGeneration({ lock, force: true }, deps);
+    deleteLegacyCredentials(deps);
+  } finally {
+    releaseCredentialLock(lock);
+  }
+}
+
+// Removes every generation entry this namespace could still hold, committed or orphaned.
+//
+// commitCredentials deliberately leaves an entry behind when it loses the lock mid-write, because
+// a by-name delete there can remove what a concurrent holder just wrote under the same number.
+// That hazard is specific to the lock-lost path: a caller that HOLDS the lock — logout — has no
+// concurrent holder, and an orphan created by a refresh holds the freshly ROTATED refresh token
+// while the committed generation's is the dead one. Leaving it is a live grant sitting in the
+// keychain of a machine the user just signed out of.
+export function deleteAllGenerationEntries(deps = {}) {
+  if (!holdsCredentialLock(deps.lock)) return 0;
+  const control = readControl();
+  // highest + 1: a lock-lost commit writes gen-<highest+1> and never reaches writeControl, so the
+  // control record has no idea that entry exists. That number IS the orphan this sweep is for.
+  const highest = (control.unreadable ? 0 : highestOf(control)) + 1;
+  let removed = 0;
+  for (let generation = 1; generation <= highest; generation += 1) {
+    const entry = generationEntry(generation);
+    for (const b of backendsFor(deps)) {
+      if (!b.available()) continue;
+      try { if (b.delete(entry) !== false) removed += 1; } catch { /* ignore */ }
+    }
+  }
+  return removed;
+}
+
+// Removes this namespace's pre-generation copies. Nothing in the new store reads them, but a
+// downgraded install or a pre-upgrade process still running does — so an explicit logout that
+// left them behind would leave a live credential on the machine. Callers hold the lock.
+export function deleteLegacyCredentials(deps = {}) {
+  const entry = legacyEntry();
+  for (const b of legacySources(deps)) {
+    if (b.available()) { try { b.delete(entry); } catch { /* ignore */ } }
   }
 }

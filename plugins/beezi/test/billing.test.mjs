@@ -92,6 +92,15 @@ test('normalizePlan — falls back to subscriptionType', () => {
   assert.equal(normalizePlan('free', undefined), 'free');
 });
 
+test('normalizePlan — a multiplier in the product field is matched too, not degraded to unknown', () => {
+  // The tier arm matches by substring; the product arm used exact equality, so a source that put
+  // the multiplier in subscriptionType missed every branch and returned 'unknown' — strictly
+  // worse than the plain 'max' it should have beaten.
+  assert.equal(normalizePlan('max_20x', null), 'max_20x');
+  assert.equal(normalizePlan('max_5x', null), 'max_5x');
+  assert.equal(normalizePlan('max', null), 'max', 'a bare max is still a bare max');
+});
+
 test('normalizePlan — unknown when nothing matches', () => {
   assert.equal(normalizePlan(undefined, undefined), 'unknown');
   assert.equal(normalizePlan('mystery', 'mystery'), 'unknown');

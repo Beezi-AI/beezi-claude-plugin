@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import { queueDir, stateDir } from './paths.mjs';
+import { queueDir, stateDir, telemetryDir } from './paths.mjs';
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 
-// Deletes files in the state + queue dirs whose mtime is older than maxAgeMs.
+// Deletes files in the state + queue + telemetry dirs whose mtime is older than maxAgeMs.
 // Best-effort: never throws. `now` injectable for deterministic tests.
 export function pruneStale(now = Date.now(), maxAgeMs = FOURTEEN_DAYS_MS) {
-  for (const dir of [stateDir(), queueDir()]) {
+  for (const dir of [stateDir(), queueDir(), telemetryDir()]) {
     let files;
     try { files = fs.readdirSync(dir); } catch { continue; } // dir missing → skip
     for (const file of files) {

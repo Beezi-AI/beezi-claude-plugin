@@ -10,6 +10,9 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { postSessionError } from './session-error-report.mjs';
+import { recordIssue, rememberClaudeCodeVersion } from './telemetry.mjs';
+import { bindInstallationIfNeeded } from './installation-binding.mjs';
+import { DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './telemetry-codes.mjs';
 import { computeSessionTimeline, postSessionTimeline } from './session-timeline.mjs';
 import { isApiKeyBillingEvidence } from './billing.mjs';
 import {
@@ -19,14 +22,20 @@ import {
   recordApiKeyEvidence,
 } from './billing-config.mjs';
 import { resolveSessionName } from './session-name.mjs';
-import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { listSubagentTranscripts, buildTaskDescriptionMap } from './subagents.mjs';
+import { readJson, readJsonSalvaged, writeJsonSecure } from './fs-store.mjs';
+import {
+  listSubagentTranscripts,
+  buildTaskDescriptionMap,
+  createWorkflowNameResolver,
+} from './subagents.mjs';
 import { claimIntervals, mergeIntervals, subtractIntervals, totalMs } from './active-time.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { claudeMdLines } from './claude-md.mjs';
 import { isLiveTrackingAllowed, markTrackingDisabled } from './tracking.mjs';
 import { readUsageUtilization as _readUsageUtilization } from './usage-utilization.mjs';
 import { readClaudeAccount as _readClaudeAccount } from './claude-account.mjs';
+import { buildIdentityStamp } from './identity-stamp.mjs';
+import { oauthTokenEnvWithOsProbe } from './claude-settings-env.mjs';
 import {
   maybePostUsageSnapshot as _maybePostUsageSnapshot,
   drainStatuslineSnapshots as _drainStatuslineSnapshots,
@@ -89,6 +98,9 @@ function detectTimezone() {
 // options exist to redirect its side effects: `sink` (payloads to the caller instead of the disk
 // queue), `skipFlush` (no per-session HTTP), `collectSessionErrors` (buffer API-error reports
 // instead of POSTing them one at a time). All default to today's hook behavior.
+//
+// `startCursor` (/beezi:sync) replaces the whole locally-tracked read position with the server's
+// own coverage — see the three reads it overrides below.
 export async function runCheckpoint(input, deps = {}, options = {}) {
   const { session_id, transcript_path, cwd } = input;
   const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
@@ -104,6 +116,14 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   let token = null;
   try { token = await getAccessToken(); } catch { return { enqueued: 0, flush: null, sessionErrors: collectedErrors }; }
   if (!token) return { enqueued: 0, flush: null, sessionErrors: collectedErrors };
+
+  // Diagnostics themselves no longer ride this path — they go out over the authorization-free
+  // route from the diagnostics worker. What is left here is the one authenticated half: this is
+  // successful authenticated activity, which is exactly when a correlation ID may be bound.
+  try { await bindInstallationIfNeeded(token, { postJsonImpl: deps.postJsonImpl }); } catch { /* never block the checkpoint */ }
+  // A bounded tail-read of the transcript, cached in telemetry.json for the recorder to stamp
+  // future events with — must never throw into the checkpoint either.
+  try { rememberClaudeCodeVersion(transcript_path); } catch { /* best-effort */ }
 
   // Tenant gate: audit-mode workspaces never track live — the server would 403 every report
   // anyway (TrackingEnabledGuard), this just spares the work and the noise. `gated` lets
@@ -175,6 +195,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const skipped = { noRemote: 0, emitFailed: 0, deltaFailed: false };
   const emptyResult = { enqueued: 0, flush: null, sessionErrors: collectedErrors, skipped };
   const state = loadState(session_id);
+  // The server is the authority on what actually landed: a local cursor can sit at EOF while the
+  // upload was lost, and a re-linked or fresh machine has no state at all. Null = trust local state.
+  const startCursor = options.startCursor == null ? null : options.startCursor;
+  const cursor = startCursor == null ? state.cursor : startCursor;
   // When the session file is unreadable (name resolves to null), keep the last name we sent
   // rather than overwriting the stored name with null.
   const sessionName =
@@ -183,7 +207,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     : null;
   let delta;
   try {
-    delta = computeDelta(transcript_path, state.cursor, { cwd, repoRootOf, branchAt: branchOf });
+    delta = computeDelta(transcript_path, cursor, { cwd, repoRootOf, branchAt: branchOf });
   } catch {
     skipped.deltaFailed = true;
     return emptyResult;
@@ -206,7 +230,50 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       billingConfig = recorded;
     }
   }
-  const billingFields = resolveBilling(billingConfig);
+  // Resolved HERE, above resolveBilling, and used for the identity stamp below too: both readings
+  // must come from ONE env. resolveBilling's `env` parameter defaults to oauthTokenEnv(process.env),
+  // so omitting it silently computed a SECOND, un-probed env — the source could then disagree with
+  // the fingerprint stamped ten lines further down. Passing it explicitly closes that.
+  //
+  // Why the probing variant: Claude Code 2.1.251 deletes CLAUDE_CODE_OAUTH_TOKEN from every child
+  // environment it builds, so a hook never inherits it however the user set it — process.env alone
+  // cannot answer here. The chain is process.env → user settings file → OS persistent environment.
+  //
+  // WHAT THIS COSTS, HONESTLY. This is the PostToolUse-Bash hook: a FRESH PROCESS on every Bash
+  // tool call. os-env-token's cache is per process, so it amortizes nothing across calls — the
+  // price below is paid once per Bash command, not once per session.
+  //
+  // Measured on Windows 11 after os-env-token learned to tell "reg ran and found nothing"
+  // (authoritative — no PowerShell) from "reg could not execute" (fall back):
+  //   token present in User scope, one `reg query` hit ......... 38ms median (34.8-46.0, n=8)
+  //   no token set, two `reg query` misses, no PowerShell ............... ~56ms
+  //   PowerShell fallback, only when reg cannot execute at all .......... ~261ms
+  // (the previous no-token behaviour, which always spawned PowerShell, was ~316ms). macOS is one
+  // ~10ms `launchctl getenv`; Linux has no OS-level persistent env store and spawns nothing at all.
+  //
+  // The 38ms is the figure to trust for this call site: it was taken at the ENTRYPOINT, spawning
+  // `node scripts/checkpoint.mjs` end to end (822ms with the probe firing vs 783ms with a token
+  // pre-set in process.env so it is skipped). That the entrypoint delta matches ONE isolated probe
+  // is also the evidence that the module-level cache holds here — no call site double-probes.
+  //
+  // And it is only paid when the two cheap tiers came up empty, so a machine whose token is
+  // exported or sits in settings.json never probes.
+  //
+  // That is accepted, with eyes open, as the price of a correct identity stamp: this is the path
+  // the fingerprint has to reach, and a setup-token machine that skips it reports usage no account
+  // can be resolved for. The alternative — SessionStart probing once and persisting the
+  // fingerprint under BEEZI_HOME for the hook to read — was considered and DEFERRED: it adds a
+  // cache that can outlive a rotated token and go quietly wrong, which is a worse failure than
+  // milliseconds. Do not build it here without deciding how it is invalidated.
+  //
+  // An INJECTED deps.env is trusted verbatim — it describes a machine under test, and a
+  // developer's own settings file (or registry) must not leak into it.
+  // Only the probe seam is forwarded, never the whole deps bag: os-env-token turns its own cache
+  // off when it sees an injected env/platform/run, and checkpoint's deps carry neither meaning.
+  const env = deps.env == null
+    ? oauthTokenEnvWithOsProbe(process.env, { osEnvOauthToken: deps.osEnvOauthToken })
+    : deps.env;
+  const billingFields = resolveBilling(billingConfig, env);
 
   // Subscription-usage stamp: account-level utilization correlated onto every payload of this
   // checkpoint. Keys are omitted (not null) when unknown. usage_account_uuid is the CACHE's own
@@ -218,8 +285,17 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   try { utilization = readUtilization(); } catch { utilization = null; }
   let claudeAccount = null;
   try { claudeAccount = readAccount(); } catch { claudeAccount = null; }
+  // Identity stamp: which vendor account this machine is logged into NOW, in every shape it can
+  // prove — the uuid, the email, and the setup-token fingerprint for CI machines that expose
+  // nothing else. The server's ingest links the session to its account with whichever arrives.
+  //
+  // Built by the shared builder, NOT inline, because the usage-snapshot report has to send the
+  // identical stamp: it posts to a different route that resolves an account the same way, and two
+  // builders reading the same sources in a different order would land this machine's sessions and
+  // its limits data on two different accounts. See lib/identity-stamp.mjs.
+  // `env` was resolved above the billing block so both readings share one answer — see there.
   const usageStamp = {
-    ...(claudeAccount != null && claudeAccount.accountUuid ? { account_uuid: claudeAccount.accountUuid } : {}),
+    ...buildIdentityStamp(claudeAccount, billingConfig, env),
     ...(utilization
       ? {
           usage_five_hour_pct: utilization.fiveHourPct,
@@ -241,10 +317,18 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // may only bill the part no earlier segment claimed. Summing them instead multiplied a session's
   // reported time by roughly (1 + number of parallel agents). Persisted across checkpoints because
   // a subagent's lines can land in a later window than the main lines covering the same minutes.
-  let covered = mergeIntervals(Array.isArray(state.coveredIntervals) ? state.coveredIntervals : []);
+  // Under startCursor the emitted window is disjoint in line space from what the server holds, so its
+  // clock is time the server never billed. Seeding from local state would zero the duration on a
+  // re-send whose narrow rows then get superseded away — the time would vanish from the aggregate.
+  const seedIntervals = startCursor == null && Array.isArray(state.coveredIntervals) ? state.coveredIntervals : [];
+  let covered = mergeIntervals(seedIntervals);
   let coveredDirty = false;
 
   const enqueueSegments = (segs, segmentScope, extra = null, { includeContext = true } = {}) => {
+    // Range of the dropped segments so far, folded into the next payload we do send — the cursor
+    // consumes them either way, and a line in no payload is a hole coverage can never step over.
+    // Per call: the main transcript and each subagent file number their lines independently.
+    let carryFrom = null;
     for (const seg of segs) {
       // Main-transcript segments run through here first and so keep their full span; subagents bill
       // only the residual. Deterministic, and it puts the time on the thread that was blocked for
@@ -254,11 +338,20 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       const durationSec = intervals
         ? Math.round(totalMs(subtractIntervals(intervals, covered)) / 1000)
         : seg.stats.duration_sec;
-      if (seg.stats.token_total === 0 && durationSec === 0) continue;
+      if (seg.stats.token_total === 0 && durationSec === 0) {
+        if (carryFrom == null) carryFrom = seg.fromLine;
+        continue;
+      }
       const resolvedRemote = resolveRemote(seg.repoRoot);
       const remote = resolvedRemote == null ? localRemote(seg.repoRoot == null ? cwd : seg.repoRoot) : resolvedRemote;
       // Nothing left to name the work by — only reachable when the session has no cwd either.
-      if (!remote) { skipped.noRemote += 1; continue; }
+      if (!remote) {
+        if (carryFrom == null) carryFrom = seg.fromLine;
+        skipped.noRemote += 1;
+        continue;
+      }
+      // Widens the claimed span only; every stat below stays this segment's own.
+      const fromLine = carryFrom == null ? seg.fromLine : Math.min(carryFrom, seg.fromLine);
       // A single write failure must not abort the window (which would leave the cursor
       // unadvanced and re-process everything forever) — skip that segment and continue.
       // A subagent's context window is not the session's — its context fields never ship.
@@ -269,11 +362,11 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       const mdLines = resolveClaudeMdLines(seg.repoRoot);
       try {
         const payload = {
-          segmentId: `${segmentScope}:${seg.fromLine}-${seg.toLine}`,
+          segmentId: `${segmentScope}:${fromLine}-${seg.toLine}`,
           sessionId: session_id,
           remote,
           branch: clamp(seg.branch, BRANCH_MAX),
-          from_line: seg.fromLine,
+          from_line: fromLine,
           to_line: seg.toLine,
           ...billingFields,
           ...usageStamp,
@@ -285,6 +378,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           duration_sec: durationSec,
         };
         emit(payload);
+        carryFrom = null;
         // Claim only what actually reached the queue: a failed write must not swallow the window
         // for every later segment too.
         if (intervals != null && intervals.length) {
@@ -293,7 +387,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
         }
         lastPayload = payload;
         enqueued += 1;
-      } catch { skipped.emitFailed += 1; /* keep going; the cursor still advances below */ }
+      } catch {
+        carryFrom = fromLine;
+        skipped.emitFailed += 1; /* keep going; the cursor still advances below */
+      }
     }
   };
   enqueueSegments(segments, session_id);
@@ -302,23 +399,30 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // appear in the main transcript, so each agent file gets its own delta window with its
   // own cursor. Line numbers are per-file: scope the segmentId by agent id so they can't
   // collide with main-transcript segments (or each other) on the server upsert.
-  const agentCursors = state.agentCursors == null ? {} : state.agentCursors;
+  // Restarted from 0 under startCursor: there is no per-agent coverage to resume from, and a full
+  // re-send is the WIDE direction, which the server's containment supersede absorbs.
+  const agentCursors = startCursor != null || state.agentCursors == null ? {} : state.agentCursors;
   let agentCursorsDirty = false;
   // Each subagent's display name is the `description` of the Task block that spawned it; join via
   // the meta.json toolUseId. Built once here (single main-transcript scan) for all subagents.
   const taskDescriptions = buildTaskDescriptionMap(transcript_path);
-  for (const { agentId, path: agentPath, agentType, spawnDepth, toolUseId } of listSubagentTranscripts(transcript_path, session_id)) {
+  const workflowNameOf = createWorkflowNameResolver(transcript_path, session_id);
+  for (const { agentId, path: agentPath, workflowId, agentType, spawnDepth, toolUseId } of listSubagentTranscripts(transcript_path, session_id)) {
     const agentFrom = agentCursors[agentId] == null ? 0 : agentCursors[agentId];
     let agentDelta;
     try {
       agentDelta = computeDelta(agentPath, agentFrom, { cwd, repoRootOf, branchAt: branchOf });
     } catch { continue; }
     const taskDescription = toolUseId ? taskDescriptions.get(toolUseId) : null;
+    // A workflow agent has no spawning Task block, so its run's state file names it instead.
+    const workflowName = workflowNameOf(workflowId, agentId);
     enqueueSegments(agentDelta.segments, `${session_id}:${agentId}`, {
       is_subagent: true,
       agent_id: agentId,
       agent_type: clamp(agentType, AGENT_TYPE_MAX),
-      agent_name: toolUseId ? clamp(taskDescription == null ? null : taskDescription, AGENT_NAME_MAX) : null,
+      agent_name: workflowName != null
+        ? clamp(workflowName, AGENT_NAME_MAX)
+        : (toolUseId ? clamp(taskDescription == null ? null : taskDescription, AGENT_NAME_MAX) : null),
       spawn_depth: spawnDepth,
     }, { includeContext: false });
     // A subagent that dies on an API error never ends the main turn, so no StopFailure fires
@@ -383,12 +487,16 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // Fleet utilization snapshot — deduped by (account, fetchedAt); best-effort like the
     // timeline. StopFailure also runs with emitTimeline, so a turn that died on a rate-limit
     // error still ships its snapshot — the moment it matters most.
+    // `env` is forwarded, not left to default: both callees build the same identity stamp this
+    // checkpoint's session reports carry, and the token behind it may live in Claude Code's
+    // settings file or the OS environment, where a bare process.env cannot see it. Without this
+    // the two would report different identities from the same machine, in the same second.
     const postSnapshot = deps.maybePostUsageSnapshot == null ? _maybePostUsageSnapshot : deps.maybePostUsageSnapshot;
-    try { await postSnapshot(token, { fetchImpl }); } catch { /* best-effort */ }
+    try { await postSnapshot(token, { fetchImpl, env }); } catch { /* best-effort */ }
     // Live rate-limit rows the status line recorded between hooks — the observations no
     // hook was running to see.
     const drainSnapshots = deps.drainStatuslineSnapshots == null ? _drainStatuslineSnapshots : deps.drainStatuslineSnapshots;
-    try { await drainSnapshots(token, { fetchImpl }); } catch { /* best-effort */ }
+    try { await drainSnapshots(token, { fetchImpl, env }); } catch { /* best-effort */ }
   }
 
   // Claude Code renames a session after the first prompt. The new name normally rides on the
@@ -481,7 +589,7 @@ function sweepHeldQueue(dir, result, now = Date.now()) {
 export async function flushQueue(token, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
-  const result = { flushed: 0, rejected: 0, failed: 0, expired: 0, trackingDisabled: false, lastError: null };
+  const result = { flushed: 0, rejected: 0, failed: 0, expired: 0, salvaged: 0, quarantined: 0, trackingDisabled: false, lastError: null };
   const dir = queueDir();
 
   // Dark workspace: no readdir-and-post loop, just the hold-window sweep. Files stay for
@@ -514,9 +622,22 @@ export async function flushQueue(token, deps = {}) {
   }
 
   for (const file of files) {
+    // Only queued payloads. Skips the `.tmp` of a writer that died mid-write and the `.corrupt`
+    // files quarantined below, neither of which is ever postable; pruneStale expires both.
+    if (!file.endsWith('.json')) continue;
     const filePath = path.join(dir, file);
-    const payload = readJson(filePath);
-    if (payload == null) continue;
+    const { value: payload, salvaged } = readJsonSalvaged(filePath);
+    // Nothing recoverable, or what came back is not a postable payload. Quarantine rather than
+    // `continue`: an unparseable file used to be re-read on every flush forever, invisibly, and
+    // the session's analytics were lost without a signal. A cleanly parsed payload is posted
+    // exactly as before — the server stays the judge of its contents.
+    if (payload == null || (salvaged && payload.segmentId == null)) {
+      result.quarantined += 1;
+      recordIssue({ code: DIAGNOSTIC_CODES.QUEUE_FILE_QUARANTINED, source: DIAGNOSTIC_SOURCES.CHECKPOINT });
+      try { fs.renameSync(filePath, `${filePath}.corrupt`); } catch { /* best-effort */ }
+      continue;
+    }
+    if (salvaged) result.salvaged += 1;
 
     try {
       let res = await postJson(reportUrl, token, payload, { fetchImpl });
@@ -561,6 +682,7 @@ export async function flushQueue(token, deps = {}) {
         fs.unlinkSync(filePath);
       } else {
         result.failed += 1; // keep for retry
+        recordIssue({ code: DIAGNOSTIC_CODES.QUEUE_FLUSH_HTTP_ERROR, source: DIAGNOSTIC_SOURCES.CHECKPOINT, httpStatus: res.status });
       }
     } catch {
       result.failed += 1; // keep file for retry on network error / throw

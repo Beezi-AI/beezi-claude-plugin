@@ -15,6 +15,16 @@ export function configCandidates(env, homedir) {
 
 // Coarse product tier from the org/seat shape (team/enterprise/max/pro/free), or null.
 // The rateLimitTier still carries the Max multiplier and is normalized downstream.
+//
+// organizationType names the product for EVERY account, not just real organizations: a personal
+// Max subscription is written as `claude_max` with `seatTier: null` and the multiplier parked in
+// `organizationRateLimitTier`. Observed on a live personal Max 20x machine:
+//   { organizationType: 'claude_max', seatTier: null, userRateLimitTier: null,
+//     organizationRateLimitTier: 'default_claude_max_20x', billingType: 'stripe_subscription' }
+// Matching only enterprise/team here returned null for that shape, which made the merge in
+// claude-auth-status.mjs treat the profile as unable to state its type and discard the tier it
+// was holding — every personal Max user reported as plain `max`. seatTier stays as the fallback
+// for seat-based orgs, where the org names the company and the seat names the product.
 function deriveSubscriptionType(account) {
   const org = String(account.organizationType == null ? '' : account.organizationType).toLowerCase();
   if (org.includes('enterprise')) return 'enterprise';
@@ -23,6 +33,9 @@ function deriveSubscriptionType(account) {
   if (seat.includes('max')) return 'max';
   if (seat.includes('pro')) return 'pro';
   if (seat.includes('free')) return 'free';
+  if (org.includes('max')) return 'max';
+  if (org.includes('pro')) return 'pro';
+  if (org.includes('free')) return 'free';
   return null;
 }
 
@@ -67,6 +80,37 @@ export function readClaudeAuthSignals(deps = {}) {
   return { hasManagedApiKey, hasApiKeyHelper };
 }
 
+// File-derived account identity for change detection, best source first: oauthAccount's
+// accountUuid (pseudonymous, but can survive an account switch stale — see the CLI email anchor
+// in claude-auth-status.mjs, which outranks this), then the top-level userID (an opaque hash
+// Claude Code writes on every surface, including logins that never populate oauthAccount).
+// Returns { value, source } or null. Non-secret either way.
+export function readClaudeAccountAnchor(deps = {}) {
+  const readFile = deps.readFile == null ? ((p) => fs.readFileSync(p, 'utf-8')) : deps.readFile;
+  const exists = deps.exists == null ? ((p) => fs.existsSync(p)) : deps.exists;
+  const env = deps.env == null ? process.env : deps.env;
+  const homedir = deps.homedir == null ? os.homedir() : deps.homedir;
+
+  for (const p of configCandidates(env, homedir)) {
+    if (!exists(p)) continue;
+    let cfg;
+    try {
+      cfg = JSON.parse(readFile(p));
+    } catch {
+      continue;
+    }
+    if (cfg == null || typeof cfg !== 'object') continue;
+    const account = cfg.oauthAccount;
+    if (account != null && typeof account === 'object' && typeof account.accountUuid === 'string' && account.accountUuid) {
+      return { value: account.accountUuid, source: 'account_uuid' };
+    }
+    if (typeof cfg.userID === 'string' && cfg.userID) {
+      return { value: cfg.userID, source: 'user_id' };
+    }
+  }
+  return null;
+}
+
 // Read ONLY the non-secret oauthAccount subscription fields. Never opens `.credentials.json`,
 // never returns or exposes access/refresh tokens. Returns null when no account info exists.
 export function readClaudeAccount(deps = {}) {
@@ -87,6 +131,9 @@ export function readClaudeAccount(deps = {}) {
     return {
       // Pseudonymous account id — which Claude account this machine is logged into. Non-secret.
       accountUuid: typeof account.accountUuid === 'string' ? account.accountUuid : null,
+      // Some login surfaces write oauthAccount with ONLY emailAddress — then this is the
+      // machine's one vendor identity, and the session identity stamp rides on it.
+      email: typeof account.emailAddress === 'string' && account.emailAddress ? account.emailAddress : null,
       subscriptionType: deriveSubscriptionType(account),
       rateLimitTier: account.userRateLimitTier != null
         ? account.userRateLimitTier

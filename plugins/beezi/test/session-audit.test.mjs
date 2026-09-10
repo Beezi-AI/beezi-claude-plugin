@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseArgs, runAudit, shouldFinalize } from '../lib/session-audit.mjs';
 import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -809,4 +812,83 @@ test('36. shouldFinalize truth table', () => {
   assert.equal(shouldFinalize({ ...clean, permanentRejections: 1 }, {}), false);
   assert.equal(shouldFinalize(clean, { sinceMs: 123 }), false);
   assert.equal(shouldFinalize(clean, { dryRun: true }), false);
+});
+
+// ─── the backfill path carries advisor legs ─────────────────────────────────
+//
+// /beezi:login's history pull and /beezi:sync both run the REAL runCheckpoint (session-audit
+// only overrides it in unit tests), so they inherit whatever delta.mjs reads. This drives the
+// audit end to end over a transcript on disk — no runCheckpointImpl double — and asserts the
+// advisor leg inside `usage.iterations` reaches the payload handed to the flush.
+
+function advisorTranscript(dir) {
+  const line = {
+    type: 'assistant',
+    gitBranch: 'main',
+    cwd: dir,
+    timestamp: '2024-01-01T10:00:00.000Z',
+    effort: 'high',
+    message: {
+      id: 'msg_adv',
+      model: 'model-a',
+      usage: {
+        input_tokens: 4,
+        output_tokens: 60,
+        cache_read_input_tokens: 1000,
+        cache_creation_input_tokens: 100,
+        iterations: [
+          { type: 'message', input_tokens: 4, output_tokens: 60, cache_read_input_tokens: 1000, cache_creation_input_tokens: 100 },
+          { type: 'advisor_message', model: 'advisor-b', input_tokens: 61696, output_tokens: 4008, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        ],
+      },
+    },
+  };
+  const p = path.join(dir, 'sess-adv.jsonl');
+  fs.writeFileSync(p, JSON.stringify(line), 'utf-8');
+  return p;
+}
+
+test('backfill — the audit path uploads advisor_message tokens, not just top-level usage', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-adv-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const prevHome = process.env.BEEZI_HOME;
+  process.env.BEEZI_HOME = dir;
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.BEEZI_HOME;
+    else process.env.BEEZI_HOME = prevHome;
+  });
+
+  const transcriptPath = advisorTranscript(dir);
+
+  let captured = null;
+  // `undefined` deliberately: makeDeps spreads overrides last, and session-audit resolves the
+  // impl with `== null`, so this hands the run the real runCheckpoint.
+  const { deps } = makeDeps({
+    runCheckpointImpl: undefined,
+    listTranscripts: () => [{ sessionId: 'sess-adv', transcriptPath, projectDir: dir, mtimeMs: 1000, size: 256 }],
+    firstRecordedCwd: () => dir,
+    flushBackfillChunksImpl: async (groups) => {
+      captured = groups;
+      const bySession = new Map(
+        groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }]),
+      );
+      return flushResult({ stored: groups.length, bySession });
+    },
+  });
+
+  await runAudit(deps, {});
+
+  assert.ok(captured != null && captured.length > 0, 'the audit reached the flush with a group');
+  const reports = captured[0].reports;
+  assert.equal(reports.length, 1, 'one segment for the one-line transcript');
+  const models = reports[0].models;
+
+  assert.ok(models['advisor-b'], 'the advisor leg reaches the uploaded payload');
+  assert.equal(models['advisor-b'].token_input, 61696);
+  assert.equal(models['advisor-b'].token_output, 4008);
+  assert.equal(models['advisor-b'].requests, 1);
+  assert.equal(models['advisor-b'].by_effort.high.token_input, 61696);
+
+  assert.equal(models['model-a'].token_input, 4, 'the parent tally still comes off top-level usage');
+  assert.equal(models['model-a'].token_output, 60);
 });

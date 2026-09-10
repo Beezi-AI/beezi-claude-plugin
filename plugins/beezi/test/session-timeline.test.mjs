@@ -89,6 +89,37 @@ test('derives one active span per subagent transcript', (t) => {
   });
 });
 
+// Workflow-tool agents shard under subagents/workflows/<wf_id>/. They get a span like any other
+// subagent, and their wall clock is real session activity, so the axis has to reach it.
+test('derives a span for a workflow subagent and widens the axis to cover it', (t) => {
+  const { transcriptPath, sessionId } = setup(t);
+  const wfDir = path.join(path.dirname(transcriptPath), sessionId, 'subagents', 'workflows', 'wf_abc123');
+  fs.mkdirSync(wfDir, { recursive: true });
+  writeJsonl(path.join(wfDir, 'agent-w1.jsonl'), [
+    { type: 'assistant', timestamp: ts(1200) },
+    { type: 'assistant', timestamp: ts(1400) },
+  ]);
+  fs.writeFileSync(
+    path.join(wfDir, 'agent-w1.meta.json'),
+    JSON.stringify({ agentType: 'workflow-subagent', spawnDepth: 1 }),
+    'utf-8',
+  );
+  // The run's journal must not become a span of its own.
+  writeJsonl(path.join(wfDir, 'journal.jsonl'), [{ type: 'started', agentId: 'w1' }]);
+
+  const tl = computeSessionTimeline(transcriptPath, sessionId);
+
+  assert.equal(tl.subagents.length, 2);
+  const wf = tl.subagents.find((a) => a.agent_id === 'agent-w1');
+  assert.deepEqual(wf, {
+    agent_id: 'agent-w1',
+    agent_type: 'workflow-subagent',
+    started_at: ts(1200),
+    ended_at: ts(1400),
+  });
+  assert.equal(tl.ended_at, ts(1400), 'axis reaches the workflow agent, which ran past the main thread');
+});
+
 test('planning is driven by permissionMode; assistant work inherits it and vim type:mode is ignored', (t) => {
   const dir = makeTmpDir(t);
   const transcriptPath = path.join(dir, 'plan.jsonl');
@@ -203,6 +234,302 @@ test('plan mode with no ExitPlanMode yields a lone plan_start', (t) => {
   ]);
   const tl = computeSessionTimeline(transcriptPath, 'cancelled');
   assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: ts(15) }]);
+});
+
+// --- Skill-based planning (plan/spec/brainstorm skill → last plan-.md write) ---
+
+const skillLine = (skillName, tSec) => ({
+  type: 'assistant',
+  message: { content: [{ type: 'tool_use', id: `s${tSec}`, name: 'Skill', input: { skill: skillName } }] },
+  timestamp: ts(tSec),
+});
+const writeLine = (filePath, tSec) => ({
+  type: 'assistant',
+  message: { content: [{ type: 'tool_use', id: `w${tSec}`, name: 'Write', input: { file_path: filePath, content: 'x' } }] },
+  timestamp: ts(tSec),
+});
+const prompt = (tSec) => ({ type: 'user', message: { content: 'do X' }, timestamp: ts(tSec) });
+
+function timelineOf(t, name, lines) {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, `${name}.jsonl`);
+  writeJsonl(transcriptPath, lines);
+  return computeSessionTimeline(transcriptPath, name);
+}
+
+test('a planning skill plus a plan .md write emits plan_start/plan_ready', (t) => {
+  const tl = timelineOf(t, 'skill-plan', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    writeLine('/r/docs/design.md', 30),
+    writeLine('/r/docs/design.md', 50),
+    // Implementation starts — the cycle closes at the LAST plan write before it...
+    writeLine('/r/src/app.js', 70),
+    // ...and a plan edit after the close (checkbox ticking) is ignored.
+    writeLine('/r/docs/design.md', 90),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(50) },
+  ]);
+});
+
+test('a plan .md write with no preceding planning skill is ignored', (t) => {
+  const tl = timelineOf(t, 'no-entry', [
+    prompt(0),
+    writeLine('/r/docs/design.md', 30),
+    writeLine('/r/src/app.js', 60),
+  ]);
+  assert.deepEqual(tl.plan_events, []);
+});
+
+test('only .md files end a cycle — other extensions never trigger', (t) => {
+  const tl = timelineOf(t, 'not-md', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    writeLine('/r/design.txt', 20),
+    writeLine('/r/plan.mdx', 30),
+    writeLine('/r/spec.json', 40),
+    writeLine('/r/src/app.js', 50),
+  ]);
+  assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: ts(10) }]);
+  assert.ok(!tl.periods.some((p) => p.state === 'planning'), 'a lone plan_start paints no band');
+});
+
+test('executing-plans is not an entry point', (t) => {
+  const tl = timelineOf(t, 'executing', [
+    prompt(0),
+    skillLine('superpowers:executing-plans', 10),
+    writeLine('/r/docs/plan-v2.md', 30),
+    writeLine('/r/src/app.js', 50),
+  ]);
+  assert.deepEqual(tl.plan_events, []);
+});
+
+test('an execution skill closes an open cycle', (t) => {
+  const tl = timelineOf(t, 'exec-close', [
+    prompt(0),
+    skillLine('superpowers:writing-plans', 10),
+    writeLine('/r/docs/design.md', 20),
+    // Execution begins even though its code edits may live in subagent transcripts.
+    skillLine('superpowers:executing-plans', 30),
+    writeLine('/r/docs/design.md', 40),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(20) },
+  ]);
+});
+
+test('built-in and skill plan cycles coexist in one session, ordered', (t) => {
+  const tl = timelineOf(t, 'coexist', [
+    prompt(0),
+    { type: 'permission-mode', permissionMode: 'plan' },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'a' }] }, timestamp: ts(10) },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'p1', name: 'ExitPlanMode', input: {} }] }, timestamp: ts(20) },
+    { type: 'permission-mode', permissionMode: 'default' },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'b' }] }, timestamp: ts(30) },
+    skillLine('superpowers:writing-plans', 40),
+    writeLine('/r/docs/plan.md', 60),
+    writeLine('/r/src/app.js', 80),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(20) },
+    { type: 'plan_start', at: ts(40) },
+    { type: 'plan_ready', at: ts(60) },
+  ]);
+});
+
+test('a planning skill invoked inside built-in plan mode does not double-emit', (t) => {
+  const tl = timelineOf(t, 'suppressed', [
+    prompt(0),
+    { type: 'permission-mode', permissionMode: 'plan' },
+    // The skill line is the next timestamped line, so the built-in plan_start anchors to it —
+    // exactly the collision that suppression exists for.
+    skillLine('superpowers:writing-plans', 20),
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'p1', name: 'ExitPlanMode', input: {} }] }, timestamp: ts(40) },
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(20) },
+    { type: 'plan_ready', at: ts(40) },
+  ]);
+});
+
+test('built-in plan mode starting closes an open skill cycle', (t) => {
+  const tl = timelineOf(t, 'builtin-closes', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    writeLine('/r/docs/design.md', 20),
+    { type: 'permission-mode', permissionMode: 'plan' },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'a' }] }, timestamp: ts(30) },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'p1', name: 'ExitPlanMode', input: {} }] }, timestamp: ts(40) },
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(20) },
+    { type: 'plan_start', at: ts(30) },
+    { type: 'plan_ready', at: ts(40) },
+  ]);
+});
+
+test('a planning skill with no plan document yields a lone plan_start and no band', (t) => {
+  const tl = timelineOf(t, 'lone', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'a' }] }, timestamp: ts(30) },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'b' }] }, timestamp: ts(60) },
+  ]);
+  assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: ts(10) }]);
+  assert.ok(!tl.periods.some((p) => p.state === 'planning'));
+});
+
+test('two skill-plan cycles emit one ordered pair each', (t) => {
+  const tl = timelineOf(t, 'two-cycles', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    writeLine('/r/docs/x-design.md', 20),
+    writeLine('/r/src/app.js', 30),
+    skillLine('superpowers:writing-plans', 40),
+    writeLine('/r/docs/x-plan.md', 50),
+    writeLine('/r/src/app.js', 60),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(20) },
+    { type: 'plan_start', at: ts(40) },
+    { type: 'plan_ready', at: ts(50) },
+  ]);
+});
+
+test('multiple plan documents in one cycle — plan_ready is the last write across any of them', (t) => {
+  const tl = timelineOf(t, 'multi-doc', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    writeLine('/r/docs/design.md', 20),
+    writeLine('/r/docs/plan.md', 40),
+    writeLine('/r/src/app.js', 60),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(40) },
+  ]);
+});
+
+test('a date-slug file directly in an exact plans/ folder matches', (t) => {
+  const tl = timelineOf(t, 'plans-folder', [
+    prompt(0),
+    skillLine('superpowers:writing-plans', 10),
+    // writing-plans output: no keyword in the basename, folder named exactly 'plans'.
+    writeLine('/r/docs/superpowers/plans/2026-08-17-fast-connect.md', 30),
+    writeLine('/r/src/app.js', 50),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(30) },
+  ]);
+});
+
+test('a keyword-substring folder name does not match — exact folder names only', (t) => {
+  const tl = timelineOf(t, 'sdd-dir', [
+    prompt(0),
+    skillLine('superpowers:writing-plans', 10),
+    writeLine('/r/docs/superpowers/plans/x.md', 20),
+    // sdd execution artifact: folder CONTAINS 'design' but is not exactly a plan folder — it is
+    // an "other" edit, so it must not extend the cycle, and must CLOSE it instead.
+    writeLine('/r/.superpowers/sdd/2026-08-17-fast-connect-design/progress.md', 40),
+    writeLine('/r/.superpowers/sdd/2026-08-17-fast-connect-design/task-1-report.md', 60),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(20) },
+  ]);
+});
+
+test('a .claude housekeeping write is neutral — neither plan doc nor cycle close', (t) => {
+  const tl = timelineOf(t, 'housekeeping', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    writeLine('/r/docs/specs/api-design.md', 20),
+    // Memory save mid-brainstorm — must not close the cycle (a real session lost 15 minutes of
+    // design authoring to exactly this write).
+    writeLine('C:\\Users\\x\\.claude\\projects\\p\\memory\\MEMORY.md', 30),
+    writeLine('/r/docs/specs/api-design.md', 50),
+    writeLine('/r/src/app.js', 70),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(50) },
+  ]);
+});
+
+test('the skill-plan window paints a planning band; work after the close is working', (t) => {
+  const tl = timelineOf(t, 'band', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'a' }] }, timestamp: ts(30) },
+    writeLine('/r/docs/design.md', 50),
+    writeLine('/r/src/app.js', 70),
+  ]);
+  const planning = tl.periods.find((p) => p.state === 'planning');
+  // The lead-up anchor at ts(10) already sits inside the [10,50] interval, so the band opens at
+  // the prompt — matching how built-in plan mode dates the interval ENDING at a plan anchor.
+  assert.deepEqual([planning.started_at, planning.ended_at], [ts(0), ts(50)]);
+  const working = tl.periods.find((p) => p.state === 'working');
+  assert.deepEqual([working.started_at, working.ended_at], [ts(50), ts(70)]);
+});
+
+test('a real user prompt inside a skill-plan window still reads waiting_user', (t) => {
+  const tl = timelineOf(t, 'precedence', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'a' }] }, timestamp: ts(30) },
+    prompt(60),
+    writeLine('/r/docs/design.md', 90),
+    writeLine('/r/src/app.js', 120),
+  ]);
+  const waits = tl.periods.filter((p) => p.state === 'waiting_user');
+  assert.equal(waits.length, 1);
+  assert.deepEqual([waits[0].started_at, waits[0].ended_at], [ts(30), ts(60)]);
+  assert.ok(tl.periods.some((p) => p.state === 'planning'));
+});
+
+test('Windows backslash paths are matched by basename', (t) => {
+  const tl = timelineOf(t, 'backslash', [
+    prompt(0),
+    skillLine('superpowers:brainstorming', 10),
+    // Both match: notes.md sits directly in an exact 'plans' folder, api-design.md by basename;
+    // plan_ready is the LAST of them, and neither reads as an implementation edit.
+    writeLine('C:\\repo\\docs\\plans\\notes.md', 20),
+    writeLine('C:\\repo\\docs\\plans\\api-design.md', 40),
+    writeLine('C:\\repo\\src\\a.js', 60),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(40) },
+  ]);
+});
+
+test('skill ids and filenames match case-insensitively', (t) => {
+  const tl = timelineOf(t, 'case', [
+    prompt(0),
+    skillLine('Superpowers:Brainstorming', 10),
+    writeLine('/r/DESIGN.MD', 30),
+    writeLine('/r/src/app.js', 50),
+  ]);
+  assert.deepEqual(tl.plan_events, [
+    { type: 'plan_start', at: ts(10) },
+    { type: 'plan_ready', at: ts(30) },
+  ]);
+});
+
+test('a non-planning skill is not an entry point — design is a document keyword only', (t) => {
+  const tl = timelineOf(t, 'non-plan-skill', [
+    prompt(0),
+    skillLine('frontend-design:frontend-design', 10),
+    writeLine('/r/docs/design.md', 30),
+  ]);
+  assert.deepEqual(tl.plan_events, []);
 });
 
 test('the pre-prompt lead-in is dropped — the session starts when the human first speaks', (t) => {
@@ -501,7 +828,7 @@ test('an AskUserQuestion wait is waiting_user, not idle', (t) => {
   assert.deepEqual([last.started_at, last.ended_at], [ts(30), ts(30 + 22 * 60)]);
 });
 
-test('an ordinary tool_result after a long gap is still idle, not waiting_user', (t) => {
+test('an ordinary tool_result after a long gap is still idle, without a permission marker', (t) => {
   const dir = makeTmpDir(t);
   const transcriptPath = path.join(dir, 'bash.jsonl');
   writeJsonl(transcriptPath, [
@@ -652,4 +979,203 @@ test('an ordinary failed tool_result is still idle, not a user decision', (t) =>
 
   const tl = computeSessionTimeline(transcriptPath, 'sess-failed');
   assert.equal(tl.periods[tl.periods.length - 1].state, 'idle', 'a tool that ran and failed is not the human');
+});
+
+// --- waiting subtypes -------------------------------------------------------------------------
+// Markers are injected rather than read from ~/.beezi/state: the real state dir belongs to whoever
+// is running the suite, and a stray file there must never be able to flip an assertion.
+const withMarkers = (markers) => ({ readPermissionMarkers: () => markers });
+const marker = (offsetSec, toolName, permissionMode) => ({
+  ts: BASE_MS + offsetSec * 1000,
+  toolName: toolName === undefined ? 'Bash' : toolName,
+  permissionMode: permissionMode === undefined ? 'default' : permissionMode,
+});
+
+// One assistant tool_use at ts(30), its result 22 minutes later. Without a marker that whole gap
+// is the tool running; with one it is the human staring at a permission dialog.
+function permissionTranscript(t, name) {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, `${name}.jsonl`);
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'run the build' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_b1', name: 'Bash', input: {} }] },
+      timestamp: ts(30),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_b1', content: 'done' }] },
+      timestamp: ts(30 + 22 * 60),
+    },
+  ]);
+  return transcriptPath;
+}
+
+test('a permission marker turns an approved tool wait into waiting_user/command_approval', (t) => {
+  const transcriptPath = permissionTranscript(t, 'perm-approved');
+  const tl = computeSessionTimeline(transcriptPath, 'sess-perm', withMarkers([marker(35)]));
+  const last = tl.periods[tl.periods.length - 1];
+  assert.equal(last.state, 'waiting_user', 'the human was reading a permission dialog');
+  assert.equal(last.waiting_subtype, 'command_approval');
+  // The stretch before the prompt appeared is still the agent's own work, not the human's time.
+  assert.deepEqual([last.started_at, last.ended_at], [ts(35), ts(30 + 22 * 60)]);
+});
+
+test('a marker for a tool the transcript already explains is ignored', (t) => {
+  const transcriptPath = permissionTranscript(t, 'perm-decision-tool');
+  const tl = computeSessionTimeline(
+    transcriptPath, 'sess-perm2', withMarkers([marker(35, 'ExitPlanMode')]),
+  );
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'idle', 'plan waits come from the transcript');
+});
+
+test('a marker written with nobody to ask is ignored', (t) => {
+  const transcriptPath = permissionTranscript(t, 'perm-unattended');
+  for (const mode of ['dontAsk', 'bypassPermissions']) {
+    const tl = computeSessionTimeline(
+      transcriptPath, 'sess-perm3', withMarkers([marker(35, 'Bash', mode)]),
+    );
+    assert.equal(tl.periods[tl.periods.length - 1].state, 'idle', `${mode} is not a human waiting`);
+  }
+});
+
+test('a marker answered within a second is ignored as auto-resolved', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'perm-fast.jsonl');
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'go' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_f1', name: 'Bash', input: {} }] },
+      timestamp: ts(30),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_f1', content: 'done' }] },
+      timestamp: ts(31),
+    },
+  ]);
+  const tl = computeSessionTimeline(
+    transcriptPath,
+    'sess-perm4',
+    withMarkers([{ ts: BASE_MS + 30500, toolName: 'Bash', permissionMode: 'default' }]),
+  );
+  assert.ok(
+    tl.periods.every((p) => p.state !== 'waiting_user'),
+    'a prompt resolved in half a second was never read by a human',
+  );
+});
+
+test('an abandoned permission prompt is still a break, not waiting_user', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'perm-break.jsonl');
+  const far = BREAK_GAP_SEC + 60;
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'go' }, timestamp: ts(0) },
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_k1', name: 'Bash', input: {} }] },
+      timestamp: ts(30),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_k1', content: 'done' }] },
+      timestamp: ts(30 + far),
+    },
+  ]);
+  const tl = computeSessionTimeline(transcriptPath, 'sess-perm5', withMarkers([marker(35)]));
+  assert.equal(tl.periods[tl.periods.length - 1].state, 'break', 'they went home, they did not deliberate');
+});
+
+test('the four waiting subtypes are labelled, and a split preserves total waiting time', (t) => {
+  const dir = makeTmpDir(t);
+  const transcriptPath = path.join(dir, 'subtypes.jsonl');
+  const declined = "The user doesn't want to proceed with this tool use. The tool use was rejected";
+  writeJsonl(transcriptPath, [
+    { type: 'user', message: { content: 'go' }, timestamp: ts(0) },
+    // plan approval
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_p1', name: 'ExitPlanMode', input: {} }] },
+      timestamp: ts(10),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_p1', content: 'approved' }] },
+      timestamp: ts(70),
+    },
+    // …answered, and the human types their next instruction straight after: two adjacent waits.
+    { type: 'user', message: { content: 'now do Y' }, timestamp: ts(130) },
+    // question
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_q1', name: 'AskUserQuestion', input: {} }] },
+      timestamp: ts(140),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_q1', content: 'Option A' }] },
+      timestamp: ts(200),
+    },
+    // declined permission
+    {
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_d1', name: 'Bash', input: {} }] },
+      timestamp: ts(210),
+    },
+    {
+      type: 'user',
+      toolUseResult: {},
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_d1', is_error: true, content: declined }],
+      },
+      timestamp: ts(270),
+    },
+  ]);
+
+  const tl = computeSessionTimeline(transcriptPath, 'sess-subtypes', withMarkers([]));
+  const waits = tl.periods.filter((p) => p.state === 'waiting_user');
+  assert.deepEqual(
+    waits.map((p) => p.waiting_subtype),
+    ['plan_approval', 'next_instruction', 'question_answer', 'command_approval'],
+  );
+  // The plan wait and the next-instruction wait are one contiguous run that the subtype split in
+  // two — the halves must still add up to what a single merged period would have measured.
+  const ms = (p) => Date.parse(p.ended_at) - Date.parse(p.started_at);
+  assert.equal(ms(waits[0]) + ms(waits[1]), 120 * 1000, 'splitting must not create or lose time');
+  assert.equal(waits[0].ended_at, waits[1].started_at, 'the halves are contiguous');
+  // Non-waiting periods must stay byte-identical to what they were before subtypes existed.
+  for (const p of tl.periods) {
+    if (p.state !== 'waiting_user') assert.deepEqual(Object.keys(p), ['state', 'started_at', 'ended_at']);
+  }
+});
+
+// Skew puts the marker exactly on an anchor rather than between two. Flagging the wrong anchor
+// there would charge the human for the agent's own work, so it is only allowed when the anchor is
+// demonstrably the tool call the prompt was about.
+test('a marker landing exactly on its own tool_use anchor still opens the wait there', (t) => {
+  const transcriptPath = permissionTranscript(t, 'perm-exact');
+  const tl = computeSessionTimeline(transcriptPath, 'sess-exact', withMarkers([marker(30)]));
+  const last = tl.periods[tl.periods.length - 1];
+  assert.equal(last.state, 'waiting_user');
+  assert.equal(last.waiting_subtype, 'command_approval');
+  assert.deepEqual([last.started_at, last.ended_at], [ts(30), ts(30 + 22 * 60)]);
+});
+
+test('a marker landing on an unrelated anchor is dropped, not charged to the human', (t) => {
+  const transcriptPath = permissionTranscript(t, 'perm-unrelated');
+  // ts(0) is the user's prompt, far from the Bash call at ts(30) — nothing to snap to, so this
+  // marker must not turn the agent's first 30 seconds of work into a permission wait.
+  const tl = computeSessionTimeline(transcriptPath, 'sess-unrelated', withMarkers([marker(0)]));
+  assert.equal(tl.periods[0].state, 'working', 'the run-up to the prompt is the agent working');
+  assert.ok(
+    tl.periods.every((p) => p.waiting_subtype !== 'command_approval'),
+    'an unplaceable marker is dropped rather than guessed at',
+  );
 });

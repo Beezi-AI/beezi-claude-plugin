@@ -13,10 +13,13 @@ const CWD_SCAN_BYTES = 64 * 1024;
 
 // Every past session transcript on this machine: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl.
 //
-// Non-recursive per project dir on purpose. Subagent transcripts live one level deeper
-// (<projectDir>/<sessionId>/subagents/agent-*.jsonl) and must NOT appear here — runCheckpoint
-// discovers those itself from the main transcript path, and surfacing them as sessions would
-// report each subagent as a session of its own.
+// Non-recursive per project dir on purpose, and the SESSION_ID regex would happily accept an
+// agent-<id> name — so this readdir plus entry.isFile() is the only thing keeping subagent
+// transcripts out. test/transcript-index.test.mjs asserts it; do not add recursion here.
+// Subagent transcripts live one or two levels deeper
+// (<projectDir>/<sessionId>/subagents/[workflows/<wf_id>/]agent-*.jsonl) and must NOT appear
+// here — runCheckpoint discovers those itself from the main transcript path, and surfacing them
+// as sessions would report each subagent as a session of its own.
 //
 // Sorted oldest-first so an interrupted import advances chronologically. Best-effort throughout:
 // an unreadable root yields [], an unreadable entry is skipped, nothing throws.

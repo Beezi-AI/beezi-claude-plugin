@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { computeDelta } from '../lib/delta.mjs';
+import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } from '../lib/reflog.mjs';
 
 // Helper: write lines to a temp file and return its path.
 function writeFixture(dir, lines) {
@@ -231,7 +232,11 @@ test('6. cursor advances past malformed and non-assistant lines', (t) => {
   assert.doesNotThrow(() => { result = computeDelta(file, 0); });
   assert.equal(result.nextCursor, 3);
 
-  // The unknown branch from mode line + main from line 3
+  // The mode line resolves no repo and no branch, so it still splits on repoRoot when line 3
+  // names one — but the ranges must leave no gap, including over the malformed line 2. (The
+  // leading zero-work segment is absorbed one layer up, in enqueueSegments.)
+  assertTiles(result.segments, 0, result.nextCursor);
+
   const mainSeg = result.segments.find(s => s.branch === 'main');
   assert.ok(mainSeg, 'main segment must exist');
   assert.equal(mainSeg.stats.models['model-a'].requests, 1);
@@ -1280,4 +1285,421 @@ test('command — injected meta lines are not anchors at either end', (t) => {
     message: { role: 'user', content: '<system-reminder>The user named this session "ping".</system-reminder>' },
   });
   assert.equal(span.ended_at, lastWork);
+});
+
+// ---------------------------------------------------------------------------
+// R-family: the segments of a window must TILE it. Every line between the
+// cursor and EOF has to sit inside some segment's [fromLine, toLine], because
+// nextCursor consumes the whole window regardless — a line outside every
+// segment is a hole no later run can ever fill, and the server's coverage fold
+// stops dead at the first one.
+// ---------------------------------------------------------------------------
+
+// Reflog with a checkout to feature/task-1 BEFORE the fixture timestamps, so a
+// timestamped line resolves to feature/task-1 while '(head)' stands in for the
+// repo's current branch — the two answers whose disagreement split the window.
+const R_REFLOG = [
+  'a1 HEAD@{2026-07-03T10:00:00+00:00}: checkout: moving from main to feature/task-1',
+].join('\n');
+
+function reflogBranchAt() {
+  const timeline = buildBranchTimeline(readCheckoutEvents(() => R_REFLOG, 'x'));
+  return (_root, ms) => (ms == null ? '(head)' : branchAtReflog(timeline, ms));
+}
+
+// Asserts the tiling invariant: no gap at the head, none between segments, none
+// at the tail.
+function assertTiles(segments, fromLine, nextCursor) {
+  assert.ok(segments.length > 0, 'expected at least one segment');
+  assert.equal(segments[0].fromLine, fromLine + 1, 'first segment must start at the cursor');
+  assert.equal(segments.at(-1).toLine, nextCursor, 'last segment must reach nextCursor');
+  for (let i = 1; i < segments.length; i++) {
+    assert.equal(segments[i].fromLine, segments[i - 1].toLine + 1, `gap before segment ${i}`);
+  }
+}
+
+test('R1. timestamp-less head lines join the first resolved run (real reflog)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    { type: 'mode', mode: 'default' },                        // no timestamp
+    { type: 'file-history-snapshot', messageId: 'x' },        // no timestamp
+    repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z'),
+    repoLine('/repo/a', U(20), '2026-07-03T11:05:00.000Z'),
+  ]);
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: reflogBranchAt(),
+  });
+
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].branch, 'feature/task-1', 'must bill the historical branch, not HEAD');
+  assertTiles(segments, 0, nextCursor);
+});
+
+test('R2. an unparseable timestamp resolves no branch and never enters the clock', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    repoLine('/repo/a', U(10), 'not-a-date'),
+    repoLine('/repo/a', U(20), '2026-07-03T11:05:00.000Z'),
+  ]);
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: reflogBranchAt(),
+  });
+
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].branch, 'feature/task-1');
+  assertTiles(segments, 0, nextCursor);
+  // NaN must not reach the span or the interval builder.
+  assert.ok(Number.isFinite(segments[0].stats.duration_sec), 'duration_sec must be finite');
+  assert.equal(segments[0].stats.started_at, '2026-07-03T11:05:00.000Z');
+  assert.equal(segments[0].stats.ended_at, '2026-07-03T11:05:00.000Z');
+});
+
+test('R3. a malformed first line still leaves the window sealed at line 1', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = path.join(dir, 'broken.jsonl');
+  fs.writeFileSync(file, [
+    'THIS IS NOT JSON!!!',
+    JSON.stringify(repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z')),
+  ].join('\n'), 'utf-8');
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: reflogBranchAt(),
+  });
+
+  assert.equal(nextCursor, 2);
+  assertTiles(segments, 0, nextCursor);
+});
+
+test('R4. a malformed trailing line is inside the last segment', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = path.join(dir, 'broken-tail.jsonl');
+  fs.writeFileSync(file, [
+    JSON.stringify(repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z')),
+    '{ NOPE',
+  ].join('\n'), 'utf-8');
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: reflogBranchAt(),
+  });
+
+  assert.equal(nextCursor, 2);
+  assertTiles(segments, 0, nextCursor);
+});
+
+test('R5. a repo switch drops the carried branch instead of leaking it', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z'),
+    // No timestamp, but its cwd moves the active repo to /repo/b.
+    { type: 'mode', mode: 'default', cwd: '/repo/b' },
+    repoLine('/repo/b', U(20), '2026-07-03T11:05:00.000Z'),
+  ]);
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: (root, ms) => (ms == null ? null : `br:${root}`),
+  });
+
+  assert.deepEqual(segments.map((s) => s.repoRoot), ['/repo/a', '/repo/b']);
+  assert.equal(segments[1].branch, 'br:/repo/b', 'the meta line must not carry repo A\'s branch into B');
+  assertTiles(segments, 0, nextCursor);
+});
+
+test('R6. multi-repo windows tile with no gaps', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    { type: 'mode', mode: 'default' },
+    repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z'),
+    repoLine('/repo/b', U(20), '2026-07-03T11:01:00.000Z'),
+    repoLine('/repo/a', U(30), '2026-07-03T11:02:00.000Z'),
+  ]);
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: (root) => `branch-of:${root}`,
+  });
+
+  assert.deepEqual(segments.map((s) => s.repoRoot), ['/repo/a', '/repo/b', '/repo/a']);
+  assertTiles(segments, 0, nextCursor);
+});
+
+test('R7. a run that never sees a usable timestamp falls back to the head branch', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    { type: 'mode', mode: 'default' },
+    { type: 'last-prompt', prompt: 'hi' },
+  ]);
+
+  const calls = [];
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a',
+    repoRootOf: (d) => d,
+    branchAt: (root, ms) => { calls.push(ms); return ms == null ? '(head)' : 'never'; },
+  });
+
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].branch, '(head)');
+  assertTiles(segments, 0, nextCursor);
+  // closeRun is the only site allowed to ask with a null ms, and it asks exactly once.
+  assert.deepEqual(calls, [null]);
+});
+
+test('R8. a malformed line on a run boundary belongs to the run that follows it', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = path.join(dir, 'boundary.jsonl');
+  fs.writeFileSync(file, [
+    JSON.stringify(repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z')),
+    'NOT JSON',                                                              // line 2
+    JSON.stringify(repoLine('/repo/b', U(20), '2026-07-03T11:01:00.000Z')),  // splits here
+  ].join('\n'), 'utf-8');
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: (root) => `br:${root}`,
+  });
+
+  assert.deepEqual(segments.map((s) => [s.fromLine, s.toLine]), [[1, 1], [2, 3]]);
+  assertTiles(segments, 0, nextCursor);
+});
+
+test('R9. untimestamped lines mid-run keep the run open', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z'),
+    { type: 'permission-mode', cwd: '/repo/a' },
+    { type: 'atis-latch', cwd: '/repo/a' },
+    repoLine('/repo/a', U(20), '2026-07-03T11:05:00.000Z'),
+  ]);
+
+  const { segments, nextCursor } = computeDelta(file, 0, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: reflogBranchAt(),
+  });
+
+  assert.equal(segments.length, 1, 'meta lines must not split a run in two');
+  assert.equal(segments[0].stats.token_input, 30);
+  assertTiles(segments, 0, nextCursor);
+});
+
+test('R10. a resumed window opens at the cursor, not at its first parsed line', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = path.join(dir, 'resumed.jsonl');
+  fs.writeFileSync(file, [
+    JSON.stringify(repoLine('/repo/a', U(10), '2026-07-03T11:00:00.000Z')),
+    'GARBAGE',                                                               // line 2, first of the window
+    JSON.stringify(repoLine('/repo/a', U(20), '2026-07-03T11:05:00.000Z')),
+  ].join('\n'), 'utf-8');
+
+  const { segments, nextCursor } = computeDelta(file, 1, {
+    cwd: '/repo/a', repoRootOf: (d) => d, branchAt: reflogBranchAt(),
+  });
+
+  assert.equal(segments[0].fromLine, 2);
+  assertTiles(segments, 1, nextCursor);
+});
+
+// ─── advisor iterations: the API calls top-level usage does not report ────────
+//
+// A single API turn now arrives as `usage.iterations` — one entry per leg. Top-level
+// input/output/cache fields sum ONLY the legs of type 'message'; an `advisor_message` leg
+// (the advisor tool's own uncached call, often on a different model) is excluded entirely.
+// Reading top-level alone lost 1,229,631 input / 29,140 output tokens on one local session.
+
+// Helper: an assistant line whose usage carries iteration legs.
+function advisorLine(model, top, iterations, timestamp, effort = undefined, id = undefined) {
+  const line = {
+    type: 'assistant',
+    gitBranch: 'main',
+    cwd: '/some/path',
+    timestamp,
+    message: { model, usage: Object.assign({}, top, { iterations }) },
+  };
+  if (effort != null) line.effort = effort;
+  if (id != null) line.message.id = id;
+  return line;
+}
+
+test('advisor — an advisor_message leg lands in its own model bucket', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    advisorLine('model-a', {
+      input_tokens: 4, output_tokens: 524, cache_read_input_tokens: 117831, cache_creation_input_tokens: 4533,
+    }, [
+      { type: 'message', input_tokens: 2, output_tokens: 41, cache_read_input_tokens: 57378, cache_creation_input_tokens: 3075 },
+      { type: 'advisor_message', model: 'advisor-b', input_tokens: 61696, output_tokens: 4008, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      { type: 'message', input_tokens: 2, output_tokens: 483, cache_read_input_tokens: 60453, cache_creation_input_tokens: 1458 },
+    ], '2024-01-01T10:00:00.000Z', 'high'),
+  ]);
+
+  const { models } = computeDelta(file, 0).segments[0].stats;
+
+  assert.deepEqual(models['model-a'], {
+    token_input: 4, token_output: 524, token_cache_read: 117831, token_cache_creation: 4533, requests: 1,
+    by_effort: {
+      high: { token_input: 4, token_output: 524, token_cache_read: 117831, token_cache_creation: 4533, requests: 1 },
+    },
+  }, 'the parent tally still comes off top-level usage, unchanged');
+
+  assert.deepEqual(models['advisor-b'], {
+    token_input: 61696, token_output: 4008, token_cache_read: 0, token_cache_creation: 0, requests: 1,
+    by_effort: {
+      high: { token_input: 61696, token_output: 4008, token_cache_read: 0, token_cache_creation: 0, requests: 1 },
+    },
+  }, 'the advisor leg is its own request, bucketed under the parent line effort');
+});
+
+test('advisor — a leg on the same model merges into that model bucket', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    advisorLine('model-a', {
+      input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 5,
+    }, [
+      { type: 'message', input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 5 },
+      { type: 'advisor_message', model: 'model-a', input_tokens: 900, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    ], '2024-01-01T10:00:00.000Z', 'max'),
+  ]);
+
+  const { models } = computeDelta(file, 0).segments[0].stats;
+  assert.deepEqual(Object.keys(models), ['model-a'], 'one bucket, not two');
+  assert.equal(models['model-a'].token_input, 902);
+  assert.equal(models['model-a'].token_output, 50);
+  assert.equal(models['model-a'].requests, 2, 'the advisor call is a second API request');
+  assert.equal(models['model-a'].by_effort.max.token_input, 902, 'buckets still partition the model tally');
+});
+
+test('advisor — a leg without its own model falls back to the parent model', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    advisorLine('model-a', {
+      input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, [
+      { type: 'message', input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      { type: 'advisor_message', input_tokens: 500, output_tokens: 20 },
+    ], '2024-01-01T10:00:00.000Z'),
+  ]);
+
+  const { models } = computeDelta(file, 0).segments[0].stats;
+  assert.deepEqual(Object.keys(models), ['model-a']);
+  assert.deepEqual(models['model-a'], {
+    token_input: 501, token_output: 21, token_cache_read: 0, token_cache_creation: 0, requests: 2,
+    by_effort: {
+      unknown: { token_input: 501, token_output: 21, token_cache_read: 0, token_cache_creation: 0, requests: 2 },
+    },
+  }, 'absent cache fields read as 0, never undefined or NaN');
+});
+
+test('advisor — message legs are never added on top of the top-level totals', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    advisorLine('model-a', {
+      input_tokens: 4, output_tokens: 60, cache_read_input_tokens: 30, cache_creation_input_tokens: 8,
+    }, [
+      { type: 'message', input_tokens: 2, output_tokens: 20, cache_read_input_tokens: 10, cache_creation_input_tokens: 3 },
+      { type: 'message', input_tokens: 2, output_tokens: 40, cache_read_input_tokens: 20, cache_creation_input_tokens: 5 },
+    ], '2024-01-01T10:00:00.000Z'),
+  ]);
+
+  const { models } = computeDelta(file, 0).segments[0].stats;
+  assert.equal(models['model-a'].token_input, 4, 'top-level already sums the message legs');
+  assert.equal(models['model-a'].token_output, 60);
+  assert.equal(models['model-a'].requests, 1);
+});
+
+test('advisor — an unrecognised leg type is ignored rather than counted twice', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    advisorLine('model-a', {
+      input_tokens: 4, output_tokens: 60, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, [
+      { type: 'message', input_tokens: 4, output_tokens: 60, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      { type: 'future_leg_20990101', input_tokens: 9999, output_tokens: 9999 },
+    ], '2024-01-01T10:00:00.000Z'),
+  ]);
+
+  const { models } = computeDelta(file, 0).segments[0].stats;
+  assert.equal(models['model-a'].token_input, 4, 'an unknown leg may already sit inside top-level; never inflate');
+  assert.equal(Object.keys(models).length, 1);
+});
+
+test('advisor — block-line dedup counts an advisor leg once', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const legs = [
+    { type: 'message', input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    { type: 'advisor_message', model: 'advisor-b', input_tokens: 700, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+  ];
+  const line = advisorLine('model-a', {
+    input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+  }, legs, '2024-01-01T10:00:00.000Z', 'high', 'msg_1');
+
+  const file = writeFixture(dir, [line, line, line]);
+  const { models } = computeDelta(file, 0).segments[0].stats;
+  assert.equal(models['advisor-b'].token_input, 700, 'advisor tokens counted once across 3 block-lines');
+  assert.equal(models['advisor-b'].requests, 1);
+});
+
+test('advisor — a line with no iterations behaves exactly as before', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    assistantLine('main', 'model-a', {
+      input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 10, cache_creation_input_tokens: 5,
+    }, '2024-01-01T10:00:00.000Z', false, '/some/path', 'high'),
+  ]);
+
+  const { models } = computeDelta(file, 0).segments[0].stats;
+  assert.deepEqual(models['model-a'], {
+    token_input: 100, token_output: 50, token_cache_read: 10, token_cache_creation: 5, requests: 1,
+    by_effort: {
+      high: { token_input: 100, token_output: 50, token_cache_read: 10, token_cache_creation: 5, requests: 1 },
+    },
+  });
+});
+
+test('advisor — advisor input does not move the session context peak', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'delta-'));
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+
+  const file = writeFixture(dir, [
+    advisorLine('model-a', {
+      input_tokens: 4, output_tokens: 60, cache_read_input_tokens: 1000, cache_creation_input_tokens: 100,
+    }, [
+      { type: 'message', input_tokens: 4, output_tokens: 60, cache_read_input_tokens: 1000, cache_creation_input_tokens: 100 },
+      { type: 'advisor_message', model: 'advisor-b', input_tokens: 900000, output_tokens: 500, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    ], '2024-01-01T10:00:00.000Z'),
+  ]);
+
+  const { stats } = computeDelta(file, 0).segments[0];
+  assert.equal(stats.context_peak_tokens, 1104, 'the advisor runs its own context; it is not the session context');
+  assert.equal(stats.context_final_tokens, 1104);
 });

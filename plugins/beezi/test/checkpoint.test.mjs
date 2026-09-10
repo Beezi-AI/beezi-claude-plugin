@@ -3,7 +3,20 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { runCheckpoint, flushQueue } from '../lib/checkpoint.mjs';
+import { runCheckpoint as _runCheckpoint, flushQueue } from '../lib/checkpoint.mjs';
+
+// runCheckpoint resolves its env through oauthTokenEnvWithOsProbe, whose last tier reads the OS
+// persistent environment and SPAWNS to do it. A test that fell through to the real probe would
+// read the developer's registry — this box has a real 108-character token in HKCU\Environment —
+// and would then behave differently here than on a token-less machine or in CI.
+//
+// So the default for this suite is a machine with no setup token anywhere. A test that wants the
+// probe says so by injecting `osEnvOauthToken` (or its own `env`), and is then left alone.
+function runCheckpoint(input, deps = {}, ...rest) {
+  const declared = Object.prototype.hasOwnProperty.call(deps, 'env')
+    || Object.prototype.hasOwnProperty.call(deps, 'osEnvOauthToken');
+  return _runCheckpoint(input, declared ? deps : { env: {}, ...deps }, ...rest);
+}
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -56,10 +69,18 @@ function fakeGitRepo(branch, remote, reflog = '') {
 
 // Multi-repo router: `spec` maps a repo root → { branch, remote, reflog? }.
 // rev-parse --show-toplevel is identity (dir passed IS the root); other calls look up by root.
+// Separator-insensitive so the fake matches the way a filesystem would. The repo signal is a
+// tool_use file_path, and joining a directory to it yields mixed separators on Windows
+// ("C:\tmp\repo-b/f.ts"); the resolver normalizes those to "/" before it asks git, so an exact
+// string lookup here missed every key and every repo silently resolved to its local: fallback.
+const asKey = (p) => String(p).replace(/\\/g, '/');
+
 function fakeGitByRoot(spec) {
+  const byKey = new Map();
+  for (const root of Object.keys(spec)) byKey.set(asKey(root), spec[root]);
   return (args, cwd) => {
     if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return cwd;
-    const entry = spec[cwd];
+    const entry = byKey.get(asKey(cwd));
     if (!entry) throw new Error(`no repo for ${cwd}`);
     if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return entry.branch;
     if (args[0] === 'reflog') return entry.reflog ?? '';
@@ -352,6 +373,146 @@ test('7. zero-work task-branch segment not enqueued', async (t) => {
   const state = readState(dir, 'sess-7');
   assert.ok(state, 'state file must exist');
   assert.equal(state.cursor, 1, 'cursor advanced past zero-work line');
+});
+
+// ─── tests 7b/7c: emitted payloads must tile the window ─────────────────────
+
+test('7b. reflog + untimestamped head → one payload starting at line 1', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const captured = [];
+  const fetchImpl = async (_url, opts) => { captured.push(JSON.parse(opts.body)); return { status: 503 }; };
+
+  // HEAD is main, but the work happened after a checkout to feature/task-1. The two
+  // untimestamped meta lines used to resolve to main and split off into their own dropped
+  // segment, so the first uploaded line was 3 and the server's coverage prefix stuck at 0.
+  const reflog = 'a1 HEAD@{2026-07-03T09:00:00+00:00}: checkout: moving from main to feature/task-1';
+  const transcript = writeTranscript(dir, [
+    { type: 'mode', mode: 'auto', sessionId: 'sess-7b' },
+    { type: 'file-history-snapshot', messageId: 'm1' },
+    assistantLine('ignored', 'model-a', { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-03T10:00:00.000Z'),
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-7b', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git', reflog), fetchImpl },
+  );
+
+  assert.equal(captured.length, 1, 'one payload');
+  assert.equal(captured[0].from_line, 1, 'must start at line 1 or coverage can never advance');
+  assert.equal(captured[0].to_line, 3);
+  assert.equal(captured[0].branch, 'feature/task-1', 'bills the branch the work ran on');
+});
+
+test('7c. a segment dropped for zero work is absorbed by the next payload', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const captured = [];
+  const fetchImpl = async (_url, opts) => { captured.push(JSON.parse(opts.body)); return { status: 503 }; };
+
+  const repoA = path.join(dir, 'repo-a');
+  const repoB = path.join(dir, 'repo-b');
+  // The meta line pins the active repo to A and bills nothing, so its run is dropped; the work
+  // below it lives in B. Line 1 is then covered by no payload at all unless it is carried over.
+  const transcript = writeTranscript(dir, [
+    { type: 'mode', mode: 'auto', sessionId: 'sess-7c', cwd: repoA },
+    repoAssistantLine(repoB, 'x', 'model-a', { input_tokens: 20, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-03T10:05:00.000Z'),
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-7c', transcript_path: transcript, cwd: repoB },
+    {
+      getAccessToken: async () => 'tok',
+      gitImpl: fakeGitByRoot({
+        [repoA]: { branch: 'a', remote: 'https://host/org/a.git' },
+        [repoB]: { branch: 'b', remote: 'https://host/org/b.git' },
+      }),
+      fetchImpl,
+    },
+  );
+
+  assert.equal(captured.length, 1, 'one payload');
+  assert.equal(captured[0].from_line, 1, "repo A's dropped range is carried onto repo B's payload");
+  assert.equal(captured[0].to_line, 2);
+  assert.equal(captured[0].remote, 'https://host/org/b.git');
+  assert.equal(captured[0].token_input, 20, "stats stay repo B's own");
+});
+
+test('7d. an absorbed range does not leak past the payload that took it', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const captured = [];
+  const fetchImpl = async (_url, opts) => { captured.push(JSON.parse(opts.body)); return { status: 503 }; };
+
+  const repoA = path.join(dir, 'repo-a');
+  const repoB = path.join(dir, 'repo-b');
+  const repoC = path.join(dir, 'repo-c');
+  const transcript = writeTranscript(dir, [
+    { type: 'mode', mode: 'auto', sessionId: 'sess-7d', cwd: repoA },
+    repoAssistantLine(repoB, 'x', 'model-a', { input_tokens: 20, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-03T10:05:00.000Z'),
+    repoAssistantLine(repoC, 'x', 'model-a', { input_tokens: 30, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, '2026-07-03T10:10:00.000Z'),
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-7d', transcript_path: transcript, cwd: repoB },
+    {
+      getAccessToken: async () => 'tok',
+      gitImpl: fakeGitByRoot({
+        [repoA]: { branch: 'a', remote: 'https://host/org/a.git' },
+        [repoB]: { branch: 'b', remote: 'https://host/org/b.git' },
+        [repoC]: { branch: 'c', remote: 'https://host/org/c.git' },
+      }),
+      fetchImpl,
+    },
+  );
+
+  const ranges = captured
+    .map((p) => [p.from_line, p.to_line])
+    .sort((a, b) => a[0] - b[0]);
+  assert.deepEqual(ranges, [[1, 2], [3, 3]], 'the drop is taken once, then forgotten');
+  // segmentId has to move with from_line or the re-send mints a second row for the same lines.
+  const first = captured.find((p) => p.from_line === 1);
+  assert.equal(first.segmentId, 'sess-7d:1-2');
+});
+
+test('7e. payloads tile the transcript across a repo hop', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const captured = [];
+  const fetchImpl = async (_url, opts) => { captured.push(JSON.parse(opts.body)); return { status: 503 }; };
+
+  const repoA = path.join(dir, 'repo-a');
+  const repoB = path.join(dir, 'repo-b');
+  const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  const transcript = writeTranscript(dir, [
+    { type: 'mode', mode: 'auto', sessionId: 'sess-7e', cwd: repoA },
+    repoAssistantLine(repoA, 'x', 'model-a', usage, '2026-07-03T10:00:00.000Z'),
+    repoAssistantLine(repoB, 'x', 'model-a', usage, '2026-07-03T10:05:00.000Z'),
+    repoAssistantLine(repoA, 'x', 'model-a', usage, '2026-07-03T10:10:00.000Z'),
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-7e', transcript_path: transcript, cwd: repoA },
+    {
+      getAccessToken: async () => 'tok',
+      gitImpl: fakeGitByRoot({
+        [repoA]: { branch: 'a', remote: 'https://host/org/a.git' },
+        [repoB]: { branch: 'b', remote: 'https://host/org/b.git' },
+      }),
+      fetchImpl,
+    },
+  );
+
+  const ranges = captured.map((p) => [p.from_line, p.to_line]).sort((a, b) => a[0] - b[0]);
+  assert.equal(ranges[0][0], 1, 'coverage can only advance from line 1');
+  assert.equal(ranges.at(-1)[1], 4, 'the last line must be claimed by some payload');
+  for (let i = 1; i < ranges.length; i++) {
+    assert.equal(ranges[i][0], ranges[i - 1][1] + 1, `gap before payload ${i}`);
+  }
 });
 
 // ─── test 8: remote sanitized ───────────────────────────────────────────────
@@ -877,6 +1038,27 @@ function writeSubagentTranscript(transcriptDir, sessionId, agentId, lines) {
   return p;
 }
 
+// Workflow-tool agents shard under subagents/workflows/<wf_id>/, and the run's own state file
+// (a sibling of subagents/) is the only place their names are recorded.
+function writeWorkflowSubagentTranscript(transcriptDir, sessionId, wfId, agentId, lines) {
+  const dir = path.join(transcriptDir, sessionId, 'subagents', 'workflows', wfId);
+  fs.mkdirSync(dir, { recursive: true });
+  const p = path.join(dir, `${agentId}.jsonl`);
+  fs.writeFileSync(p, lines.map(l => JSON.stringify(l)).join('\n'), 'utf-8');
+  fs.writeFileSync(
+    path.join(dir, `${agentId}.meta.json`),
+    JSON.stringify({ agentType: 'workflow-subagent', spawnDepth: 1 }),
+    'utf-8',
+  );
+  return p;
+}
+
+function writeWorkflowState(transcriptDir, sessionId, wfId, state) {
+  const dir = path.join(transcriptDir, sessionId, 'workflows');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${wfId}.json`), JSON.stringify(state), 'utf-8');
+}
+
 test('20. subagent transcript usage is enqueued as its own segment', async (t) => {
   const dir = makeTmpDir(t);
   setHome(dir);
@@ -1004,6 +1186,107 @@ test('21. per-agent cursor — second run only processes new subagent lines', as
 });
 
 // ─── parallel subagents: reported time is the union, not the sum ─────────────
+
+const WF_USAGE = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+
+test('20c. workflow subagent usage is enqueued with its run-derived name', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'claude-fable-5', WF_USAGE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  writeWorkflowSubagentTranscript(dir, 'sess-20c', 'wf_abc123', 'agent-w1', [
+    assistantLine('main', 'claude-sonnet-5', WF_USAGE, '2024-01-01T10:00:30.000Z'),
+  ]);
+  writeWorkflowState(dir, 'sess-20c', 'wf_abc123', {
+    workflowName: 'code-review',
+    workflowProgress: [{ type: 'workflow_agent', agentId: 'w1', label: 'verify:UserRow.tsx(1)' }],
+  });
+
+  await runCheckpoint(
+    { session_id: 'sess-20c', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl: fakeFetch(503) },
+  );
+
+  const agent = readQueue(dir).find(i => i.payload.agent_id === 'agent-w1');
+  assert.ok(agent, 'the workflow agent must be discovered at all');
+  assert.equal(agent.payload.is_subagent, true);
+  assert.equal(agent.payload.agent_type, 'workflow-subagent');
+  assert.equal(agent.payload.spawn_depth, 1);
+  assert.equal(agent.payload.agent_name, 'code-review:verify:UserRow.tsx(1)');
+  assert.ok(agent.payload.token_total > 0, 'its tokens are reported');
+  // The id stays bare, so the segment scope matches an ordinary subagent's.
+  assert.ok(agent.payload.segmentId.startsWith('sess-20c:agent-w1:'));
+});
+
+test('20d. workflow agent cursors persist under the bare id', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'claude-fable-5', WF_USAGE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  writeWorkflowSubagentTranscript(dir, 'sess-20d', 'wf_abc123', 'agent-w1', [
+    assistantLine('main', 'claude-sonnet-5', WF_USAGE, '2024-01-01T10:00:30.000Z'),
+  ]);
+
+  const deps = { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl: fakeFetch(503) };
+  await runCheckpoint({ session_id: 'sess-20d', transcript_path: transcript, cwd: dir }, deps);
+
+  const state = readState(dir, 'sess-20d');
+  assert.equal(state.agentCursors['agent-w1'], 1, 'cursor keyed by the bare agent id');
+
+  const before = readQueue(dir).length;
+  await runCheckpoint({ session_id: 'sess-20d', transcript_path: transcript, cwd: dir }, deps);
+  assert.equal(readQueue(dir).length, before, 'a second checkpoint re-enqueues nothing');
+});
+
+test('20e. a workflow agent with no state file still reports its usage', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'claude-fable-5', WF_USAGE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  writeWorkflowSubagentTranscript(dir, 'sess-20e', 'wf_abc123', 'agent-w1', [
+    assistantLine('main', 'claude-sonnet-5', WF_USAGE, '2024-01-01T10:00:30.000Z'),
+  ]);
+
+  await runCheckpoint(
+    { session_id: 'sess-20e', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl: fakeFetch(503) },
+  );
+
+  const agent = readQueue(dir).find(i => i.payload.agent_id === 'agent-w1');
+  assert.ok(agent);
+  assert.equal(agent.payload.agent_name, null, 'no name, but never a lost segment');
+  assert.ok(agent.payload.token_total > 0);
+});
+
+test('20f. a workflow run journal is not reported as an agent', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'claude-fable-5', WF_USAGE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  writeWorkflowSubagentTranscript(dir, 'sess-20f', 'wf_abc123', 'agent-w1', [
+    assistantLine('main', 'claude-sonnet-5', WF_USAGE, '2024-01-01T10:00:30.000Z'),
+  ]);
+  fs.writeFileSync(
+    path.join(dir, 'sess-20f', 'subagents', 'workflows', 'wf_abc123', 'journal.jsonl'),
+    JSON.stringify({ type: 'started', agentId: 'w1' }),
+    'utf-8',
+  );
+
+  await runCheckpoint(
+    { session_id: 'sess-20f', transcript_path: transcript, cwd: dir },
+    { getAccessToken: async () => 'tok', gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'), fetchImpl: fakeFetch(503) },
+  );
+
+  assert.equal(readQueue(dir).filter(i => i.payload.agent_id === 'journal').length, 0);
+});
 
 test('25. parallel subagents overlapping the main thread bill only uncovered wall clock', async (t) => {
   const dir = makeTmpDir(t);
@@ -1684,7 +1967,10 @@ const UTIL_FIXTURE = {
 };
 const ACCOUNT_FIXTURE = { accountUuid: 'acc-1', subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x' };
 const USAGE_FIXTURE = { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
-const USAGE_STAMP_KEYS = ['account_uuid', 'usage_account_uuid', 'usage_five_hour_pct', 'usage_seven_day_pct', 'usage_fetched_at'];
+const USAGE_STAMP_KEYS = [
+  'account_uuid', 'usage_account_uuid', 'usage_five_hour_pct', 'usage_seven_day_pct', 'usage_fetched_at',
+  'account_email', 'oauth_key_prefix', 'oauth_key_last4', 'oauth_key_length',
+];
 
 function usageDeps(extra = {}) {
   return {
@@ -1726,12 +2012,132 @@ test('usage stamp — no stamp keys at all when both caches are unreadable', asy
     usageDeps({
       readUsageUtilization: () => { throw new Error('boom'); },
       readClaudeAccount: () => { throw new Error('boom'); },
+      env: {},
     }),
   );
   const p = readQueue(dir)[0].payload;
   for (const key of USAGE_STAMP_KEYS) {
     assert.equal(key in p, false, `${key} must be absent, not null`);
   }
+});
+
+// ─── identity stamp (live session → account mapping on the server) ───────────
+// The server's ingest resolves cli_agent_account_id from what the SESSION reports. A machine
+// whose ~/.claude.json has no accountUuid used to report nothing — its sessions could never
+// link to the account its own check-in created. Every payload therefore carries the full
+// identity triple: account_uuid, account_email, and the setup-token fingerprint — each only
+// when known.
+
+const OAUTH_SECRET = 'sk-ant-oat01-MIDDLEMUSTNEVERAPPEARANYWHERE-44aa';
+
+test('identity stamp — account_email rides every payload from oauthAccount', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint(
+    { session_id: 'sess-id1', transcript_path: transcript, cwd: dir },
+    usageDeps({
+      readClaudeAccount: () => ({ ...ACCOUNT_FIXTURE, email: 'dev@example.com' }),
+      env: {},
+    }),
+  );
+  const p = readQueue(dir)[0].payload;
+  assert.equal(p.account_email, 'dev@example.com');
+  assert.equal(p.account_uuid, 'acc-1', 'the uuid still rides alongside');
+});
+
+test('identity stamp — billing-config anchor email is the fallback when oauthAccount has none', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  fs.writeFileSync(
+    path.join(dir, 'billing.json'),
+    JSON.stringify({
+      version: 2,
+      source: 'subscription',
+      subscriptionType: 'max',
+      plan: 'max',
+      capturedAt: new Date().toISOString(),
+      accountAnchor: { value: 'cli@example.com', source: 'email', updatedAt: new Date().toISOString() },
+    }),
+  );
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint(
+    { session_id: 'sess-id2', transcript_path: transcript, cwd: dir },
+    usageDeps({ env: {} }),
+  );
+  const p = readQueue(dir)[0].payload;
+  assert.equal(p.account_email, 'cli@example.com');
+});
+
+test('identity stamp — a user_id anchor never becomes an email', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  fs.writeFileSync(
+    path.join(dir, 'billing.json'),
+    JSON.stringify({
+      version: 2,
+      source: 'subscription',
+      subscriptionType: 'max',
+      plan: 'max',
+      capturedAt: new Date().toISOString(),
+      accountAnchor: { value: 'opaque-local-hash', source: 'user_id', updatedAt: new Date().toISOString() },
+    }),
+  );
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint(
+    { session_id: 'sess-id3', transcript_path: transcript, cwd: dir },
+    usageDeps({ env: {} }),
+  );
+  const p = readQueue(dir)[0].payload;
+  assert.equal('account_email' in p, false);
+});
+
+test('identity stamp — oauth setup token rides as a fingerprint, never whole', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint(
+    { session_id: 'sess-id4', transcript_path: transcript, cwd: dir },
+    usageDeps({ env: { CLAUDE_CODE_OAUTH_TOKEN: OAUTH_SECRET } }),
+  );
+  const p = readQueue(dir)[0].payload;
+  assert.equal(p.oauth_key_prefix, OAUTH_SECRET.slice(0, 12));
+  assert.equal(p.oauth_key_last4, OAUTH_SECRET.slice(-4));
+  assert.equal(p.oauth_key_length, OAUTH_SECRET.length);
+  assert.equal(
+    JSON.stringify(p).includes(OAUTH_SECRET.slice(12, -4)),
+    false,
+    'the middle of the token must never leave the machine',
+  );
+});
+
+test('identity stamp — the oauth setup token replaces the uuid/email, never rides beside them', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint(
+    { session_id: 'sess-id5', transcript_path: transcript, cwd: dir },
+    usageDeps({
+      env: { CLAUDE_CODE_OAUTH_TOKEN: OAUTH_SECRET },
+      readClaudeAccount: () => ({ accountUuid: 'stale-uuid', email: 'previous@example.com' }),
+    }),
+  );
+  const p = readQueue(dir)[0].payload;
+  // uuid is matched BEFORE the fingerprint server-side, so a leftover oauthAccount would win the
+  // resolution outright and attribute the session to the previous account.
+  assert.equal('account_uuid' in p, false);
+  assert.equal('account_email' in p, false);
+  assert.equal(p.oauth_key_last4, OAUTH_SECRET.slice(-4));
 });
 
 test('usage stamp — context fields ride main segments, stripped from subagent segments', async (t) => {
@@ -1809,4 +2215,164 @@ test('claude_md_lines — reported from the segment repo root, omitted when the 
   const bareItems = readQueue(bare);
   assert.equal(bareItems.length, 1, 'exactly one queue file');
   assert.equal('claude_md_lines' in bareItems[0].payload, false);
+});
+
+// ─── end to end: an OS-environment token reaches the payload ─────────────────
+// The unit tests in claude-settings-env.test.mjs prove the resolver; this proves the WIRING —
+// runCheckpoint really does use the probing variant, and its answer really does land in the
+// identity stamp. The probe is injected, so nothing spawns and nothing reads this machine.
+
+test('OS-env probe — a recovered setup token stamps the fingerprint and suppresses uuid/email', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  // Hermetic first two tiers: no exported token, and CLAUDE_CONFIG_DIR points at an empty temp
+  // dir so the developer's own ~/.claude/settings.json cannot answer before the probe does.
+  const cfgDir = makeTmpDir(t);
+  const prevCfg = process.env.CLAUDE_CONFIG_DIR;
+  const prevToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  process.env.CLAUDE_CONFIG_DIR = cfgDir;
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const { resetSettingsEnvCache } = await import('../lib/claude-settings-env.mjs');
+  resetSettingsEnvCache();
+  t.after(() => {
+    if (prevCfg == null) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prevCfg;
+    if (prevToken != null) process.env.CLAUDE_CODE_OAUTH_TOKEN = prevToken;
+    resetSettingsEnvCache();
+  });
+
+  const OS_TOKEN = `sk-ant-oat01-${'d'.repeat(60)}`;
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', USAGE_FIXTURE, '2024-01-01T10:00:00.000Z'),
+  ]);
+  await runCheckpoint(
+    { session_id: 'sess-osenv', transcript_path: transcript, cwd: dir },
+    usageDeps({
+      // No `env`: injecting the probe is what tells the suite-wide guard to stand down, so the
+      // resolution under test is the real one runCheckpoint performs.
+      osEnvOauthToken: () => OS_TOKEN,
+    }),
+  );
+
+  const p = readQueue(dir)[0].payload;
+  assert.equal(p.oauth_key_last4, OS_TOKEN.slice(-4));
+  assert.equal(p.oauth_key_length, OS_TOKEN.length);
+  assert.equal(typeof p.oauth_key_prefix, 'string');
+  // The fingerprint REPLACES the disk identity — a stale uuid would otherwise win server-side.
+  assert.equal('account_uuid' in p, false);
+  assert.equal('account_email' in p, false);
+  // The value itself never reaches the wire.
+  assert.equal(JSON.stringify(p).includes(OS_TOKEN), false);
+  // Billing read the SAME env: a setup token is positive subscription evidence.
+  assert.equal(p.billing_source, 'subscription');
+});
+
+// ─── corrupt queue files: salvage what is readable, quarantine what is not ───────────────
+
+// The exact wreckage two concurrent pre-atomic writers left behind: a whole payload followed by
+// the tail of a longer previous one. These used to be re-read and skipped on every flush forever.
+test('flushQueue salvages a payload buried under trailing wreckage and posts it', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const qdir = path.join(dir, 'queue');
+  fs.mkdirSync(qdir, { recursive: true });
+
+  const p = path.join(qdir, 'seg-salvage.json');
+  const good = JSON.stringify({ segmentId: 'sess-salvage:1-1', sessionId: 'sess-salvage' });
+  fs.writeFileSync(p, good + '65070,"context_final_model":"claude-opus-5"}', 'utf-8');
+
+  const posted = [];
+  const fetchImpl = async (_url, opts) => { posted.push(JSON.parse(opts.body)); return { status: 200 }; };
+  const result = await flushQueue('tok', { fetchImpl });
+
+  assert.equal(posted.length, 1, 'the recovered payload was posted');
+  assert.equal(posted[0].segmentId, 'sess-salvage:1-1');
+  assert.equal(result.salvaged, 1);
+  assert.equal(result.flushed, 1);
+  assert.equal(fs.existsSync(p), false, 'file removed once accepted');
+});
+
+test('flushQueue quarantines an unreadable file instead of retrying it forever', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const qdir = path.join(dir, 'queue');
+  fs.mkdirSync(qdir, { recursive: true });
+
+  const p = path.join(qdir, 'seg-garbage.json');
+  fs.writeFileSync(p, 'not json at all', 'utf-8');
+
+  let calls = 0;
+  const result = await flushQueue('tok', { fetchImpl: async () => { calls += 1; return { status: 200 }; } });
+
+  assert.equal(calls, 0, 'nothing postable, so nothing posted');
+  assert.equal(result.quarantined, 1);
+  assert.equal(fs.existsSync(p), false);
+  assert.equal(fs.existsSync(p + '.corrupt'), true, 'set aside, and pruneStale expires it');
+});
+
+test('flushQueue ignores stray .tmp and .corrupt entries', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+  const qdir = path.join(dir, 'queue');
+  fs.mkdirSync(qdir, { recursive: true });
+
+  fs.writeFileSync(path.join(qdir, 'seg.json.1234.abcd.tmp'), '{"segmentId":"x:1-1"}', 'utf-8');
+  fs.writeFileSync(path.join(qdir, 'seg-old.json.corrupt'), 'garbage', 'utf-8');
+
+  let calls = 0;
+  const result = await flushQueue('tok', { fetchImpl: async () => { calls += 1; return { status: 200 }; } });
+
+  assert.equal(calls, 0, 'a half-written temp is never posted');
+  assert.equal(result.quarantined, 0, 'and an already-quarantined file is not re-quarantined');
+});
+
+// ─── advisor legs inside a SUBAGENT transcript ──────────────────────────────
+//
+// Subagent files get their own computeDelta window (a separate call site from the main
+// transcript), so the advisor handling has to be proven there too — a subagent that consults
+// the advisor bills on the parent's account exactly like the main thread does.
+
+test('advisor legs inside a subagent transcript reach the subagent segment', async (t) => {
+  const dir = makeTmpDir(t);
+  setHome(dir);
+
+  const transcript = writeTranscript(dir, [
+    assistantLine('main', 'model-a', {
+      input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+    }, '2024-01-01T10:00:00.000Z'),
+  ]);
+  writeSubagentTranscript(dir, 'sess-adv-sub', 'agent-deadbeef', [
+    assistantLine('main', 'model-a', {
+      input_tokens: 2, output_tokens: 20, cache_read_input_tokens: 500, cache_creation_input_tokens: 40,
+      iterations: [
+        { type: 'message', input_tokens: 2, output_tokens: 20, cache_read_input_tokens: 500, cache_creation_input_tokens: 40 },
+        { type: 'advisor_message', model: 'advisor-b', input_tokens: 30000, output_tokens: 1500, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      ],
+    }, '2024-01-01T10:00:30.000Z', undefined, 'xhigh'),
+  ]);
+  fs.writeFileSync(
+    path.join(dir, 'sess-adv-sub', 'subagents', 'agent-deadbeef.meta.json'),
+    JSON.stringify({ agentType: 'Explore', spawnDepth: 1, toolUseId: 'toolu_y' }),
+    'utf-8',
+  );
+
+  await runCheckpoint(
+    { session_id: 'sess-adv-sub', transcript_path: transcript, cwd: dir },
+    {
+      getAccessToken: async () => 'tok',
+      gitImpl: fakeGitRepo('main', 'https://host/org/repo.git'),
+      fetchImpl: fakeFetch(503), // 503 keeps the queue files on disk for inspection
+    },
+  );
+
+  const agent = readQueue(dir).find(i => i.payload.segmentId === 'sess-adv-sub:agent-deadbeef:1-1');
+  assert.ok(agent, 'subagent segment exists');
+  const models = agent.payload.models;
+
+  assert.ok(models['advisor-b'], 'the advisor leg is billed from inside the subagent segment');
+  assert.equal(models['advisor-b'].token_input, 30000);
+  assert.equal(models['advisor-b'].token_output, 1500);
+  assert.equal(models['advisor-b'].by_effort.xhigh.token_input, 30000, 'bucketed under the subagent line effort');
+  assert.equal(models['model-a'].token_input, 2, 'the subagent parent tally is untouched');
+  assert.equal(agent.payload.token_total, 2 + 20 + 500 + 40 + 30000 + 1500, 'advisor tokens are inside the segment total');
 });

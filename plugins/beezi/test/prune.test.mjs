@@ -103,6 +103,32 @@ test('4. missing dirs → no throw', (t) => {
   assert.doesNotThrow(() => pruneStale(Date.now()));
 });
 
+// ─── test 5b: prunes old telemetry file ──────────────────────────────────────
+
+function telemetryDir(homeDir) {
+  return path.join(homeDir, 'telemetry');
+}
+
+test('5b. prunes old telemetry file, keeps recent one', (t) => {
+  const homeDir = makeTmpDir(t);
+  setHome(homeDir);
+
+  const now = Date.now();
+  const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
+
+  const td = telemetryDir(homeDir);
+  const oldFile = writeFile(td, 'abc1234567890abc.json');
+  const recentFile = writeFile(td, 'def1234567890def.json');
+
+  ageFile(oldFile, fifteenDaysMs, now);
+  ageFile(recentFile, 0, now);
+
+  pruneStale(now);
+
+  assert.equal(fs.existsSync(oldFile), false, 'old telemetry file must be pruned');
+  assert.equal(fs.existsSync(recentFile), true, 'recent telemetry file must be kept');
+});
+
 // ─── test 5: custom maxAgeMs boundary ────────────────────────────────────────
 
 test('5. custom maxAgeMs boundary — 2-day-old file pruned at 1d, kept at 3d', (t) => {

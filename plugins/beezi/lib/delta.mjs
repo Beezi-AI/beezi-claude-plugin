@@ -178,6 +178,9 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   const apiErrorEvents = [];
   let run = null;
   let activeRoot = cwd != null ? repoRootOf(cwd) : null;
+  // Last-touch-wins like activeRoot: a line that resolves no branch inherits rather than invents.
+  let activeBranch = null;
+  let lastToLine = null;
 
   const closeRun = () => {
     if (run) {
@@ -198,7 +201,10 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
       }
       segments.push({
         repoRoot: run.repoRoot,
-        branch: run.branch,
+        // Only site that passes a null ms: branchAt answers it with the repo's head branch.
+        branch: run.branch != null
+          ? run.branch
+          : (branchAt ? branchAt(run.repoRoot, null) : '(unknown)'),
         fromLine: run.fromLine,
         toLine: run.toLine,
         // Deliberately outside `stats` (which is spread wholesale into the report payload): the
@@ -206,6 +212,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
         activeIntervals,
         stats,
       });
+      lastToLine = run.toLine;
       run = null;
     }
   };
@@ -222,18 +229,28 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     const sigDir = toolDir || (typeof line.cwd === 'string' ? line.cwd : null);
     if (sigDir) {
       const sigRoot = repoRootOf(sigDir);
-      if (sigRoot) activeRoot = sigRoot; // last-touch-wins; unresolvable -> carry forward
+      if (sigRoot) {
+        if (sigRoot !== activeRoot) activeBranch = null; // only a real move drops the branch
+        activeRoot = sigRoot; // last-touch-wins; unresolvable -> carry forward
+      }
     }
 
-    const ms = line.timestamp ? new Date(line.timestamp).getTime() : null;
+    // NaN collapses to null: an unparseable stamp resolves the reflog's oldest branch, not none.
+    const stamp = line.timestamp ? new Date(line.timestamp).getTime() : NaN;
+    const ms = Number.isFinite(stamp) ? stamp : null;
     const branch = branchAt
-      ? branchAt(activeRoot, ms)
-      : (line.gitBranch || '(unknown)');
+      ? (ms == null ? activeBranch : branchAt(activeRoot, ms))
+      : (line.gitBranch || activeBranch);
+    if (branch != null) activeBranch = branch;
 
-    if (!run || run.repoRoot !== activeRoot || run.branch !== branch) {
+    if (!run || run.repoRoot !== activeRoot || (branch != null && run.branch != null && run.branch !== branch)) {
       closeRun();
-      run = { repoRoot: activeRoot, branch, fromLine: lineNo, toLine: lineNo, models: {}, timestamps: [], anchors: [], lines: [] };
+      // Open flush against the last run: a malformed line on the boundary reaches no run at all.
+      const openAt = lastToLine == null ? lineNo : lastToLine + 1;
+      run = { repoRoot: activeRoot, branch, fromLine: openAt, toLine: lineNo, models: {}, timestamps: [], anchors: [], lines: [] };
     }
+    // The first line that names a branch defines the meta lines above it too.
+    if (run.branch == null && branch != null) run.branch = branch;
     run.toLine = lineNo;
     run.lines.push(line);
     if (ms != null) {
@@ -262,17 +279,6 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
       const u = line.message.usage;
       const cacheCreation = u.cache_creation_input_tokens
         || Object.values(u.cache_creation || {}).reduce((a, x) => a + (x || 0), 0);
-      if (run.models[model] == null) {
-        run.models[model] = {
-          token_input: 0, token_output: 0, token_cache_read: 0, token_cache_creation: 0, requests: 0,
-        };
-      }
-      const m = run.models[model];
-      m.token_input += u.input_tokens || 0;
-      m.token_output += u.output_tokens || 0;
-      m.token_cache_read += u.cache_read_input_tokens || 0;
-      m.token_cache_creation += cacheCreation;
-      m.requests += 1;
 
       // Reasoning effort rides each assistant line as a top-level field, stable across a
       // message's block-lines — reading it here (the dedup site) buckets each message exactly
@@ -280,18 +286,37 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
       // partition the model tally above. Nested inside the model entry so summarize()'s models
       // spread ships it in the report payload untouched (mirrors operations.mcp.by_server).
       const effort = typeof line.effort === 'string' && line.effort !== '' ? line.effort : 'unknown';
-      if (m.by_effort == null) m.by_effort = {};
-      if (m.by_effort[effort] == null) {
-        m.by_effort[effort] = {
-          token_input: 0, token_output: 0, token_cache_read: 0, token_cache_creation: 0, requests: 0,
-        };
+
+      tally(run.models, model, effort, {
+        input: u.input_tokens || 0,
+        output: u.output_tokens || 0,
+        cacheRead: u.cache_read_input_tokens || 0,
+        cacheCreation,
+      });
+
+      // `usage.iterations` splits one turn into the legs the API actually billed. The top-level
+      // fields above sum ONLY the legs of type 'message' — an `advisor_message` leg (the advisor
+      // tool's own uncached call, on whichever model that request named) is left out entirely, so
+      // reading top-level alone silently drops it. One local session lost 1,229,631 input and
+      // 29,140 output tokens that way: $9.37 of a $57.20 session, 16% of its real cost.
+      //
+      // Deliberately an allowlist, not `type !== 'message'`. A leg type invented later may well
+      // already be inside the top-level totals, and adding it twice would OVER-report what the
+      // human spent. Undercounting an unknown leg is the failure we already have; inflating a
+      // bill is a worse one. Widen this only against a transcript that proves the leg is excluded.
+      const legs = Array.isArray(u.iterations) ? u.iterations : [];
+      for (const leg of legs) {
+        if (leg == null || leg.type !== 'advisor_message') continue;
+        // The leg names its own model; it falls back to the parent's only when absent. Effort
+        // comes off the parent line — the advisor's own effort is not recorded anywhere, and
+        // 'unknown' already means "Claude Code too old to emit the field", not "not the parent".
+        tally(run.models, leg.model || model, effort, {
+          input: leg.input_tokens || 0,
+          output: leg.output_tokens || 0,
+          cacheRead: leg.cache_read_input_tokens || 0,
+          cacheCreation: leg.cache_creation_input_tokens || 0,
+        });
       }
-      const eff = m.by_effort[effort];
-      eff.token_input += u.input_tokens || 0;
-      eff.token_output += u.output_tokens || 0;
-      eff.token_cache_read += u.cache_read_input_tokens || 0;
-      eff.token_cache_creation += cacheCreation;
-      eff.requests += 1;
 
       // Context the request ran with = prompt-side tokens. Sidechains (title generation etc.)
       // run tiny separate contexts and must not move the session's numbers.
@@ -304,7 +329,39 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     }
   }
   closeRun();
-  return { nextCursor: Math.max(fromLine, raw.length), segments, apiErrorEvents };
+  const nextCursor = Math.max(fromLine, raw.length);
+  // Widen the outer ranges over blank/malformed head and tail lines the cursor consumes anyway.
+  if (segments.length > 0) {
+    segments[0].fromLine = Math.min(segments[0].fromLine, fromLine + 1);
+    const last = segments[segments.length - 1];
+    last.toLine = Math.max(last.toLine, nextCursor);
+  }
+  return { nextCursor, segments, apiErrorEvents };
+}
+
+// Add one billed API call to a model bucket and to its effort sub-bucket, creating either on
+// first sight. Shared by the parent turn and by each advisor leg inside it so the two can never
+// drift — the effort buckets are contractually a partition of the model tally above them.
+function tally(models, model, effort, t) {
+  if (models[model] == null) {
+    models[model] = {
+      token_input: 0, token_output: 0, token_cache_read: 0, token_cache_creation: 0, requests: 0,
+    };
+  }
+  const m = models[model];
+  if (m.by_effort == null) m.by_effort = {};
+  if (m.by_effort[effort] == null) {
+    m.by_effort[effort] = {
+      token_input: 0, token_output: 0, token_cache_read: 0, token_cache_creation: 0, requests: 0,
+    };
+  }
+  for (const bucket of [m, m.by_effort[effort]]) {
+    bucket.token_input += t.input;
+    bucket.token_output += t.output;
+    bucket.token_cache_read += t.cacheRead;
+    bucket.token_cache_creation += t.cacheCreation;
+    bucket.requests += 1;
+  }
 }
 
 // `anchors` are the segment's session-marking stamps (isTimingAnchor), used only for the span.

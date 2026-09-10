@@ -40,6 +40,18 @@ export function isLiveTrackingAllowed(state = readTrackingState()) {
   return true;
 }
 
+// The one predicate for "this tenant has opted out entirely". Deliberately NOT
+// isLiveTrackingAllowed (which also excludes backfill_only, a mode that still wants its past
+// sessions) and NOT shouldBackfill (which goes false once backfillCompleted is set, and so would
+// switch off recurring work on every machine that finished its one-time pull).
+//
+// Fail-open like every other gate in this file: a missing record or a null mode is an old server
+// or a fresh install, and the server's TrackingEnabledGuard is the real boundary.
+export function isTrackingDisabled(state = readTrackingState()) {
+  const mode = state == null || state.trackingMode == null ? null : state.trackingMode;
+  return mode === TrackingMode.DISABLED;
+}
+
 // Mirrors the server's derivation: every mode except `disabled` is offered the one-time pull
 // until it completes — paid tenants included, not just audit ones. A null mode means a
 // pre-audit server: it has no backfill routes, so no hint.

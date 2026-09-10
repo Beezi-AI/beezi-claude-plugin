@@ -170,7 +170,9 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
   const chunks = planChunks(sessionGroups, options);
   if (chunks.length === 0) return result;
 
-  const url = `${apiBase()}${ENDPOINTS.sessionsBackfill}`;
+  // /beezi:sync posts the identical wire shape to a repeatable route that never seals the pull.
+  const endpointPath = options.endpoint == null ? ENDPOINTS.sessionsBackfill : options.endpoint;
+  const url = `${apiBase()}${endpointPath}`;
   // A 401 is authentication, not a verdict on the payload. Renew once for the whole run and retry;
   // if renewal fails, the remaining chunks count as failed and stay eligible for a re-run.
   let renewed = false;

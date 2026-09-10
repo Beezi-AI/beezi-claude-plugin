@@ -8,6 +8,7 @@ import {
   readTrackingState,
   writeTrackingState,
   isLiveTrackingAllowed,
+  isTrackingDisabled,
   shouldBackfill,
   matchesIdentity,
   recordWhoami,
@@ -54,6 +55,32 @@ test('2. both audit modes block live tracking; live allows it', (t) => {
 
   writeTrackingState({ trackingMode: TrackingMode.LIVE });
   assert.equal(isLiveTrackingAllowed(), true);
+});
+
+// The predicate the recurring cost-state sync gates on. Distinct from isLiveTrackingAllowed
+// (backfill_only still wants its past sessions) and from shouldBackfill (which goes false once
+// the one-time pull completes, and would switch recurring work off on every finished machine).
+test('2b. only `disabled` counts as disabled — and it fails open', (t) => {
+  makeHome(t);
+
+  assert.equal(isTrackingDisabled(), false, 'missing file');
+
+  writeTrackingState({ trackingMode: null });
+  assert.equal(isTrackingDisabled(), false, 'null mode (pre-audit server)');
+
+  writeTrackingState({ trackingMode: TrackingMode.LIVE });
+  assert.equal(isTrackingDisabled(), false);
+
+  // The case isLiveTrackingAllowed gets wrong for this purpose.
+  writeTrackingState({ trackingMode: TrackingMode.BACKFILL_ONLY });
+  assert.equal(isTrackingDisabled(), false);
+
+  // The case shouldBackfill gets wrong for this purpose.
+  writeTrackingState({ trackingMode: TrackingMode.LIVE, backfillCompleted: true });
+  assert.equal(isTrackingDisabled(), false);
+
+  writeTrackingState({ trackingMode: TrackingMode.DISABLED });
+  assert.equal(isTrackingDisabled(), true);
 });
 
 // Mirrors the server's resolveTrackingMode: everything except disabled is offered the pull until

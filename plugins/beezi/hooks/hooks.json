@@ -13,6 +13,9 @@
     "SubagentStop": [
       { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-ping.mjs"], "timeout": 10 } ] }
     ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/permission-request.mjs", "timeout": 5 } ] }
+    ],
     "PostToolUse": [
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/checkpoint.mjs"], "timeout": 10 } ] },
       { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/pulse.mjs"], "timeout": 10 } ] }

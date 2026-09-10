@@ -111,7 +111,7 @@ test('1. resume does NOT re-report already-counted work (no double count)', asyn
     return { ok: false };
   };
 
-  await runSessionStart({ session_id, cwd: 'x' }, { getAccessToken, fetchImpl: fetchImplResume, gitImpl });
+  await runSessionStart({ session_id, cwd: 'x' }, { env: {}, getAccessToken, fetchImpl: fetchImplResume, gitImpl, checkForUpdate: async () => null });
 
   // No segments should be flushed on resume (queue was already empty after first checkpoint's 200)
   assert.equal(payloadsFlush.length, 0, 'no segments flushed on resume (queue already empty)');
@@ -198,7 +198,7 @@ test('2. offline segment flushed on next SessionStart', async (t) => {
     return { ok: false };
   };
 
-  await runSessionStart({ session_id, cwd: 'x' }, { getAccessToken, fetchImpl: okFetch, gitImpl });
+  await runSessionStart({ session_id, cwd: 'x' }, { env: {}, getAccessToken, fetchImpl: okFetch, gitImpl, checkForUpdate: async () => null });
 
   // Queue file must have been POSTed to /sessions/report
   const reportPosts = postedUrls.filter(c => c.url.includes('/sessions/report'));

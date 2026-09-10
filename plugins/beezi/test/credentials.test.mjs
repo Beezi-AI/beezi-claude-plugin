@@ -18,7 +18,9 @@ function tmpHome(t) {
   return dir;
 }
 
+// The pre-generation file (seeded by the legacy-read tests) and a generation entry of the store.
 const credsPath = (dir) => path.join(dir, 'credentials.json');
+const genPath = (dir, n) => path.join(dir, 'credentials', `gen-${n}.json`);
 
 // Minimal valid credentials object; access_token varies per test for traceability.
 const creds = (accessToken) => ({
@@ -118,7 +120,7 @@ test('macOS — security keychain round-trip; nothing written to disk', async (t
   const dir = tmpHome(t);
   const deps = { platform: 'darwin', run: macRun(new Map()) };
   await setCredentials(creds('mac-tok'), deps);
-  assert.equal(fs.existsSync(credsPath(dir)), false, 'keychain used, no file');
+  assert.equal(fs.existsSync(genPath(dir, 1)), false, 'keychain used, no file');
   assert.equal(await storedToken(deps), 'mac-tok');
   await deleteCredentials(deps);
   assert.equal(await storedToken(deps), null);
@@ -130,7 +132,7 @@ test('Linux — secret-tool round-trip when libsecret is installed', async (t) =
   const dir = tmpHome(t);
   const deps = { platform: 'linux', run: secretToolRun(new Map(), true) };
   await setCredentials(creds('lin-tok'), deps);
-  assert.equal(fs.existsSync(credsPath(dir)), false, 'keychain used, no file');
+  assert.equal(fs.existsSync(genPath(dir, 1)), false, 'keychain used, no file');
   assert.equal(await storedToken(deps), 'lin-tok');
   await deleteCredentials(deps);
   assert.equal(await storedToken(deps), null);
@@ -140,8 +142,8 @@ test('Linux — no secret-tool → falls back to the 0600 file', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'linux', run: secretToolRun(new Map(), false) };
   await setCredentials(creds('lin-file'), deps);
-  assert.equal(fs.existsSync(credsPath(dir)), true, 'file fallback written');
-  const raw = JSON.parse(fs.readFileSync(credsPath(dir), 'utf-8')).token;
+  assert.equal(fs.existsSync(genPath(dir, 1)), true, 'file fallback written');
+  const raw = JSON.parse(fs.readFileSync(genPath(dir, 1), 'utf-8')).token;
   assert.equal(JSON.parse(raw).access_token, 'lin-file');
   assert.equal(await storedToken(deps), 'lin-file');
 });
@@ -153,7 +155,7 @@ test('Windows — Credential Manager round-trip (primary); nothing written to di
   const deps = { platform: 'win32', run: winRun() };
   const where = await setCredentials(creds('win-cred'), deps);
   assert.equal(where, 'the Windows Credential Manager');
-  assert.equal(fs.existsSync(credsPath(dir)), false, 'Credential Manager used, no file');
+  assert.equal(fs.existsSync(genPath(dir, 1)), false, 'Credential Manager used, no file');
   assert.equal(await storedToken(deps), 'win-cred');
   await deleteCredentials(deps);
   assert.equal(await storedToken(deps), null);
@@ -163,7 +165,7 @@ test('Windows — Credential Manager unavailable → DPAPI encrypts at rest (no 
   const dir = tmpHome(t);
   const deps = { platform: 'win32', run: winRun({ credMan: false, dpapi: true }) };
   await setCredentials(creds('win-tok'), deps);
-  const raw = fs.readFileSync(credsPath(dir), 'utf-8');
+  const raw = fs.readFileSync(genPath(dir, 1), 'utf-8');
   const obj = JSON.parse(raw);
   assert.ok(obj.enc, 'ciphertext stored under "enc"');
   assert.equal(obj.token, undefined, 'no plaintext token field');
@@ -175,15 +177,15 @@ test('Windows — Credential Manager + DPAPI unavailable → plaintext 0600 file
   const dir = tmpHome(t);
   const deps = { platform: 'win32', run: winRun({ credMan: false, dpapi: false }) };
   await setCredentials(creds('win-plain'), deps);
-  const raw = JSON.parse(fs.readFileSync(credsPath(dir), 'utf-8')).token;
+  const raw = JSON.parse(fs.readFileSync(genPath(dir, 1), 'utf-8')).token;
   assert.equal(JSON.parse(raw).access_token, 'win-plain');
   assert.equal(await storedToken(deps), 'win-plain');
 });
 
-test('Windows — legacy DPAPI-file credentials still read when Credential Manager is empty', async (t) => {
+test('Windows — a generation committed to the DPAPI file is still read when Credential Manager is present', async (t) => {
   tmpHome(t);
-  // Simulate a user who linked before the Credential Manager backend existed: credentials live
-  // in the DPAPI file only. A later session (credMan present but empty) must still find them.
+  // Credential Manager was down at login, so the generation landed in the DPAPI file. A later
+  // session (credMan present but empty) follows the control record to that file.
   await setCredentials(creds('legacy-dpapi'), { platform: 'win32', run: winRun({ credMan: false, dpapi: true }) });
   assert.equal(await storedToken({ platform: 'win32', run: winRun({ credMan: true, dpapi: true }) }), 'legacy-dpapi');
 });
@@ -194,15 +196,15 @@ test('unknown platform → file store round-trip', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) };
   await setCredentials(creds('generic'), deps);
-  assert.equal(fs.existsSync(credsPath(dir)), true);
+  assert.equal(fs.existsSync(genPath(dir, 1)), true);
   assert.equal(await storedToken(deps), 'generic');
 });
 
-test('keychain empty but file credentials exist → file fallback on read', async (t) => {
+test('a generation committed to the file is read even when an empty keychain is preferred', async (t) => {
   tmpHome(t);
-  await setCredentials(creds('legacy-file'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) }); // file
-  const deps = { platform: 'darwin', run: macRun(new Map()) };                                                // empty keychain
-  assert.equal(await storedToken(deps), 'legacy-file');
+  await setCredentials(creds('file-gen'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) }); // file
+  const deps = { platform: 'darwin', run: macRun(new Map()) };                                             // empty keychain
+  assert.equal(await storedToken(deps), 'file-gen');
 });
 
 test('no credentials anywhere → null, never throws', async (t) => {
@@ -212,22 +214,23 @@ test('no credentials anywhere → null, never throws', async (t) => {
   assert.equal(await getCredentials(deps), null);
 });
 
-test('deleteCredentials clears both keychain and any file copy', async (t) => {
+test('deleteCredentials clears the committed generation; a replaced file generation is already retired', async (t) => {
   const dir = tmpHome(t);
-  // Seed a stale file copy AND a keychain copy.
-  await setCredentials(creds('file-one'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) });
+  await setCredentials(creds('file-one'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) }); // gen 1 → file
   const store = new Map();
   const deps = { platform: 'darwin', run: macRun(store) };
-  await setCredentials(creds('key-one'), deps);
+  await setCredentials(creds('key-one'), deps);                                                            // gen 2 → keychain
+  assert.equal(fs.existsSync(genPath(dir, 1)), false, 'superseded file generation retired');
   await deleteCredentials(deps);
   assert.equal(store.has('k'), false, 'keychain cleared');
-  assert.equal(fs.existsSync(credsPath(dir)), false, 'file cleared');
+  assert.equal(fs.existsSync(genPath(dir, 2)), false);
   assert.equal(await getCredentials(deps), null);
 });
 
 test('file store uses restricted 0600 permissions (posix only)', { skip: process.platform === 'win32' }, async (t) => {
   const dir = tmpHome(t);
   await setCredentials(creds('x'), { platform: 'linux', run: secretToolRun(new Map(), false) });
-  const mode = fs.statSync(credsPath(dir)).mode & 0o777;
+  const mode = fs.statSync(genPath(dir, 1)).mode & 0o777;
   assert.equal(mode, 0o600);
+  assert.equal(fs.statSync(path.join(dir, 'credentials', 'control.json')).mode & 0o777, 0o600);
 });

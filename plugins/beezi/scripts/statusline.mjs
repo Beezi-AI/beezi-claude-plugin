@@ -15,9 +15,24 @@ import { readHookInput } from '../lib/hook-input.mjs';
 // opts out of display entirely and keeps only the capture.
 const raw = readHookInput();
 
-// Display resolves first and is never blocked by our bookkeeping: a throw, a corrupt state file
-// or a full disk must not blank someone's status bar.
+// The capture goes FIRST because this process is killed, not waited for. Claude Code re-renders
+// on a 300ms debounce and every render aborts the one still in flight — the signal reaches us as
+// a SIGTERM to the whole process group. Rendering first meant the capture sat behind the WHOLE
+// runtime of the chained command, so a status line slower than the gap between renders (a
+// git-heavy monorepo line, anything spawned through npx) lost every observation, silently: the
+// wrapped line looked fine and nothing was ever recorded. Capturing first bounds the exposure to
+// node's own startup instead of the user's command.
+//
+// The bookkeeping still cannot blank a status bar: it is one small local write, and every
+// failure path below is swallowed so the display runs regardless.
 (async () => {
+  try {
+    const { recordStatuslineUsage } = await import('../lib/statusline-usage.mjs');
+    recordStatuslineUsage(raw);
+  } catch {
+    /* best-effort: the status line's job is to render, not to report */
+  }
+
   const chain = process.env.BEEZI_STATUSLINE_CHAIN;
   if (chain) {
     const result = spawnSync(chain, {
@@ -33,15 +48,11 @@ const raw = readHookInput();
       const line = renderDefaultStatusline(raw);
       if (line) process.stdout.write(line);
     } catch {
-      /* rendering is cosmetic; capture below still runs */
+      /* rendering is cosmetic; the capture above already landed */
     }
   }
-
-  try {
-    const { recordStatuslineUsage } = await import('../lib/statusline-usage.mjs');
-    recordStatuslineUsage(raw);
-  } catch {
-    /* best-effort: the status line's job is to render, not to report */
-  }
-  process.exit(0);
+  // NOT process.exit(): stdout is a pipe here, so a line longer than the pipe buffer is still
+  // queued when this line runs and exit() would drop the rest of it. Nothing holds the loop open
+  // once the write drains — spawnSync keeps no handle — so a natural exit ends just as promptly.
+  process.exitCode = 0;
 })();

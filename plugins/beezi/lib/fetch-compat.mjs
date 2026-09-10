@@ -27,7 +27,7 @@ export async function httpsFetch(url, init = {}) {
   for (let hop = 0; ; hop++) {
     const res = await sendOnce(currentUrl, method, headers, body, signal);
     const location = REDIRECT_STATUSES.has(res.statusCode) ? res.headers.location : null;
-    if (!location) return toResponse(res);
+    if (!location) return toResponse(res, signal);
 
     // Discard the redirect response body — nothing reads it. A late socket error on an
     // already-decided response must not crash the process as an unhandled 'error' event.
@@ -75,6 +75,11 @@ function makeAbortError() {
 
 // Sends one request (no redirect handling) and resolves with the IncomingMessage once
 // response headers arrive. The body stream is left untouched for the caller to consume.
+//
+// The abort listener deliberately outlives the headers: it used to be removed the moment
+// `response` fired, which left the body read unguarded, so a body streaming past the caller's
+// deadline (a refresh's 7s budget) completed anyway. It now destroys the response stream, and
+// is dropped when the stream closes.
 function sendOnce(url, method, headers, body, signal) {
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) {
@@ -97,10 +102,14 @@ function sendOnce(url, method, headers, body, signal) {
 
     // `{ once: true }` plus explicit removal on every settle path keeps a long-lived
     // signal (e.g. a shared AbortController) from accumulating listeners across calls.
+    let responseStream = null;
     const onAbort = () => {
       cleanup();
-      req.destroy();
-      reject(makeAbortError());
+      if (responseStream) {
+        responseStream.on('error', () => {}); // destroy() emits on the stream; nobody may be reading yet
+        responseStream.destroy(makeAbortError());
+      } else req.destroy();
+      reject(makeAbortError()); // no-op once the headers already resolved this promise
     };
     const cleanup = () => {
       if (signal) signal.removeEventListener('abort', onAbort);
@@ -108,7 +117,8 @@ function sendOnce(url, method, headers, body, signal) {
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
     req.on('response', (res) => {
-      cleanup();
+      responseStream = res;
+      res.once('close', cleanup);
       resolve(res);
     });
     req.on('error', (err) => {
@@ -121,8 +131,15 @@ function sendOnce(url, method, headers, body, signal) {
   });
 }
 
-function bufferText(res) {
+// Reads the whole body. A signal that fires mid-stream destroys `res` (see sendOnce), which
+// surfaces here as an 'error'; an already-aborted signal short-circuits, because a destroyed
+// stream emits neither 'end' nor a second 'error' and the read would otherwise never settle.
+function bufferText(res, signal) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(makeAbortError());
+      return;
+    }
     const chunks = [];
     res.on('data', (chunk) => chunks.push(chunk));
     res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
@@ -130,7 +147,7 @@ function bufferText(res) {
   });
 }
 
-function toResponse(res) {
+function toResponse(res, signal) {
   return {
     ok: res.statusCode >= 200 && res.statusCode < 300,
     status: res.statusCode,
@@ -142,8 +159,8 @@ function toResponse(res) {
         return value == null ? null : value;
       },
     },
-    text: () => bufferText(res),
-    json: async () => JSON.parse(await bufferText(res)),
+    text: () => bufferText(res, signal),
+    json: async () => JSON.parse(await bufferText(res, signal)),
     body: res,
   };
 }

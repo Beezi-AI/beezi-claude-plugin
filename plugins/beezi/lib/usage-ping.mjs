@@ -62,6 +62,7 @@ export async function pingUsageSnapshot(deps = {}) {
   // Heavy imports stay off the fast path — reached only when the config file actually changed.
   const { getAccessToken } = await import('./token.mjs');
   const { maybePostUsageSnapshot } = await import('./usage-snapshot-report.mjs');
+  const { oauthTokenEnvWithOsProbe } = await import('./claude-settings-env.mjs');
 
   let token = null;
   try {
@@ -71,8 +72,23 @@ export async function pingUsageSnapshot(deps = {}) {
   }
   if (!token) return { reported: false, reason: 'no-token' };
 
+  // The SAME env resolution runCheckpoint performs, so the snapshot this path posts carries the
+  // same identity as the session reports that path sends. A setup token can live in Claude Code's
+  // settings file or the OS environment, where the bare process.env above cannot see it — and the
+  // identity stamp suppresses the local uuid precisely when one is in force. Reading a bare env
+  // here would post the stale uuid this machine's other reports withhold, and the two would
+  // resolve to two different accounts server-side.
+  //
+  // Resolved LAST, after the mtime gate and after the token: the OS probe is the expensive part,
+  // and a machine that never ran /beezi:login must not pay for it on every config rewrite. An
+  // injected deps.env is trusted verbatim, exactly as in checkpoint — it describes a machine under
+  // test, and a developer's own settings file must not leak into it.
+  const probedEnv = deps.env == null
+    ? oauthTokenEnvWithOsProbe(process.env, { osEnvOauthToken: deps.osEnvOauthToken })
+    : deps.env;
+
   try {
-    return await maybePostUsageSnapshot(token, deps);
+    return await maybePostUsageSnapshot(token, { ...deps, env: probedEnv });
   } catch {
     return { reported: false, reason: 'network' };
   }

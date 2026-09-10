@@ -276,3 +276,20 @@ test('cross-origin redirect drops the Authorization header', async (t) => {
 test('unsupported protocol rejects with a TypeError', async () => {
   await assert.rejects(httpsFetch('ftp://example.com/file'), TypeError);
 });
+
+// Regression for finding 5: the abort listener used to be removed as soon as headers arrived,
+// leaving a body that streams past the deadline completely unguarded.
+test('aborting after the headers arrive kills the body read', { timeout: 5000 }, async (t) => {
+  const { server, url } = await startServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Transfer-Encoding': 'chunked' });
+    res.write('first');
+    // Never ends: only the abort can finish this request.
+  });
+  t.after(() => closeServer(server));
+  const controller = new AbortController();
+  const response = await httpsFetch(url, { signal: controller.signal });
+  assert.equal(response.status, 200);
+  const reading = response.text();
+  controller.abort();
+  await assert.rejects(reading, (error) => error.name === 'AbortError');
+});

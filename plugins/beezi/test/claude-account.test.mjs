@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { readClaudeAccount, readClaudeAuthSignals } from '../lib/claude-account.mjs';
+import { readClaudeAccount, readClaudeAuthSignals, readClaudeAccountAnchor } from '../lib/claude-account.mjs';
 
 const withAccount = (oauthAccount) => ({
   exists: () => true,
@@ -51,11 +51,53 @@ test('readClaudeAccount — exposes accountUuid from oauthAccount', () => {
     withAccount({ accountUuid: 'acc-123', seatTier: 'max', userRateLimitTier: 'default_claude_max_5x' }),
   );
   assert.equal(r.accountUuid, 'acc-123');
+  assert.equal(r.rateLimitTier, 'default_claude_max_5x');
+  assert.equal(r.subscriptionType, 'max');
+});
+
+test('readClaudeAccount — personal Max: organizationType names the product, seatTier is null', () => {
+  // Verbatim from a live Max 20x machine. A personal subscription is written as an
+  // "organization" of type claude_max: seatTier and userRateLimitTier are both null and the
+  // multiplier sits in organizationRateLimitTier. Deriving from seatTier alone returned null
+  // here, which downstream read as "this profile cannot state its type" and cost the tier.
+  const r = readClaudeAccount(withAccount({
+    accountUuid: '164073bf-3bef-4127-93d5-b0bb5d8ec7e5',
+    emailAddress: 'b@icloud.com',
+    seatTier: null,
+    organizationType: 'claude_max',
+    userRateLimitTier: null,
+    organizationRateLimitTier: 'default_claude_max_20x',
+    billingType: 'stripe_subscription',
+  }));
+  assert.equal(r.subscriptionType, 'max');
+  assert.equal(r.rateLimitTier, 'default_claude_max_20x');
+});
+
+test('readClaudeAccount — a seat tier still outranks the org product label', () => {
+  // Order matters for seat-based orgs: the org names the company, the seat names the product.
+  const r = readClaudeAccount(
+    withAccount({ organizationType: 'claude_team', seatTier: 'max', userRateLimitTier: 'default_claude_max_20x' }),
+  );
+  assert.equal(r.subscriptionType, 'team', 'an explicit team org is still a team account');
+  const p = readClaudeAccount(withAccount({ organizationType: 'claude_pro' }));
+  assert.equal(p.subscriptionType, 'pro');
 });
 
 test('readClaudeAccount — accountUuid null when absent or non-string', () => {
   assert.equal(readClaudeAccount(withAccount({ seatTier: 'pro' })).accountUuid, null);
   assert.equal(readClaudeAccount(withAccount({ accountUuid: 42, seatTier: 'pro' })).accountUuid, null);
+});
+
+// Some login surfaces write oauthAccount with ONLY emailAddress (no accountUuid) — the email is
+// then the machine's one vendor identity, and the identity stamp on session reports needs it.
+test('readClaudeAccount — exposes emailAddress as email', () => {
+  const r = readClaudeAccount(withAccount({ emailAddress: 'dev@example.com', seatTier: 'max' }));
+  assert.equal(r.email, 'dev@example.com');
+});
+
+test('readClaudeAccount — email null when absent or non-string', () => {
+  assert.equal(readClaudeAccount(withAccount({ seatTier: 'pro' })).email, null);
+  assert.equal(readClaudeAccount(withAccount({ emailAddress: 42, seatTier: 'pro' })).email, null);
 });
 
 test('readClaudeAccount — falls back to organizationRateLimitTier', () => {
@@ -136,4 +178,27 @@ test('readClaudeAuthSignals — unreadable/malformed files yield no signals rath
     readClaudeAuthSignals(fakeFs({})),
     { hasManagedApiKey: false, hasApiKeyHelper: false },
   );
+});
+
+// ─── readClaudeAccountAnchor ─────────────────────────────────────────────────
+
+test('readClaudeAccountAnchor — prefers oauthAccount.accountUuid over userID', () => {
+  const a = readClaudeAccountAnchor(fakeFs({
+    [AT('.claude.json')]: JSON.stringify({ oauthAccount: { accountUuid: 'acc-1' }, userID: 'uid-9' }),
+  }));
+  assert.deepEqual(a, { value: 'acc-1', source: 'account_uuid' });
+});
+
+test('readClaudeAccountAnchor — falls back to the top-level userID (modern surfaces without oauthAccount)', () => {
+  const a = readClaudeAccountAnchor(fakeFs({
+    [AT('.claude.json')]: JSON.stringify({ numStartups: 3, userID: 'uid-9' }),
+  }));
+  assert.deepEqual(a, { value: 'uid-9', source: 'user_id' });
+});
+
+test('readClaudeAccountAnchor — null when neither identity exists or values are non-strings', () => {
+  assert.equal(readClaudeAccountAnchor(fakeFs({ [AT('.claude.json')]: JSON.stringify({ numStartups: 3 }) })), null);
+  assert.equal(readClaudeAccountAnchor(fakeFs({ [AT('.claude.json')]: JSON.stringify({ userID: 42 }) })), null);
+  assert.equal(readClaudeAccountAnchor(fakeFs({ [AT('.claude.json')]: '{not json' })), null);
+  assert.equal(readClaudeAccountAnchor(fakeFs({})), null);
 });

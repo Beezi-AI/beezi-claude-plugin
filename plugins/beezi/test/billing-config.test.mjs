@@ -13,6 +13,9 @@ import {
   resolveSource,
   hasFreshApiKeyEvidence,
   recordApiKeyEvidence,
+  isFreshCliCapture,
+  isPlanUnresolvable,
+  hasRecentStatuslineObservation,
 } from '../lib/billing-config.mjs';
 
 function withTempHome(fn) {
@@ -101,9 +104,10 @@ const SUB_CONFIG = Object.freeze({
   plan: 'max_5x',
 });
 
-// Always injected: the real reader would hit the developer's own ~/.claude.json.
-const withAccount = { readClaudeAccount: () => ({ subscriptionType: 'max' }) };
-const noAccount = { readClaudeAccount: () => null };
+// Always injected: the real readers would hit the developer's own ~/.claude.json and
+// ~/.beezi/statusline-usage.json.
+const withAccount = { readClaudeAccount: () => ({ subscriptionType: 'max' }), hasStatuslineObservation: () => false };
+const noAccount = { readClaudeAccount: () => null, hasStatuslineObservation: () => false };
 
 test('resolveBilling — a readable account resolves subscription and emits the plan fields', () => {
   assert.deepEqual(resolveBilling(SUB_CONFIG, {}, withAccount), {
@@ -122,7 +126,7 @@ test('resolveBilling — no account and no env signal reports unknown, not a gue
 });
 
 test('resolveBilling — an unreadable ~/.claude.json degrades to unknown rather than throwing', () => {
-  const throwing = { readClaudeAccount: () => { throw new Error('EACCES'); } };
+  const throwing = { readClaudeAccount: () => { throw new Error('EACCES'); }, hasStatuslineObservation: () => false };
   assert.deepEqual(resolveBilling(SUB_CONFIG, {}, throwing), { billing_source: 'unknown' });
 });
 
@@ -214,7 +218,7 @@ test('syncBillingSource — realigns back to subscription with the plan still in
 
 test('recordApiKeyEvidence — stamps a machine with no billing.json at all', () => {
   const rec = recordApiKeyEvidence(null, new Date(1_000_000_000_000));
-  assert.equal(rec.version, 1);
+  assert.equal(rec.version, 4);
   assert.equal(rec.apiKeyEvidenceAt, new Date(1_000_000_000_000).toISOString());
 });
 
@@ -351,4 +355,197 @@ test('resolveBilling — an undeclared gateway machine reports unknown and nothi
     resolveBilling({ source: 'subscription', plan: 'team' }, { ANTHROPIC_BASE_URL: 'https://gw.corp.example' }, withAccount),
     { billing_source: 'unknown' },
   );
+});
+
+// ─── CLI-observed captures and statusline observations as subscription evidence ──
+
+const NOW = 1_000_000_000_000;
+const cliCapture = (over = {}) => ({
+  version: 2,
+  source: 'subscription',
+  subscriptionType: 'max',
+  rateLimitTier: null,
+  plan: 'max',
+  capturedAt: new Date(NOW - 60_000).toISOString(),
+  detectedVia: 'cli_status',
+  ...over,
+});
+
+test('isFreshCliCapture — a recent cli_status/merged capture with a real plan counts', () => {
+  assert.equal(isFreshCliCapture(cliCapture(), NOW), true);
+  assert.equal(isFreshCliCapture(cliCapture({ detectedVia: 'merged' }), NOW), true);
+});
+
+test('isFreshCliCapture — stale, self-reported, planless, or differently-sourced captures do not', () => {
+  assert.equal(isFreshCliCapture(null, NOW), false);
+  assert.equal(isFreshCliCapture(cliCapture({ capturedAt: new Date(NOW - 8 * DAY).toISOString() }), NOW), false);
+  assert.equal(isFreshCliCapture(cliCapture({ selfReported: true }), NOW), false);
+  assert.equal(isFreshCliCapture(cliCapture({ plan: 'unknown' }), NOW), false);
+  assert.equal(isFreshCliCapture(cliCapture({ plan: null }), NOW), false);
+  assert.equal(isFreshCliCapture(cliCapture({ detectedVia: 'oauth_account' }), NOW), false);
+  assert.equal(isFreshCliCapture(cliCapture({ detectedVia: null }), NOW), false);
+  // Clock-skewed future stamp must not pin the source.
+  assert.equal(isFreshCliCapture(cliCapture({ capturedAt: new Date(NOW + DAY).toISOString() }), NOW), false);
+});
+
+test('resolveSource — a fresh CLI capture resolves subscription for a machine with no oauthAccount', () => {
+  assert.equal(resolveSource(cliCapture(), {}, { ...noAccount, now: NOW }), 'subscription');
+});
+
+test('resolveSource — a stale CLI capture is no longer evidence', () => {
+  const config = cliCapture({ capturedAt: new Date(NOW - 8 * DAY).toISOString() });
+  assert.equal(resolveSource(config, {}, { ...noAccount, now: NOW }), 'unknown');
+});
+
+test('resolveSource — a recent statusline observation resolves subscription', () => {
+  const deps = { readClaudeAccount: () => null, hasStatuslineObservation: () => true };
+  assert.equal(resolveSource(null, {}, deps), 'subscription');
+});
+
+test('resolveSource — a custom gateway is never answered by CLI captures or observations', () => {
+  const gatewayEnv2 = { ANTHROPIC_BASE_URL: 'https://gw.corp.example' };
+  assert.equal(resolveSource(cliCapture(), gatewayEnv2, { ...noAccount, now: NOW }), 'unknown');
+  const deps = { readClaudeAccount: () => null, hasStatuslineObservation: () => true };
+  assert.equal(resolveSource(null, gatewayEnv2, deps), 'unknown');
+});
+
+test('resolveSource — a throwing observation reader degrades silently', () => {
+  const deps = { readClaudeAccount: () => null, hasStatuslineObservation: () => { throw new Error('EACCES'); } };
+  assert.equal(resolveSource(null, {}, deps), 'unknown');
+});
+
+test('hasRecentStatuslineObservation — freshness window on lastRecordedAt', () => {
+  const read = (state) => ({ readJson: () => state });
+  assert.equal(hasRecentStatuslineObservation(NOW, read({ lastRecordedAt: new Date(NOW - 60_000).toISOString() })), true);
+  assert.equal(hasRecentStatuslineObservation(NOW, read({ lastRecordedAt: new Date(NOW - 8 * DAY).toISOString() })), false);
+  assert.equal(hasRecentStatuslineObservation(NOW, read({ lastRecordedAt: new Date(NOW + DAY).toISOString() })), false);
+  assert.equal(hasRecentStatuslineObservation(NOW, read({})), false);
+  assert.equal(hasRecentStatuslineObservation(NOW, read(null)), false);
+  assert.equal(hasRecentStatuslineObservation(NOW, { readJson: () => { throw new Error('bad'); } }), false);
+});
+
+test('v1 configs read back untouched — every reader tolerates the old schema', () => {
+  withTempHome(() => {
+    const v1 = { version: 1, source: 'subscription', plan: 'max_20x', capturedAt: new Date(NOW).toISOString() };
+    writeBillingConfig(v1);
+    assert.deepEqual(readBillingConfig(), v1);
+    assert.equal(isFreshCliCapture(readBillingConfig(), NOW), false, 'no detectedVia — not CLI evidence');
+    assert.deepEqual(
+      subscriptionReportFields('subscription', readBillingConfig()),
+      { subscription_type: null, rate_limit_tier: null, subscription_plan: 'max_20x' },
+    );
+  });
+});
+
+// ─── a plan that is unresolvable, not stale ──────────────────────────────────
+//
+// planSource 'unresolved' records that the capture ASKED and was told the credential in force is a
+// setup token, so no local source can name a plan. billing.mjs forces SUBSCRIPTION on a truthy
+// CLAUDE_CODE_OAUTH_TOKEN, which is why both gates below matter: the source still says
+// subscription, and nothing else stands between a plan we know is someone else's and the wire.
+
+const UNRESOLVED_CONFIG = Object.freeze({
+  version: 3,
+  source: 'subscription',
+  subscriptionType: null,
+  rateLimitTier: null,
+  plan: null,
+  planSource: 'unresolved',
+  detectedVia: 'oauth_token',
+  capturedAt: new Date(1_000_000_000_000).toISOString(),
+});
+
+test('isPlanUnresolvable — only the explicit verdict counts', () => {
+  assert.equal(isPlanUnresolvable(UNRESOLVED_CONFIG), true);
+  assert.equal(isPlanUnresolvable({ source: 'subscription', plan: null }), false, 'a gap is not a verdict');
+  assert.equal(isPlanUnresolvable({ planSource: 'claude_login' }), false);
+  assert.equal(isPlanUnresolvable(null), false);
+});
+
+test('isStale — an unresolvable plan is NOT stale (re-reading it cannot help)', () => {
+  const now = 1_000_000_000_000;
+  // Same shape a month old: age is irrelevant when the answer cannot change locally.
+  assert.equal(isStale(UNRESOLVED_CONFIG, now), false);
+  assert.equal(isStale({ ...UNRESOLVED_CONFIG, capturedAt: new Date(now - 30 * DAY).toISOString() }, now), false);
+  // The gate has to sit ABOVE the missing-plan check, which plan:null would otherwise trip.
+  assert.equal(isStale({ ...UNRESOLVED_CONFIG, planSource: 'claude_login' }, now), true);
+});
+
+test('subscriptionReportFields — omits all three plan keys for an unresolvable plan', () => {
+  const fields = subscriptionReportFields('subscription', UNRESOLVED_CONFIG);
+  assert.deepEqual(fields, {}, 'omitted, not explicit nulls — this client has no plan to assert');
+  assert.equal('subscription_type' in fields, false);
+  assert.equal('rate_limit_tier' in fields, false);
+  assert.equal('subscription_plan' in fields, false);
+});
+
+test('resolveBilling — an unresolvable plan still reports billing_source subscription', () => {
+  // Injected readers everywhere, like the rest of this suite: the real ones would reach the
+  // developer's own ~/.claude.json and statusline-usage.json and make the result machine-dependent.
+  const payload = resolveBilling(UNRESOLVED_CONFIG, { CLAUDE_CODE_OAUTH_TOKEN: `sk-ant-oat01-${'y'.repeat(40)}` }, noAccount);
+  assert.equal(payload.billing_source, 'subscription');
+  assert.deepEqual(Object.keys(payload), ['billing_source']);
+});
+
+test('subscriptionReportFields — a resolved plan is unaffected (explicit values, nulls included)', () => {
+  const cfg = { source: 'subscription', subscriptionType: 'max', rateLimitTier: null, plan: 'max', planSource: 'claude_login' };
+  assert.deepEqual(subscriptionReportFields('subscription', cfg), {
+    subscription_type: 'max',
+    rate_limit_tier: null,
+    subscription_plan: 'max',
+  });
+});
+
+test('isFreshCliCapture — an unresolvable capture is not subscription-source evidence of a plan', () => {
+  assert.equal(isFreshCliCapture(UNRESOLVED_CONFIG, 1_000_000_000_000), false);
+});
+
+test('isFreshCliCapture — a server-resolved key plan counts, whatever detectedVia was left behind', () => {
+  const now = 1_000_000_000_000;
+  // The exact shape recordResolvedKeyPlan writes: it SPREADS the existing config, so the previous
+  // login's detectedVia rides along next to a plan that came from the portal.
+  const cfg = {
+    source: 'subscription',
+    plan: 'pro',
+    planSource: 'key_resolution',
+    planResolvedAt: new Date(now).toISOString(),
+    capturedAt: new Date(now).toISOString(),
+    detectedVia: 'cli_status',
+  };
+  assert.equal(isFreshCliCapture(cfg, now), true);
+  // …and with no detectedVia at all, which is the shape on a machine that never logged in.
+  assert.equal(isFreshCliCapture({ ...cfg, detectedVia: null }, now), true);
+  // Provenance is still required: a plan with neither marker is not evidence.
+  assert.equal(isFreshCliCapture({ ...cfg, planSource: null, detectedVia: null }, now), false);
+});
+
+test('a cleared plan later resolved by the portal reports the plan and omits what nothing observed', () => {
+  const now = 1_000_000_000_000;
+  // Step 1: the capture cleared the tuple (setup token in force) — nothing on the wire.
+  assert.deepEqual(subscriptionReportFields('subscription', UNRESOLVED_CONFIG), {});
+  // Step 2: recordResolvedKeyPlan spreads that config and names a plan. It deliberately does NOT
+  // synthesize subscriptionType/rateLimitTier — the server named a plan, not a tier — and because
+  // the clear already nulled them there is no leftover `max` to contradict a resolved `pro`.
+  const resolved = {
+    ...UNRESOLVED_CONFIG,
+    plan: 'pro',
+    planSource: 'key_resolution',
+    planResolvedAt: new Date(now).toISOString(),
+    capturedAt: new Date(now).toISOString(),
+  };
+  assert.equal(isPlanUnresolvable(resolved), false, 'the portal answered — no longer unresolvable');
+  assert.deepEqual(subscriptionReportFields('subscription', resolved), {
+    subscription_type: null,
+    rate_limit_tier: null,
+    subscription_plan: 'pro',
+  });
+  assert.equal(isStale(resolved, now), false, 'the restamped capturedAt keeps the nudge quiet');
+});
+
+test('isStale — an unresolvable config carries no expiry to fire a false nudge with', () => {
+  const now = 1_000_000_000_000;
+  // credentialsExpiresAt is the second route to "missing or stale": the clear writes null, and the
+  // unresolvable gate sits above the expiry check anyway.
+  assert.equal(UNRESOLVED_CONFIG.credentialsExpiresAt, undefined);
+  assert.equal(isStale({ ...UNRESOLVED_CONFIG, credentialsExpiresAt: now - 1 }, now), false);
 });

@@ -1,6 +1,6 @@
 import { readHookInput } from '../lib/hook-input.mjs';
-import { pingUsageSnapshot } from '../lib/usage-ping.mjs';
-import { exitClean } from '../lib/shutdown.mjs';
+import { runHook, importHookModule } from '../lib/hook-runner.mjs';
+import { DIAGNOSTIC_SOURCES } from '../lib/telemetry-codes.mjs';
 
 // Captures Claude Code's subscription-limit cache at moments runCheckpoint does not cover:
 // every prompt, before a compaction, and when a subagent finishes. Turn end and session end
@@ -9,6 +9,7 @@ import { exitClean } from '../lib/shutdown.mjs';
 // Silent by design: it prints nothing and always exits 0, so it can never annotate a turn or
 // block one. The common case is a single stat() of ~/.claude.json and an immediate exit.
 readHookInput();
-pingUsageSnapshot()
-  .catch(() => {})
-  .finally(() => exitClean(0));
+runHook(DIAGNOSTIC_SOURCES.USAGE_PING, async () => {
+  const mod = await importHookModule('./usage-ping.mjs');
+  if (mod != null) await mod.pingUsageSnapshot();
+});

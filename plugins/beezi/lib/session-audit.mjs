@@ -1,6 +1,6 @@
 import fs from 'fs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
-import { runCheckpoint as _runCheckpoint } from './checkpoint.mjs';
+import { runCheckpoint as _runCheckpoint, flushQueue as _flushQueue } from './checkpoint.mjs';
 import { listAllTranscripts as _listAllTranscripts, firstRecordedCwd as _firstRecordedCwd } from './transcript-index.mjs';
 import {
   loadLedger as _loadLedger,
@@ -21,6 +21,8 @@ import {
   MAX_BODY_BYTES,
   MAX_CHUNK_ITEMS,
 } from './audit-flush.mjs';
+import { ENDPOINTS } from './config.mjs';
+import { fetchCoverage as _fetchCoverage } from './session-coverage.mjs';
 import { computeSessionTimeline as _computeSessionTimeline } from './session-timeline.mjs';
 import { postSessionError as _postSessionError } from './session-error-report.mjs';
 import { resolveSessionTranscript } from './transcript.mjs';
@@ -48,6 +50,9 @@ const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const FOLLOWUP_CONCURRENCY = 4;
 
 const AUDIT_TIMEOUT_MS = 60_000;
+
+// Repeatable history sync (/beezi:sync) rather than the one-time pull driven by /beezi:login.
+export const SYNC_MODE = 'sync';
 
 // A transcript touched this recently is probably an OPEN session in another window: its hooks are
 // mid-flight between checkpoints, and backfilling it would re-segment the same lines on different
@@ -131,6 +136,9 @@ async function mapLimited(items, limit, worker) {
 // blocking would deadlock the seal forever.
 export function shouldFinalize(result, options = {}) {
   if (!result.ok) return false;
+  // /beezi:sync is repeatable by definition; sealing the one-time pull from it would lock the user
+  // out of the very command they just ran.
+  if (options.mode === SYNC_MODE) return false;
   if (options.dryRun === true) return false;
   if (options.sinceMs != null) return false;
   if (result.halt !== null) return false;
@@ -165,6 +173,8 @@ export async function runAudit(deps = {}, options = {}) {
   const completeBackfill = deps.completeBackfillImpl == null ? _completeBackfill : deps.completeBackfillImpl;
   const loadLedger = deps.loadLedgerImpl == null ? _loadLedger : deps.loadLedgerImpl;
   const saveLedger = deps.saveLedgerImpl == null ? _saveLedger : deps.saveLedgerImpl;
+  const fetchCoverage = deps.fetchCoverageImpl == null ? _fetchCoverage : deps.fetchCoverageImpl;
+  const flushQueue = deps.flushQueueImpl == null ? _flushQueue : deps.flushQueueImpl;
   const computeSessionTimeline = deps.computeSessionTimelineImpl == null ? _computeSessionTimeline : deps.computeSessionTimelineImpl;
   const postSessionError = deps.postSessionErrorImpl == null ? _postSessionError : deps.postSessionErrorImpl;
   const readTracking = deps.readTrackingStateImpl == null ? readTrackingState : deps.readTrackingStateImpl;
@@ -221,6 +231,8 @@ export async function runAudit(deps = {}, options = {}) {
     // audit window is the only reason to run again, so the summary points at an upgrade.
     upgradeAdvised: false,
     followupsAllowed: true,
+    // Sync only: false means the server could not answer, so this run resumed from local cursors.
+    coverageKnown: false,
     timelines: 0,
     // Client-side twin of `timelines` (which is purely the server's number), so a gap between
     // what we sent and what landed is attributable instead of a bare unexplained difference.
@@ -240,12 +252,15 @@ export async function runAudit(deps = {}, options = {}) {
   // ledger and tracking cache (a new login mints a new id, so a workspace switch invalidates
   // both instead of sealing the new tenant's pull empty).
   const identity = getMachineClientId();
+  // Sync drops every gate that encodes one-timeness and every skip keyed on the session id alone;
+  // the server's per-session line coverage decides what is already uploaded.
+  const syncMode = options.mode === SYNC_MODE;
   const tracking = readTracking();
   const trackingValid = matchesIdentity(tracking, identity);
 
   // Fast path: the local cache already knows the pull is sealed. --force skips the LOCAL
   // caches only — the server verdict below is never bypassed.
-  if (!options.force && trackingValid && tracking != null && tracking.backfillCompleted === true) {
+  if (!syncMode && !options.force && trackingValid && tracking != null && tracking.backfillCompleted === true) {
     result.ok = true;
     result.reason = 'already-completed';
     result.upgradeAdvised = tracking.trackingMode != null && tracking.trackingMode !== TrackingMode.LIVE;
@@ -259,7 +274,7 @@ export async function runAudit(deps = {}, options = {}) {
   const who = await whoamiImpl(token, { fetchImpl }).catch(() => null);
   if (who != null && who.valid) {
     try { recordWhoamiImpl(who, identity); } catch { /* best-effort */ }
-    if (who.backfillCompleted === true) {
+    if (!syncMode && who.backfillCompleted === true) {
       try { markCompleted(); } catch { /* best-effort */ }
       result.ok = true;
       result.reason = 'already-completed';
@@ -269,10 +284,18 @@ export async function runAudit(deps = {}, options = {}) {
   }
 
   const ledger = loadLedger(identity);
-  if (!options.force && isComplete(ledger)) {
+  if (!syncMode && !options.force && isComplete(ledger)) {
     result.ok = true;
     result.reason = 'already-completed';
     return result;
+  }
+
+  // Drain the live queue FIRST. A settled session can still hold an undelivered narrow window in
+  // queue/<segmentId>.json; if it landed after this run's wide re-send, the server would hold a
+  // narrow row inside a wider one — the one direction its containment supersede cannot dedupe, so
+  // both would count in every SUM. Draining first also makes the coverage answer below current.
+  if (syncMode) {
+    try { await flushQueue(token, { fetchImpl }); } catch { /* best-effort; coverage still bounds us */ }
   }
 
   const live = liveSessionId(env, deps);
@@ -283,7 +306,9 @@ export async function runAudit(deps = {}, options = {}) {
   // would double-count once its per-session cursor was pruned. Dark-mode tenants never tracked
   // live, so every transcript is fair game.
   const liveMode = trackingValid && tracking != null && tracking.trackingMode === TrackingMode.LIVE;
-  const linkCutoffMs = liveMode ? linkedAtMs(tracking, deps) : null;
+  // Sync keeps post-link sessions in scope on purpose: a session whose hooks died after 200 of 900
+  // lines is exactly what it exists to repair, and coverage stops it re-sending what already landed.
+  const linkCutoffMs = liveMode && !syncMode ? linkedAtMs(tracking, deps) : null;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
 
   const candidates = [];
@@ -291,12 +316,22 @@ export async function runAudit(deps = {}, options = {}) {
     if (live && entry.sessionId === live) { result.live += 1; continue; }
     if (entry.mtimeMs > activeCutoffMs) { result.active += 1; continue; }
     if (linkCutoffMs != null && entry.mtimeMs >= linkCutoffMs) { result.liveTracked += 1; continue; }
-    if (!options.force && isImported(ledger, entry.sessionId)) { result.alreadyImported += 1; continue; }
+    // Session-keyed, so it goes stale the moment a session grows — coverage supersedes it in sync.
+    if (!syncMode && !options.force && isImported(ledger, entry.sessionId)) { result.alreadyImported += 1; continue; }
     if (options.sinceMs != null && entry.mtimeMs < options.sinceMs) continue;
     if (entry.size > MAX_TRANSCRIPT_BYTES) { result.oversize += 1; continue; }
     candidates.push(entry);
   }
   result.candidates = candidates.length;
+
+  // One batched question for the whole run: how far does the server already reach in each session.
+  // Null (old server, transport failure) means the answer cannot be trusted, so every session falls
+  // back to its local cursor rather than re-sending from line 0 on a blip.
+  let coverage = null;
+  if (syncMode && candidates.length > 0) {
+    coverage = await fetchCoverage(candidates.map((entry) => entry.sessionId), token, { fetchImpl });
+    result.coverageKnown = coverage != null;
+  }
 
   const finalize = async () => {
     if (!shouldFinalize(result, options)) return;
@@ -343,7 +378,12 @@ export async function runAudit(deps = {}, options = {}) {
       return;
     }
 
-    const flushed = await flushBackfillChunks(batch, token, { fetchImpl }, { timeoutMs: AUDIT_TIMEOUT_MS });
+    const flushed = await flushBackfillChunks(
+      batch,
+      token,
+      { fetchImpl },
+      { timeoutMs: AUDIT_TIMEOUT_MS, endpoint: syncMode ? ENDPOINTS.sessionsSync : ENDPOINTS.sessionsBackfill },
+    );
     result.plannedChunks += flushed.chunks;
     result.timelinesDropped += flushed.timelinesDropped == null ? 0 : flushed.timelinesDropped;
     result.reportsStored += flushed.stored;
@@ -438,6 +478,14 @@ export async function runAudit(deps = {}, options = {}) {
     unreadableDirty = true;
   };
 
+  // computeDelta counts lines already consumed, and the server reports to_line 1-based inclusive, so
+  // a coverage of N maps straight onto a start cursor of N — the next window opens at line N+1.
+  const startCursorFor = (sessionId) => {
+    if (coverage == null) return null;
+    const covered = coverage.get(sessionId);
+    return covered == null ? 0 : covered;
+  };
+
   // Parsing itself stays strictly sequential. computeDelta reads and JSON.parses the whole
   // transcript, so parsing sessions in parallel multiplies peak memory with no gain on a
   // single thread.
@@ -460,6 +508,7 @@ export async function runAudit(deps = {}, options = {}) {
           collectSessionErrors: true,
           persistState: false,
           skipLiveTrackingGate: true,
+          startCursor: startCursorFor(entry.sessionId),
         },
       );
       sessionErrors = checkpoint == null || checkpoint.sessionErrors == null ? [] : checkpoint.sessionErrors;

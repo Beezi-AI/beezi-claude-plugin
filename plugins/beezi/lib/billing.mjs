@@ -132,6 +132,10 @@ export function normalizePlan(subscriptionType, rateLimitTier) {
   if (tier.includes('max_20x')) return 'max_20x';
   if (tier.includes('max_5x')) return 'max_5x';
   const type = String(subscriptionType == null ? '' : subscriptionType).toLowerCase();
+  // Symmetric with the tier arm above: a source that puts the multiplier in the product field
+  // would otherwise miss every exact-equality branch below and degrade to 'unknown'.
+  if (type.includes('max_20x')) return 'max_20x';
+  if (type.includes('max_5x')) return 'max_5x';
   if (type === 'enterprise') return 'enterprise';
   if (type === 'team') return 'team';
   if (type === 'max') return 'max';
