@@ -1,5 +1,6 @@
 import fs from 'fs';
-import { getAccessToken as _getAccessToken } from './token.mjs';
+import { getAuthentication as _getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from './token.mjs';
+import { AUTH_STATES } from './auth-state.mjs';
 import { runCheckpoint as _runCheckpoint, flushQueue as _flushQueue } from './checkpoint.mjs';
 import { listAllTranscripts as _listAllTranscripts, firstRecordedCwd as _firstRecordedCwd } from './transcript-index.mjs';
 import {
@@ -165,7 +166,7 @@ export function shouldFinalize(result, options = {}) {
 // live-only follow-up — and only for sessions the server judged accepted, so a failed session
 // stays fully retryable.
 export async function runAudit(deps = {}, options = {}) {
-  const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
+  const getAuthentication = deps.getAuthentication == null ? _getAuthentication : deps.getAuthentication;
   const listTranscripts = deps.listTranscripts == null ? _listAllTranscripts : deps.listTranscripts;
   const recordedCwd = deps.firstRecordedCwd == null ? _firstRecordedCwd : deps.firstRecordedCwd;
   const runCheckpoint = deps.runCheckpointImpl == null ? _runCheckpoint : deps.runCheckpointImpl;
@@ -242,9 +243,24 @@ export async function runAudit(deps = {}, options = {}) {
     lastError: null,
   };
 
-  const token = await getAccessToken().catch(() => null);
+  // The typed accessor, not the collapsing wrapper. Backfill runs as the last step of
+  // /beezi:login, so it has a human in front of it and can wait the interactive budget for a
+  // refresh already in flight. More importantly it must tell "this machine has no saved login"
+  // apart from "the credential store did not answer in time" — reporting the second as the first
+  // is what sent a correctly linked user through three logins, a logout and a reinstall.
+  let token = null;
+  let auth = null;
+  if (deps.getAccessToken != null) {
+    token = await deps.getAccessToken().catch(() => null); // historical seam, honoured as-is
+  } else {
+    auth = await getAuthentication({}, { waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
+    token = auth != null && auth.authState === AUTH_STATES.READY ? auth.accessToken : null;
+  }
   if (!token) {
-    result.reason = 'no-token';
+    const unlinked = auth == null || auth.authState === AUTH_STATES.UNLINKED;
+    result.reason = unlinked ? 'no-token' : 'auth-unavailable';
+    result.authState = auth == null ? null : auth.authState;
+    result.authReason = auth == null ? null : auth.reason;
     return result;
   }
 

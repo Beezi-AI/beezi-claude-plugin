@@ -33,6 +33,16 @@ async function main() {
   if (result.reason === 'no-token') {
     fail('Beezi: this machine is not linked. Run /beezi:login first.');
   }
+  // Linked, but the credential could not be read right now — a busy OS credential store, a
+  // refresh still in flight, a held lock. Signing in again fixes none of those and re-running
+  // login is what this message used to ask for, so it says the opposite: wait and retry.
+  if (result.reason === 'auth-unavailable') {
+    fail(
+      'Beezi: this machine is linked, but its saved login could not be read just now '
+        + `(${result.authReason == null ? result.authState : result.authReason}). `
+        + 'Nothing was removed — wait a moment and run /beezi:sync to finish the upload.',
+    );
+  }
 
   // The one-time import has been used — verified against the server before anything was parsed.
   // Inside the login flow this is a normal outcome; a direct/manual run is a rejected request.

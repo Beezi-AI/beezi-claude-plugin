@@ -66,6 +66,8 @@ function unavailableSentence(reason) {
   switch (reason) {
     case AUTH_REASONS.STORAGE_UNAVAILABLE:
       return 'could not read this machine’s saved login just now.';
+    case AUTH_REASONS.STORAGE_TIMEOUT:
+      return 'took too long reading this machine’s saved login — the OS credential store is busy.';
     case AUTH_REASONS.STORAGE_CONFLICT:
       return 'found two different saved logins on this machine; run /beezi:login to settle it.';
     case AUTH_REASONS.LOCK_TIMEOUT:

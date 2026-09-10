@@ -21,6 +21,10 @@ export const CREDENTIAL_STATUS = Object.freeze({
 
 export const UNAVAILABLE_REASONS = Object.freeze({
   BACKEND_UNREADABLE: 'backend_unreadable',
+  // The backend never answered — its helper was killed for taking too long. Distinct from
+  // BACKEND_UNREADABLE because it says nothing about whether the credential is still there, and
+  // the caller should say so rather than send the user to /beezi:login.
+  BACKEND_TIMEOUT: 'backend_timeout',
   ENTRY_MALFORMED: 'entry_malformed',
   BACKEND_MISSING: 'backend_missing',
   CONTROL_UNREADABLE: 'control_unreadable',
@@ -176,11 +180,27 @@ async function migrateLegacy(deps, heldLock) {
   }
 }
 
+// Spread the retries of readers that were killed together. The window is small enough that an
+// interactive command still feels immediate and large enough to break the lockstep.
+const RETRY_PAUSE_MIN_MS = 150;
+const RETRY_PAUSE_SPREAD_MS = 600;
+
+function retryPause(deps) {
+  const random = deps.randomImpl == null ? Math.random : deps.randomImpl;
+  const sleep = deps.sleepImpl == null
+    ? ((ms) => new Promise((resolve) => { setTimeout(resolve, ms); }))
+    : deps.sleepImpl;
+  return sleep(RETRY_PAUSE_MIN_MS + Math.floor(random() * RETRY_PAUSE_SPREAD_MS));
+}
+
 // ── public store API ──────────────────────────────────────────────────────────────────────────
 
 // { status: 'ready', generation, backend, credentials, migrated? } | { status: 'none' }
 // | { status: 'unavailable', reason, generation?, backend? } | { status: 'storage_conflict', sources }.
 // `options.lock` lets a caller that already holds the namespace lock reread without re-acquiring.
+// `options.interactive` says a human is waiting: the backend read gets the longer cap AND one more
+// attempt when its helper was killed before answering. Hooks must leave it off — their whole
+// budget is 10s and they still have work to do after the read.
 export async function readCredentials(deps = {}, options = {}) {
   const control = readControl();
   if (control.unreadable) {
@@ -193,8 +213,22 @@ export async function readCredentials(deps = {}, options = {}) {
   const b = backendByName(backend, deps);
   if (b == null) return unavailable(UNAVAILABLE_REASONS.BACKEND_MISSING);
   if (!b.available()) return unavailable(UNAVAILABLE_REASONS.BACKEND_UNREADABLE);
-  const raw = b.get(generationEntry(generation));
-  if (!raw) return unavailable(UNAVAILABLE_REASONS.BACKEND_UNREADABLE);
+  const entry = generationEntry(generation);
+  const interactive = options.interactive === true;
+  let attempt = b.read(entry, { interactive });
+  // A killed read says nothing about whether the credential is still there, so it is worth one
+  // more try — after a jittered pause, because the readers that lost the race are the ones that
+  // started together, and retrying them in lockstep just recreates the pile-up that killed them.
+  if (attempt.token == null && attempt.timedOut && interactive) {
+    await retryPause(deps);
+    attempt = b.read(entry, { interactive });
+  }
+  const raw = attempt.token;
+  if (!raw) {
+    return unavailable(
+      attempt.timedOut ? UNAVAILABLE_REASONS.BACKEND_TIMEOUT : UNAVAILABLE_REASONS.BACKEND_UNREADABLE,
+    );
+  }
   const credentials = parseCredentials(raw);
   if (!credentials) return unavailable(UNAVAILABLE_REASONS.ENTRY_MALFORMED);
   return { status: CREDENTIAL_STATUS.READY, generation, backend, credentials };

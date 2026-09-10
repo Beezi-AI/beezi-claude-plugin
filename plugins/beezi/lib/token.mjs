@@ -30,6 +30,7 @@ const POLL_MS = 50;
 // Storage failures the store distinguishes, flattened onto the pinned reason vocabulary.
 const STORAGE_REASONS = Object.freeze({
   [UNAVAILABLE_REASONS.LOCKED]: AUTH_REASONS.LOCK_TIMEOUT,
+  [UNAVAILABLE_REASONS.BACKEND_TIMEOUT]: AUTH_REASONS.STORAGE_TIMEOUT,
 });
 
 function result(authState, reason, extra) {
@@ -49,8 +50,15 @@ export async function getAuthentication(deps = {}, options = {}) {
   const now = deps.now == null ? Date.now : deps.now;
   const looksFresh = (c) => (c == null || c.expires_at == null ? 0 : c.expires_at) - now() > SKEW_MS;
 
+  // A caller that asked for more than the hook budget has a human waiting on it, so its store read
+  // gets the longer cap and a second attempt when the first is killed rather than answered. Hooks
+  // keep the fail-fast default: their whole budget is 10s and they still have work to do after.
+  const interactive = options.waitMs != null && options.waitMs > HOOK_REFRESH_WAIT_MS;
+
   let first;
-  try { first = await readCredentials(deps); } catch { first = null; }
+  try {
+    first = await readCredentials(deps, { interactive });
+  } catch { first = null; }
   if (first == null) return settle(result(AUTH_STATES.UNAVAILABLE, AUTH_REASONS.STORAGE_UNAVAILABLE));
   if (first.status === CREDENTIAL_STATUS.NONE) {
     return settle(result(AUTH_STATES.UNLINKED, AUTH_REASONS.NO_CREDENTIALS));

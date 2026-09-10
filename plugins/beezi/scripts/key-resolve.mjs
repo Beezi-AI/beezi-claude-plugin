@@ -1,4 +1,5 @@
-import { getAccessToken } from '../lib/token.mjs';
+import { getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from '../lib/token.mjs';
+import { AUTH_STATES } from '../lib/auth-state.mjs';
 import {
   fetchKeyResolution,
   submitKeyPlan,
@@ -86,13 +87,27 @@ function emit(object) {
 // re-derives the fingerprint from the env it is given, so a recovery that reached only `status`
 // would strand the user's answer on the very next invocation.
 
-async function runStatus(token, env) {
+async function runStatus(token, env, auth) {
   if (!token) {
-    emit({
-      ok: false,
-      status: 'not_linked',
-      message: 'Beezi: this machine is not linked. Run /beezi:login to link it.',
-    });
+    // `not_linked` is a verdict about the machine and the model turns it into "run /beezi:login".
+    // It may only be said when the store actually answered "there is nothing here". A store that
+    // was too busy to answer gets its own status, so the model stops proposing a login that
+    // cannot help — the misreport that had this user log in three times and reinstall.
+    const unlinked = auth == null || auth.authState === AUTH_STATES.UNLINKED;
+    emit(unlinked
+      ? {
+        ok: false,
+        status: 'not_linked',
+        message: 'Beezi: this machine is not linked. Run /beezi:login to link it.',
+      }
+      : {
+        ok: false,
+        status: 'auth_unavailable',
+        authState: auth.authState,
+        authReason: auth.reason,
+        message: 'Beezi: this machine is linked, but its saved login could not be read just now. '
+          + 'Nothing was removed — try /beezi:refresh again in a moment.',
+      });
     return;
   }
   // Answered before any request, and with the SAME predicate the fingerprint uses, so the two
@@ -162,11 +177,12 @@ async function runStatus(token, env) {
 
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
-  const token = await getAccessToken().catch(() => null);
+  const auth = await getAuthentication({}, { waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
+  const token = auth != null && auth.authState === AUTH_STATES.READY ? auth.accessToken : null;
   const env = oauthTokenEnvWithOsProbe(process.env);
 
   if (parsed.mode === 'status') {
-    await runStatus(token, env);
+    await runStatus(token, env, auth);
     return;
   }
 

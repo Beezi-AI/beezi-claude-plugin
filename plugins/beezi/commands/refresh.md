@@ -32,6 +32,7 @@ It prints exactly one JSON object. Read `status` from it and do exactly this:
 | `"unlinked"`                      | Continue to Step 1a — this is the case worth asking about.                                   |
 | `"unavailable"`                   | Report the object's `message` verbatim. **Stop — do not run Step 2.**                        |
 | `"no_key"` / `"not_linked"`       | Report the object's `message` verbatim, then continue to Step 2. `"no_key"` means this machine is not on a setup token at all, so the local capture is the right answer for it. |
+| `"auth_unavailable"`              | Report the object's `message` verbatim. This machine IS linked — the saved login just could not be read this moment (a busy OS credential store, a renewal in flight). Never suggest `/beezi:login`: there is nothing wrong with the link and signing in again fixes nothing. **Stop — do not run Step 2.** |
 | `null` (a JSON null, not a string) | The server answered something this plugin does not understand, so the key's subscription cannot be resolved right now. Say exactly that and suggest trying again later. **Stop — do not run Step 2.** |
 
 Whichever row you land on, never state a subscription plan that did not come out

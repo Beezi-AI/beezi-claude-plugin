@@ -15,6 +15,7 @@ export const AUTH_REASONS = Object.freeze({
   NO_CREDENTIALS: 'no_credentials',
   LOGGED_OUT: 'logged_out',
   STORAGE_UNAVAILABLE: 'storage_unavailable',
+  STORAGE_TIMEOUT: 'storage_timeout',
   STORAGE_CONFLICT: 'storage_conflict',
   LOCK_TIMEOUT: 'lock_timeout',
   REFRESH_IN_PROGRESS: 'refresh_in_progress',
