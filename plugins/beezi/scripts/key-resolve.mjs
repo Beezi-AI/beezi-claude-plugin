@@ -116,17 +116,24 @@ async function runStatus(token, env, auth) {
   // here means the machine genuinely has none — not merely that Claude Code scrubbed it out of
   // this process, which by itself is true of every session.
   if (!hasOauthTokenIdentity(env)) {
-    // Deliberately NOT phrased as "you have no setup token". One home of the token stays invisible
+    // The overwhelming majority of machines reaching this line have never heard of a setup token,
+    // and the command's own answer for them is the ordinary local capture that follows. So the
+    // message says what happens next in one plain sentence, and /beezi:refresh prints nothing for
+    // this status at all — a paragraph about CLAUDE_CODE_OAUTH_TOKEN, its scrubbing and where to
+    // re-home it was the loudest thing in the command for the users it least applied to.
+    //
+    // `hint` carries what that paragraph was for, unprinted. One home of the token stays invisible
     // from here whatever we do: a plain `export CLAUDE_CODE_OAUTH_TOKEN=...` in a shell profile is
     // the documented, most common way to set one, and Claude Code deletes the variable from every
     // subprocess it spawns — this script included — so an exported token that the session is
-    // actively authenticating with reaches us as nothing at all. Saying it does not exist would be
-    // specifically false for exactly those users, so this names the scrub and the one form we can
-    // read instead.
+    // actively authenticating with reaches us as nothing at all. Those users are exactly the ones
+    // the local capture answers wrongly (it reads a previous login's leftovers), and this field is
+    // what a support conversation or a log has to explain it with.
     emit({
       ok: false,
       status: 'no_key',
-      message: 'Beezi: no Claude setup token (CLAUDE_CODE_OAUTH_TOKEN) is visible from here. Claude Code removes that variable from every command it runs, so a token exported in your shell profile cannot be seen by this plugin even while your session is using it. If you have one, add it to the "env" block of ~/.claude/settings.json (or set it in your Windows user environment) and run /beezi:refresh again. If you have not set one, there is no key to resolve.',
+      message: 'Beezi: this machine does not sign in with a Claude setup token — its plan is read from the Claude login instead.',
+      hint: 'A setup token exported in a shell profile is invisible to this plugin: Claude Code removes CLAUDE_CODE_OAUTH_TOKEN from every command it runs. Put it in the "env" block of ~/.claude/settings.json (or the OS user environment) if this machine uses one.',
     });
     return;
   }

@@ -31,7 +31,8 @@ It prints exactly one JSON object. Read `status` from it and do exactly this:
 | `"unknown_key"`                   | The command already tried to register this key and ask again; reaching this row means that did not work. Say Beezi could not register this key with the server yet and to try `/beezi:refresh` again later. **Stop — do not run Step 2.** |
 | `"unlinked"`                      | Continue to Step 1a — this is the case worth asking about.                                   |
 | `"unavailable"`                   | Report the object's `message` verbatim. **Stop — do not run Step 2.**                        |
-| `"no_key"` / `"not_linked"`       | Report the object's `message` verbatim, then continue to Step 2. `"no_key"` means this machine is not on a setup token at all, so the local capture is the right answer for it. |
+| `"no_key"`                        | Say NOTHING about this step — do not print the object's `message`, do not mention setup tokens, `CLAUDE_CODE_OAUTH_TOKEN` or this check at all. This machine is not on a setup token, so the question did not apply to it and the local capture is its real answer. Go straight to Step 2; its one line is the whole output the user sees. |
+| `"not_linked"`                    | Report the object's `message` verbatim, then continue to Step 2. |
 | `"auth_unavailable"`              | Report the object's `message` verbatim. This machine IS linked — the saved login just could not be read this moment (a busy OS credential store, a renewal in flight). Never suggest `/beezi:login`: there is nothing wrong with the link and signing in again fixes nothing. **Stop — do not run Step 2.** |
 | `null` (a JSON null, not a string) | The server answered something this plugin does not understand, so the key's subscription cannot be resolved right now. Say exactly that and suggest trying again later. **Stop — do not run Step 2.** |
 

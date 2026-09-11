@@ -23,5 +23,3 @@ Notes for interpreting the output:
 - If it says the portal does not support `/beezi:sync` yet, the workspace's Beezi
   server needs updating — the user's history is not lost, and the command will work
   after the update.
-- Sessions "still active" are open in another window; they upload on their own once
-  they settle. Do not offer to force them.

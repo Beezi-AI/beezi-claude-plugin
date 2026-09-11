@@ -175,3 +175,25 @@ function parseOriginUrl(text) {
   }
   return null;
 }
+
+// The repo key for one directory, resolved WITHOUT ever shelling out to git: the persisted map,
+// then a .git walk-up, then the repo's own config, then the `local:<folder>` stand-in.
+//
+// checkpoint.mjs resolves the same key with git FIRST and these as its fallbacks. The backfill's
+// cost-state fast path resolves one key per past session, where a git subprocess each would cost
+// more than the tail read the whole fast path exists to save — and a past session's checkout may
+// not even be on disk any more, in which case git answers nothing that this cannot.
+//
+// Returns null only for a null/empty dir. Never throws.
+export function resolveRemoteOffline(dir, map) {
+  if (!dir) return null;
+  let root = matchKnownRoot(dir, map);
+  if (root == null) root = findRepoRootByWalk(dir);
+  let remote = root == null ? null : knownOrigin(root, map);
+  if (remote == null && root != null) remote = originFromGitConfig(root);
+  if (remote) return remote;
+  // Same stand-in checkpoint.mjs falls back to, byte for byte: only the folder name travels, and
+  // the `local:` prefix keeps it from ever canonicalizing onto a real remote server-side.
+  const base = path.basename(root == null ? dir : root);
+  return base ? `local:${base}` : null;
+}

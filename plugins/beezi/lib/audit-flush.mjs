@@ -41,8 +41,8 @@ export const BackfillHalt = Object.freeze({
   FORBIDDEN: 'forbidden',
 });
 
-const wireBytes = (reports, timelines = []) =>
-  Buffer.byteLength(JSON.stringify({ sessions: reports, timelines }), 'utf-8');
+const wireBytes = (reports, timelines = [], costStates = []) =>
+  Buffer.byteLength(JSON.stringify({ sessions: reports, timelines, costStates }), 'utf-8');
 
 // Pack whole sessions into request-sized chunks of at most `maxItems` payloads / `maxBytes`.
 //
@@ -55,18 +55,43 @@ const wireBytes = (reports, timelines = []) =>
 // a split session — the server applies it once the session has stored anything). Timelines are
 // small next to the 1MB headroom over the route's 5mb limit, so the split path does not re-run
 // its byte math over them; the normal path counts them.
+//
+// A group's optional `costState` is the OTHER kind of session: one taking the backfill's
+// cost-state fast path carries that block INSTEAD of reports, so it never splits and never takes
+// the over-budget branch — it is one small item that packs like any other.
 export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes = MAX_BODY_BYTES } = {}) {
   const chunks = [];
   let current = null;
 
   const flushCurrent = () => {
-    if (current && current.reports.length > 0) chunks.push(current);
+    if (current && (current.reports.length > 0 || current.costStates.length > 0)) chunks.push(current);
     current = null;
+  };
+
+  const startCurrent = () => {
+    if (!current) current = { reports: [], sessionIds: [], timelines: [], costStates: [] };
+    return current;
   };
 
   for (const group of sessionGroups) {
     const reports = group.reports == null ? [] : group.reports;
-    if (reports.length === 0) continue;
+    const costState = group.costState == null ? null : group.costState;
+    if (reports.length === 0 && costState == null) continue;
+
+    if (reports.length === 0) {
+      // Cost-state-only session. One item, always well under the byte cap on its own.
+      if (
+        current &&
+        (current.reports.length + current.costStates.length + 1 > maxItems ||
+          wireBytes(current.reports, current.timelines, [...current.costStates, costState]) > maxBytes)
+      ) {
+        flushCurrent();
+      }
+      const chunk = startCurrent();
+      chunk.costStates.push(costState);
+      chunk.sessionIds.push(group.sessionId);
+      continue;
+    }
 
     if (reports.length > maxItems || wireBytes(reports) > maxBytes) {
       // Over-budget session: emit it alone, split by whichever cap binds first.
@@ -79,6 +104,7 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
           sessionIds: [group.sessionId],
           partialOf: group.sessionId,
           timelines: first && group.timeline ? [group.timeline] : [],
+          costStates: [],
         });
         first = false;
       };
@@ -97,18 +123,19 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
 
     if (
       current &&
-      (current.reports.length + reports.length > maxItems ||
+      (current.reports.length + current.costStates.length + reports.length > maxItems ||
         wireBytes(
           [...current.reports, ...reports],
           group.timeline ? [...current.timelines, group.timeline] : current.timelines,
+          current.costStates,
         ) > maxBytes)
     ) {
       flushCurrent();
     }
-    if (!current) current = { reports: [], sessionIds: [], timelines: [] };
-    current.reports.push(...reports);
-    current.sessionIds.push(group.sessionId);
-    if (group.timeline) current.timelines.push(group.timeline);
+    const chunk = startCurrent();
+    chunk.reports.push(...reports);
+    chunk.sessionIds.push(group.sessionId);
+    if (group.timeline) chunk.timelines.push(group.timeline);
   }
   flushCurrent();
   return chunks;
@@ -139,9 +166,11 @@ export async function readResponseBody(res) {
 // 2xx bodies carry chunk totals plus errors[{sessionId, segmentId, reason}] — a session is
 // accepted unless it appears there.
 //
-// sessionGroups: [{ sessionId, reports: payload[] }] — order preserved.
+// sessionGroups: [{ sessionId, reports: payload[], timeline?, costState? }] — order preserved. A
+// group carries EITHER reports (the segment path) or a costState (the backfill fast path).
 // Returns { chunks, stored, skipped, itemErrors, retryableFailures, permanentRejections,
-//           unattributed, bySession: Map, halt, lastError }.
+//           unattributed, costStatesStored, costStatesSkipped, costStatesUnsupported,
+//           bySession: Map, halt, lastError }.
 export async function flushBackfillChunks(sessionGroups, token, deps = {}, options = {}) {
   const postJsonImpl = deps.postJsonImpl == null ? postJson : deps.postJsonImpl;
   const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
@@ -159,6 +188,14 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
     // summary can say the sessions landed but their timelines did not, instead of leaving an
     // unexplained gap between offered and attached.
     timelinesDropped: 0,
+    // Cost-state blocks the server acknowledged. Kept apart from `stored`/`skipped`, which are
+    // segment-scoped and feed a different arithmetic in the summary.
+    costStatesStored: 0,
+    costStatesSkipped: 0,
+    // Set when the server does not understand the in-band cost-state half of a chunk — either it
+    // 400s the unknown field or it 2xxs without acknowledging it. Every session that rode on it is
+    // marked FAILED, so nothing is ledgered off an ack we never got.
+    costStatesUnsupported: false,
     itemErrors: 0,
     retryableFailures: 0,
     permanentRejections: 0,
@@ -184,17 +221,14 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
     return null;
   };
 
-  // `timelines` is omitted when empty so a chunk without them stays byte-identical to the
-  // pre-timeline wire shape.
-  const post = async (chunk) =>
-    postJsonImpl(
-      url,
-      token,
-      chunk.timelines != null && chunk.timelines.length
-        ? { sessions: chunk.reports, timelines: chunk.timelines }
-        : { sessions: chunk.reports },
-      { fetchImpl, timeoutMs },
-    );
+  // `timelines` and `costStates` are omitted when empty so a chunk without them stays
+  // byte-identical to the wire shape that predates each.
+  const post = async (chunk) => {
+    const body = { sessions: chunk.reports };
+    if (chunk.timelines != null && chunk.timelines.length) body.timelines = chunk.timelines;
+    if (chunk.costStates != null && chunk.costStates.length) body.costStates = chunk.costStates;
+    return postJsonImpl(url, token, body, { fetchImpl, timeoutMs });
+  };
 
   const setSession = (sessionId, status, reason) => {
     const existing = result.bySession.get(sessionId);
@@ -227,7 +261,52 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
       const count = sentBySession.get(report.sessionId);
       sentBySession.set(report.sessionId, (count == null ? 0 : count) + 1);
     }
+
+    // The chunk's cost-state half is judged by its OWN block in the response, never by errors[].
+    // That array is segment-scoped and a session named in it is ledgered as never-retry, so
+    // folding a cost-state rejection into it would permanently write off a session — including,
+    // on a mixed chunk, one whose segments stored perfectly well.
+    const costStateIds = new Set(
+      (chunk.costStates == null ? [] : chunk.costStates).map((item) => item.sessionId),
+    );
+    const costStateVerdicts = new Map();
+    const costStateBody = parsed.costStates == null ? null : parsed.costStates;
+    if (costStateBody != null) {
+      result.costStatesStored += typeof costStateBody.stored === 'number' ? costStateBody.stored : 0;
+      result.costStatesSkipped += typeof costStateBody.skipped === 'number' ? costStateBody.skipped : 0;
+      const costStateErrors = Array.isArray(costStateBody.errors) ? costStateBody.errors : [];
+      for (const entry of costStateErrors) {
+        if (entry == null || !entry.sessionId) continue;
+        // A write failure is the server's own transient trouble (a deadlock, a lost connection),
+        // so it stays RETRYABLE — REJECTED is ledgered and would never be attempted again. Every
+        // other reason is a verdict on the block itself and cannot improve on a re-run.
+        const retryable = entry.reason === 'write failed';
+        costStateVerdicts.set(entry.sessionId, {
+          status: retryable ? BackfillSessionStatus.FAILED : BackfillSessionStatus.REJECTED,
+          reason: entry.reason == null ? 'cost-state rejected' : entry.reason,
+        });
+      }
+    } else if (costStateIds.size > 0) {
+      // 2xx, but the server never acknowledged the cost-state half — a build that whitelists the
+      // field and drops it. Never ledger a session off an ack we did not get.
+      result.costStatesUnsupported = true;
+      result.lastError = 'coststates-not-acknowledged';
+    }
+
     for (const sessionId of new Set(chunk.sessionIds)) {
+      // Segments win when a session has both: they are the richer record, and in the fast path a
+      // session is only ever one kind or the other.
+      const sentAsSegments = sentBySession.get(sessionId);
+      if (costStateIds.has(sessionId) && (sentAsSegments == null || sentAsSegments === 0)) {
+        if (costStateBody == null) {
+          setSession(sessionId, BackfillSessionStatus.FAILED, 'coststates-not-acknowledged');
+          continue;
+        }
+        const verdict = costStateVerdicts.get(sessionId);
+        if (verdict == null) setSession(sessionId, BackfillSessionStatus.ACCEPTED);
+        else setSession(sessionId, verdict.status, verdict.reason);
+        continue;
+      }
       const sessionErrorList = errorsBySession.get(sessionId);
       const failedSegments = sessionErrorList == null ? 0 : sessionErrorList.length;
       const sentCount = sentBySession.get(sessionId);
@@ -341,19 +420,49 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
       return sendChunk({ ...chunk, timelines: [] }, depth);
     }
 
+    if (res.status === 400 && chunk.costStates != null && chunk.costStates.length && raw.includes('costStates')) {
+      // A server predating the in-band cost states 400s the whole chunk on the unknown field
+      // (forbidNonWhitelisted). Retry without them so the chunk's SEGMENT sessions still land —
+      // but unlike a dropped timeline, a dropped cost state is the session's entire usage, so its
+      // sessions are marked FAILED rather than quietly abandoned: they stay unledgered, the pull
+      // stays open, and the next login retries them against the deployed API.
+      result.costStatesUnsupported = true;
+      result.lastError = 'coststates-unsupported';
+      const costStateIds = new Set(chunk.costStates.map((item) => item.sessionId));
+      let goOn = true;
+      if (chunk.reports.length > 0) {
+        goOn = await sendChunk(
+          {
+            ...chunk,
+            costStates: [],
+            sessionIds: chunk.sessionIds.filter((id) => !costStateIds.has(id)),
+          },
+          depth,
+        );
+      }
+      for (const sessionId of costStateIds) {
+        setSession(sessionId, BackfillSessionStatus.FAILED, 'coststates-unsupported');
+      }
+      result.retryableFailures += 1;
+      return goOn;
+    }
+
     if (res.status === 400 && new Set(chunk.sessionIds).size > 1 && depth < MAX_BISECT_DEPTH) {
       // Whole-chunk validation failure: one malformed field anywhere 400s all 50 sessions.
       // Split at the session boundary nearest the midpoint and isolate the poison session
       // instead of losing (or endlessly resending) the innocent ones.
       const ids = [...new Set(chunk.sessionIds)];
       const splitIds = new Set(ids.slice(0, Math.ceil(ids.length / 2)));
-      const first = { reports: [], sessionIds: [], timelines: [] };
-      const second = { reports: [], sessionIds: [], timelines: [] };
+      const first = { reports: [], sessionIds: [], timelines: [], costStates: [] };
+      const second = { reports: [], sessionIds: [], timelines: [], costStates: [] };
       for (const report of chunk.reports) {
         (splitIds.has(report.sessionId) ? first : second).reports.push(report);
       }
       for (const timeline of (chunk.timelines == null ? [] : chunk.timelines)) {
         (splitIds.has(timeline.sessionId) ? first : second).timelines.push(timeline);
+      }
+      for (const costState of (chunk.costStates == null ? [] : chunk.costStates)) {
+        (splitIds.has(costState.sessionId) ? first : second).costStates.push(costState);
       }
       first.sessionIds = chunk.sessionIds.filter((id) => splitIds.has(id));
       second.sessionIds = chunk.sessionIds.filter((id) => !splitIds.has(id));

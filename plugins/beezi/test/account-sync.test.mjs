@@ -528,8 +528,9 @@ const STORED_FINGERPRINT = { prefix: 'sk-ant-oat01', last4: 'yyyy', length: 53 }
 // billing.json answers for the uuid, the email and the plan — never for which key is in force. Its
 // stored fingerprint is stamped from the same probed env this payload resolves, so it names no
 // token the env cannot see, and a disagreement is a stale record with no way out:
-// shouldKeepExisting's key guard blocks the rewrite on the forced path too, and authModeReverted
-// excuses selfReported records from the one escape. See oauth-identity.mjs.
+// shouldKeepExisting's key guard blocks the automatic rewrite, and authModeReverted excuses
+// records carrying the user's own testimony from the one escape — so nothing but a /beezi:refresh
+// the user runs themselves moves it. See oauth-identity.mjs.
 test('payload — a stored fingerprint alone suppresses nothing', () => {
   const p = buildAccountSyncPayload({
     config: config({ accountUuid: 'acc-uuid-1', keyFingerprint: STORED_FINGERPRINT }),

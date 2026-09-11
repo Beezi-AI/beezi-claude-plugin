@@ -4,7 +4,7 @@ import { readResponseBody } from './audit-flush.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { listAllTranscripts } from './transcript-index.mjs';
-import { readLastCostState, toWireModels } from './cost-state.mjs';
+import { readLastCostState, toCostStateItem } from './cost-state.mjs';
 import { readSyncState, scanFloorMs, markSuccess, markAttempt } from './cost-state-sync-state.mjs';
 import { markTrackingDisabled as _markTrackingDisabled } from './tracking.mjs';
 
@@ -84,19 +84,12 @@ export async function runCostStateScan(deps = {}) {
     const block = readBlock(entry.transcriptPath, entry.sessionId);
     if (block == null) continue;
     result.withBlock += 1;
-    const models = toWireModels(block);
-    // A block with no model usage carries no cost to record; sending it would only earn a
-    // "no priced model usage" rejection.
-    if (models.length === 0) continue;
-    items.push({
-      sessionId: entry.sessionId,
-      total_cost_usd: typeof block.totalCostUSD === 'number' ? block.totalCostUSD : 0,
-      has_unknown_model_cost: block.hasUnknownModelCost === true,
-      // The file mtime, because the block itself carries no timestamp and its startTime resets
-      // mid-file. Observability only — never a date basis.
-      captured_at: new Date(entry.mtimeMs).toISOString(),
-      models: models,
-    });
+    // captured_at is the file mtime, because the block itself carries no timestamp and its
+    // startTime resets mid-file. Observability only — never a date basis.
+    const item = toCostStateItem(entry.sessionId, block, new Date(entry.mtimeMs).toISOString());
+    // A block with no priced model usage carries no cost to record.
+    if (item == null) continue;
+    items.push(item);
   }
 
   result.sent = items.length;

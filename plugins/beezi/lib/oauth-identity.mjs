@@ -110,12 +110,12 @@ export function sameKeyFingerprint(a, b) {
 //     oauthTokenEnvWithOsProbe, and every suppression site resolves its env the same way
 //     (checkpoint.mjs, session-start.mjs). The stored value therefore names no token the env cannot
 //     see; it can only DISAGREE with the env, and every such disagreement is a stale record.
-//   - The stale case has no way out. billing-capture.mjs's `kept` branch never clears the
-//     fingerprint, shouldKeepExisting's key guard blocks the overwrite "on the forced path too"
-//     (/beezi:refresh included), and authModeReverted excuses selfReported records from the one
-//     escape. So a self-reported key-scoped machine that moved back to an interactive login would
-//     suppress its real identity forever and be minted an anonymous account row for a key it no
-//     longer uses.
+//   - The stale case clears only when something rewrites the record. billing-capture.mjs's `kept`
+//     branch never clears the fingerprint, and its key guard still blocks an automatic overwrite
+//     unless authModeReverted confirms the migration. /beezi:refresh can now correct it (the guard
+//     stands down under force), but that is a command the user has to run: between the migration
+//     and that run, a machine honouring a stored fingerprint would suppress its real identity and
+//     be minted an anonymous account row for a key it no longer uses.
 //
 // billing.json IS the source of truth for the uuid, the email and the plan — see identity-stamp.mjs.
 // The key in force is the one question it does not answer better than the env.

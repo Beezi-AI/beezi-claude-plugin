@@ -247,7 +247,11 @@ const iso = (msAgo) => new Date(T0.getTime() - msAgo).toISOString();
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // Harness: in-memory config store + spy-able readers; realistic defaults everywhere.
-function harness({ existing = null, sub = null, fileAnchor = null, env = {}, stale = false } = {}) {
+// `fileAccount` defaults to null on purpose: without the stub the reconcile reads the REAL
+// ~/.claude.json of whoever runs the suite, and identityChanged then compares a fixture's account
+// against that machine's own — so a test asserting `kept` passed or failed depending on who was
+// logged in. Every account the tests care about is stated in the fixtures.
+function harness({ existing = null, sub = null, fileAnchor = null, fileAccount = null, env = {}, stale = false } = {}) {
   const writes = [];
   let store = existing;
   const subCalls = { count: 0 };
@@ -261,6 +265,7 @@ function harness({ existing = null, sub = null, fileAnchor = null, env = {}, sta
       isStale: () => stale,
       resolveClaudeSubscription: () => { subCalls.count += 1; return sub; },
       readClaudeAccountAnchor: () => fileAnchor,
+      readClaudeAccount: () => fileAccount,
       env,
       now: T0,
     },
@@ -971,4 +976,83 @@ test('reconcile — the SAME setup token is steady state: no spawn, no write', (
   reconcileBillingConfig(h.deps);
   assert.equal(h.subCalls.count, 0, 'an unchanged token must not spawn the CLI');
   assert.equal(h.writes.length, 0);
+});
+
+// ─── migrating OFF a setup token, back to an ordinary Claude login ───────────
+
+// What the CLI answers once the token is gone and an interactive login is in force: a positively
+// merged profile, which is what confirmsInteractiveLogin demands.
+const REVERTED_SUB = Object.freeze({
+  accountUuid: 'acc-uuid-2',
+  email: 'dev@corp.co',
+  subscriptionType: 'team',
+  rateLimitTier: 'default_raven',
+  expiresAt: null,
+  billingType: 'stripe_subscription',
+  seatTier: 'team_standard',
+  organizationType: 'claude_team',
+  detectedVia: 'merged',
+  anchor: { value: 'dev@corp.co', source: 'email' },
+});
+
+const KEY_FINGERPRINT = Object.freeze({ prefix: 'sk-ant-oat01', last4: 'yyyy', length: 108 });
+
+test('reconcile — a portal-resolved key plan yields to the login that replaced the token', () => {
+  // plan-writeback merges its answer onto whatever is on disk, so a record the user once declared
+  // keeps `selfReported: true` after the portal overwrites its plan. That flag used to excuse the
+  // record from the key-revert escape, which left the portal's answer for a key this machine no
+  // longer has as the ONE state no local capture could correct — /beezi:refresh included.
+  const h = harness({
+    existing: {
+      version: 4,
+      source: 'subscription',
+      plan: 'max',
+      subscriptionType: 'max',
+      selfReported: true,
+      planSource: 'key_resolution',
+      capturedBy: 'portal',
+      capturedAt: iso(DAY_MS),
+      anchorCheckedAt: iso(8 * DAY_MS), // heartbeat trigger: no force, no user action
+      accountAnchor: { value: 'dev@corp.co', source: 'email', updatedAt: iso(8 * DAY_MS) },
+      keyFingerprint: KEY_FINGERPRINT,
+      envKeyPresent: false,
+    },
+    sub: REVERTED_SUB,
+  });
+  const { config, outcome } = reconcileBillingConfig(h.deps);
+  // `migrated`, not plain `captured`: the record also stopped belonging to a key, which is the
+  // one automatic rewrite the user is told about.
+  assert.equal(outcome, 'migrated');
+  assert.equal(config.plan, 'team');
+  assert.equal(config.planSource, 'claude_login');
+  assert.equal(config.keyFingerprint, null, 'the record stops belonging to a key it no longer has');
+});
+
+test('reconcile — /beezi:refresh corrects a key-scoped record the automatic path must not touch', () => {
+  // A plan the USER declared, on a machine whose record is key-scoped. authModeReverted still
+  // excuses it (their testimony is not the portal's answer), so the key guard holds on every
+  // automatic pass — but the forced path is the user asking for this exact correction.
+  const declared = {
+    version: 4,
+    source: 'subscription',
+    plan: 'max_20x',
+    subscriptionType: 'max',
+    selfReported: true,
+    planSource: 'self_reported',
+    capturedAt: iso(DAY_MS),
+    anchorCheckedAt: iso(8 * DAY_MS),
+    accountAnchor: { value: 'dev@corp.co', source: 'email', updatedAt: iso(8 * DAY_MS) },
+    keyFingerprint: KEY_FINGERPRINT,
+    envKeyPresent: false,
+  };
+
+  const auto = harness({ existing: { ...declared }, sub: REVERTED_SUB });
+  const autoResult = reconcileBillingConfig(auto.deps);
+  assert.equal(autoResult.outcome, 'kept', 'a session start must not overwrite declared testimony');
+  assert.equal(autoResult.config.plan, 'max_20x');
+
+  const forced = harness({ existing: { ...declared }, sub: REVERTED_SUB });
+  const forcedResult = reconcileBillingConfig(forced.deps, { force: true, via: 'refresh' });
+  assert.equal(forcedResult.outcome, 'captured');
+  assert.equal(forcedResult.config.plan, 'team');
 });

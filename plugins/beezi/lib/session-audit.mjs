@@ -23,6 +23,10 @@ import {
   MAX_CHUNK_ITEMS,
 } from './audit-flush.mjs';
 import { ENDPOINTS } from './config.mjs';
+import { readLastCostState as _readLastCostState, toCostStateItem } from './cost-state.mjs';
+import { readSessionShell as _readSessionShell } from './transcript-shell.mjs';
+import { sessionNameFrom as _sessionNameFrom } from './session-name.mjs';
+import { loadRepoMap as _loadRepoMap, resolveRemoteOffline } from './repo-map.mjs';
 import { fetchCoverage as _fetchCoverage } from './session-coverage.mjs';
 import { computeSessionTimeline as _computeSessionTimeline } from './session-timeline.mjs';
 import { postSessionError as _postSessionError } from './session-error-report.mjs';
@@ -61,6 +65,10 @@ export const SYNC_MODE = 'sync';
 const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
 
 const SINCE_FORMAT = /^\d{4}-\d{2}-\d{2}$/;
+
+// The server's cap on a cost-state shell's repo_urls entries. Mirrored here because one over-long
+// field 400s the whole chunk, and on this path that chunk is the session's entire cost record.
+const MAX_REPO_URL_LENGTH = 500;
 
 // Same shape as lib/billing-capture.mjs: a plain loop, `argv[++i]` for valued flags, UserError for
 // anything malformed so the script surfaces it verbatim.
@@ -157,6 +165,10 @@ export function shouldFinalize(result, options = {}) {
   // `empty` and `noRemote` never block: the first has nothing to upload, and the second can never
   // succeed (a transcript with no recorded cwd will have none on the next run either).
   if (result.retriableUnreadable > 0) return false;
+  // A cost-state-only session has no reports, so a failure on one contributes NOTHING to
+  // reportsFailed above — sealing on top of it would lose that session's entire usage for good.
+  if (result.costStatesFailed > 0) return false;
+  if (result.costStatesUnsupported) return false;
   return true;
 }
 
@@ -177,6 +189,10 @@ export async function runAudit(deps = {}, options = {}) {
   const fetchCoverage = deps.fetchCoverageImpl == null ? _fetchCoverage : deps.fetchCoverageImpl;
   const flushQueue = deps.flushQueueImpl == null ? _flushQueue : deps.flushQueueImpl;
   const computeSessionTimeline = deps.computeSessionTimelineImpl == null ? _computeSessionTimeline : deps.computeSessionTimelineImpl;
+  const readCostState = deps.readLastCostStateImpl == null ? _readLastCostState : deps.readLastCostStateImpl;
+  const readShell = deps.readSessionShellImpl == null ? _readSessionShell : deps.readSessionShellImpl;
+  const sessionNameFrom = deps.sessionNameFromImpl == null ? _sessionNameFrom : deps.sessionNameFromImpl;
+  const loadRepoMapImpl = deps.loadRepoMapImpl == null ? _loadRepoMap : deps.loadRepoMapImpl;
   const postSessionError = deps.postSessionErrorImpl == null ? _postSessionError : deps.postSessionErrorImpl;
   const readTracking = deps.readTrackingStateImpl == null ? readTrackingState : deps.readTrackingStateImpl;
   const markCompleted = deps.markBackfillCompletedImpl == null ? markBackfillCompleted : deps.markBackfillCompletedImpl;
@@ -203,6 +219,15 @@ export async function runAudit(deps = {}, options = {}) {
     // both modes so "stored" has something to be compared against: without it a server that
     // quietly stores fewer than it was sent is undetectable.
     plannedReports: 0,
+    // Sessions the cost-state fast path claimed: Claude Code's own whole-session accounting was
+    // read off the transcript's tail and the segment parse was skipped entirely.
+    costStateSessions: 0,
+    costStatesStored: 0,
+    costStatesSkipped: 0,
+    // Cost-state sessions the server never judged. They contribute nothing to reportsFailed (they
+    // have no reports), so they are counted separately and block the seal on their own.
+    costStatesFailed: 0,
+    costStatesUnsupported: false,
     sessionsImported: 0,
     // Candidates that produced no report, split by cause — every one of these used to vanish
     // between `candidates` and `sessionsImported` with nothing printed, which is why the totals
@@ -340,14 +365,13 @@ export async function runAudit(deps = {}, options = {}) {
   }
   result.candidates = candidates.length;
 
-  // One batched question for the whole run: how far does the server already reach in each session.
+  // How far the server already reaches in each session. Asked below, once the fast path has
+  // decided which sessions still need a line cursor at all — a cost-state block carries no line
+  // window, so a session taking that path has nothing to resume.
+  //
   // Null (old server, transport failure) means the answer cannot be trusted, so every session falls
   // back to its local cursor rather than re-sending from line 0 on a blip.
   let coverage = null;
-  if (syncMode && candidates.length > 0) {
-    coverage = await fetchCoverage(candidates.map((entry) => entry.sessionId), token, { fetchImpl });
-    result.coverageKnown = coverage != null;
-  }
 
   const finalize = async () => {
     if (!shouldFinalize(result, options)) return;
@@ -402,6 +426,9 @@ export async function runAudit(deps = {}, options = {}) {
     );
     result.plannedChunks += flushed.chunks;
     result.timelinesDropped += flushed.timelinesDropped == null ? 0 : flushed.timelinesDropped;
+    result.costStatesStored += flushed.costStatesStored == null ? 0 : flushed.costStatesStored;
+    result.costStatesSkipped += flushed.costStatesSkipped == null ? 0 : flushed.costStatesSkipped;
+    if (flushed.costStatesUnsupported === true) result.costStatesUnsupported = true;
     result.reportsStored += flushed.stored;
     result.reportsSkipped += flushed.skipped;
     result.timelines += flushed.timelines;
@@ -424,7 +451,12 @@ export async function runAudit(deps = {}, options = {}) {
         result.reportsRejected += group.reports.length;
         result.sessionsRejected += 1;
       }
-      if (status === BackfillSessionStatus.FAILED) result.reportsFailed += group.reports.length;
+      if (status === BackfillSessionStatus.FAILED) {
+        result.reportsFailed += group.reports.length;
+        // A cost-state group carries no reports, so the line above counts zero for it. Without
+        // this the seal would land on top of a session whose entire usage never arrived.
+        if (group.costState != null) result.costStatesFailed += 1;
+      }
       // Anything the server judged is ledgered, including a rejection: an unconnected repository
       // will reject on every future run too. Failures and unattributed chunks stay eligible.
       if (
@@ -502,11 +534,112 @@ export async function runAudit(deps = {}, options = {}) {
     return covered == null ? 0 : covered;
   };
 
+  // Claude Code writes its OWN whole-session cost accounting into the last records of a
+  // transcript. It is both more accurate than anything we can tally (advisor iterations and
+  // retried API attempts never reach the transcript at all) and reachable with a 256KB tail read
+  // instead of a full parse — so when a past session has one, that block IS the session's usage
+  // and the segment path is skipped outright.
+  //
+  // BOTH modes take it — the one-time pull and /beezi:sync alike. The trade is deliberate: a
+  // cost-state block carries no repository, branch, operations, timeline or line coverage. Only its
+  // cost and token counts survive, plus the shell read off the transcript's two ends. For a session
+  // that already has segment rows on the server (live-tracked, or uploaded by an earlier run) this
+  // is pure gain — the block supersedes only the cost, and the stored segments keep everything
+  // else. For a session Beezi has never seen, cost is all it will ever get from either command.
+  //
+  // The repo map is loaded ONCE for the run: matchKnownRoot walks its roots per lookup, and this
+  // resolves one remote per candidate.
+  let repoMap = null;
+  const costStateGroupFor = (entry) => {
+    let block;
+    try {
+      block = readCostState(entry.transcriptPath, entry.sessionId);
+    } catch {
+      return null;
+    }
+    if (block == null) return null;
+    // captured_at is the file mtime for the same reason the hourly scan uses it: the block itself
+    // carries no timestamp. Observability only — never a date basis.
+    const item = toCostStateItem(entry.sessionId, block, new Date(entry.mtimeMs).toISOString());
+    if (item == null) return null;
+    let shell;
+    try {
+      shell = readShell(entry.transcriptPath);
+    } catch {
+      return null;
+    }
+    // No usable start means no date basis at all: every CLI read filters and buckets on
+    // started_at, and the server refuses a retrospective session without one. Hand the session
+    // back to the segment path, which can still recover a span from its own timing anchors.
+    if (shell == null || shell.startedAt == null) return null;
+
+    const costState = { ...item, started_at: shell.startedAt };
+    if (shell.endedAt != null) costState.ended_at = shell.endedAt;
+    let name = null;
+    try { name = sessionNameFrom(entry.transcriptPath); } catch { /* best-effort */ }
+    if (name != null) costState.session_name = name;
+    if (shell.cwd != null) {
+      try {
+        if (repoMap == null) repoMap = loadRepoMapImpl();
+        const remote = resolveRemoteOffline(shell.cwd, repoMap);
+        // Attribution the block itself cannot carry, recovered git-free from the transcript's own
+        // cwd. Best-effort by nature: it is the session's FIRST directory, not a per-segment
+        // split, so a session that hopped repositories records only where it started.
+        //
+        // Dropped rather than clamped past the server's cap: a truncated remote would fabricate a
+        // bogus repo key, and sending it whole would 400 the chunk and cost the session its cost
+        // record entirely. The session still lands — without repository attribution.
+        if (remote != null && remote.length <= MAX_REPO_URL_LENGTH) costState.repo_urls = [remote];
+      } catch { /* best-effort */ }
+    }
+    return { sessionId: entry.sessionId, reports: [], timeline: null, costState: costState };
+  };
+
+  // Resolved for EVERY candidate up front, before the coverage question below. Two bounded reads
+  // per transcript (a 256KB tail, a 64KB head), so this is cheap next to the parse it replaces —
+  // and doing it first is what lets /beezi:sync ask about the segment-path sessions ALONE.
+  // fetchCoverage batches 200 ids to a request, sequentially, with a 60s budget each; a run where
+  // every session has a block would otherwise pay every one of those round trips for answers that
+  // nothing goes on to read.
+  //
+  // Holds one small wire item per fast-path session for the length of the run. That is a few
+  // hundred bytes each against the megabytes a single transcript parse costs.
+  const costStateBySession = new Map();
+  for (const entry of candidates) {
+    const group = costStateGroupFor(entry);
+    if (group != null) costStateBySession.set(entry.sessionId, group);
+  }
+
+  if (syncMode) {
+    const needsCursor = candidates
+      .filter((entry) => !costStateBySession.has(entry.sessionId))
+      .map((entry) => entry.sessionId);
+    if (needsCursor.length > 0) {
+      coverage = await fetchCoverage(needsCursor, token, { fetchImpl });
+      result.coverageKnown = coverage != null;
+    } else {
+      // Nothing needed a cursor, so the resume basis is trivially sound. Reporting this as
+      // "unknown" would have /beezi:sync warn that it could not confirm what Beezi already holds —
+      // on a run that had nothing to confirm.
+      result.coverageKnown = true;
+    }
+  }
+
   // Parsing itself stays strictly sequential. computeDelta reads and JSON.parses the whole
   // transcript, so parsing sessions in parallel multiplies peak memory with no gain on a
   // single thread.
   for (const entry of candidates) {
     if (halted) break;
+    const fastPath = costStateBySession.get(entry.sessionId);
+    if (fastPath != null) {
+      processed += 1;
+      result.costStateSessions += 1;
+      pending.push(fastPath);
+      pendingBytes += Buffer.byteLength(JSON.stringify(fastPath.costState), 'utf-8');
+      pendingItems += 1;
+      if (pendingBytes >= MAX_BODY_BYTES || pendingItems >= MAX_CHUNK_ITEMS) await dispatch();
+      continue;
+    }
     const reports = [];
     let sessionErrors = [];
     let skipped = null;

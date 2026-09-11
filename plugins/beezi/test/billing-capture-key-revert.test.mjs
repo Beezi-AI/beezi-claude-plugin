@@ -17,7 +17,9 @@ import { shouldKeepExisting, reconcileBillingConfig, describeBillingChanges } fr
 const T0 = new Date('2026-08-21T10:00:00.000Z');
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-function harness({ existing = null, sub = null, fileAnchor = null, env = {} } = {}) {
+// `fileAccount` is stubbed for the same reason as in billing-capture.test.mjs: unstubbed, the
+// reconcile reads the real ~/.claude.json of whoever runs the suite.
+function harness({ existing = null, sub = null, fileAnchor = null, fileAccount = null, env = {} } = {}) {
   const writes = [];
   let store = existing;
   return {
@@ -33,6 +35,7 @@ function harness({ existing = null, sub = null, fileAnchor = null, env = {} } = 
       isStale: () => false,
       resolveClaudeSubscription: () => sub,
       readClaudeAccountAnchor: () => fileAnchor,
+      readClaudeAccount: () => fileAccount,
       env,
       now: T0,
     },
@@ -360,10 +363,28 @@ test('revert — a self-reported plan survives a confirmed login', () => {
   assert.equal(config.selfReported, true);
 });
 
-// Forced is the /beezi:refresh path, and it covers this rule too — same reason the key guard does.
-test('revert — /beezi:refresh does not overwrite a self-reported plan either', () => {
+// Forced is the /beezi:refresh path, and there the rule inverts: the key guard stands down for a
+// run the user asked for. The protection above is for passes nobody asked for — a session start, a
+// weekly heartbeat — not for the command whose entire purpose is re-reading this record.
+//
+// The cost is the honest limit again: on a machine whose token lives in a shell profile, refresh
+// now writes the previous login's plan over the user's own answer. That is recoverable by declaring
+// the plan again (/beezi:login asks); the state this replaces was not recoverable at all, because
+// no local action could move it. Key-scoped records simply behave like every other declared record
+// under force, where a CLI that names a plan has always won.
+test('revert — /beezi:refresh DOES overwrite a self-reported plan the user asked it to re-read', () => {
   const h = harness({ existing: SELF_REPORTED_KEY_SCOPED, sub: LOGIN_CONFIRMED_SUB, fileAnchor: FILE_ANCHOR, env: {} });
   const { config } = reconcileBillingConfig(h.deps, { force: true });
+
+  assert.equal(config.plan, 'pro', "the CLI's answer, not the declared max_20x");
+  assert.equal(config.planSource, 'claude_login');
+  assert.equal(config.selfReported, undefined, 'the record stops being testimony');
+});
+
+// The automatic path is untouched by that: only `force` stands the guard down.
+test('revert — a session start still keeps the self-reported plan the forced run replaces', () => {
+  const h = harness({ existing: SELF_REPORTED_KEY_SCOPED, sub: LOGIN_CONFIRMED_SUB, fileAnchor: FILE_ANCHOR, env: {} });
+  const { config } = reconcileBillingConfig(h.deps);
 
   assert.equal(config.plan, 'max_20x');
   assert.equal(config.selfReported, true);

@@ -104,3 +104,20 @@ export function toWireModels(block) {
 function num(value) {
   return typeof value === 'number' && isFinite(value) && value > 0 ? Math.round(value) : 0;
 }
+
+// The wire item both cost-state producers build: the hourly scan and the backfill's fast path.
+//
+// Returns null when the block prices no model usage at all — sending it would only earn a
+// "no priced model usage" rejection, and on the backfill route that rejection is LEDGERED.
+export function toCostStateItem(sessionId, block, capturedAtIso) {
+  if (block == null) return null;
+  const models = toWireModels(block);
+  if (models.length === 0) return null;
+  return {
+    sessionId: sessionId,
+    total_cost_usd: typeof block.totalCostUSD === 'number' ? block.totalCostUSD : 0,
+    has_unknown_model_cost: block.hasUnknownModelCost === true,
+    captured_at: capturedAtIso,
+    models: models,
+  };
+}

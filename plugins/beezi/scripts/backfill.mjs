@@ -85,7 +85,6 @@ async function main() {
     const bits = [];
     if (result.alreadyImported > 0) bits.push(`${plural(result.alreadyImported, 'session')} already uploaded`);
     if (result.liveTracked > 0) bits.push(`${result.liveTracked} already tracked live`);
-    if (result.active > 0) bits.push(`${result.active} still active — they upload on a later login`);
     console.log(`✓ Beezi: nothing new to upload${bits.length ? ` (${bits.join(', ')})` : ''}.`);
     if (result.finalized) console.log('✓ Beezi: your history pull is finalized.');
     return;
@@ -102,7 +101,15 @@ async function main() {
 
   // Everything that was parsed but never judged by the server. Those sessions stay unledgered, so
   // saying "log in again to continue" is accurate — the next login's backfill picks them up.
-  if (result.reportsFailed > 0 && result.sessionsImported === 0) {
+  if ((result.reportsFailed > 0 || result.costStatesFailed > 0) && result.sessionsImported === 0) {
+    // A server that rejects the cost records outright is a version mismatch, not an unreachable
+    // one, and re-running against the same build would fail identically. Say which it is.
+    if (result.costStatesUnsupported) {
+      fail(
+        'Beezi: upload stopped — this Beezi server does not accept Claude cost records yet. ' +
+          'Nothing was uploaded and nothing was lost; re-run /beezi:login after the portal update.',
+      );
+    }
     fail(
       `Beezi: upload stopped — could not reach the server (${result.lastError == null ? 'unknown error' : result.lastError}). ` +
         'Re-run /beezi:login to continue where it left off.',
@@ -112,7 +119,12 @@ async function main() {
   const parts = [`✓ Beezi: uploaded ${plural(result.sessionsImported, 'session')} (${plural(result.reportsStored, 'report')} stored).`];
   if (result.alreadyImported > 0) parts.push(`${result.alreadyImported} were already uploaded.`);
   if (result.liveTracked > 0) parts.push(`${result.liveTracked} were already tracked live.`);
-  if (result.active > 0) parts.push(`${result.active} still active — they upload on a later login.`);
+  if (result.costStateSessions > 0) {
+    parts.push(
+      `${plural(result.costStateSessions, 'session')} used Claude's own cost record ` +
+        '(no repository or timeline detail for those).',
+    );
+  }
   // Server-side skips already include the errored items; report the errors, not both numbers.
   if (result.itemErrors > 0) {
     parts.push(`${plural(result.itemErrors, 'report')} skipped — their repository is not connected to Beezi.`);
@@ -122,6 +134,19 @@ async function main() {
   if (result.sessionsRejected > 0) {
     parts.push(
       `${plural(result.sessionsRejected, 'session')} were rejected by the server and will not be retried.`,
+    );
+  }
+  // Its own line, not folded into the retry stanza below: this one is a server-version problem the
+  // user cannot fix by re-running, and reportsFailed stays 0 for these sessions (they carry no
+  // reports), so nothing else in this summary would mention them.
+  if (result.costStatesUnsupported) {
+    parts.push(
+      `${plural(result.costStatesFailed, 'session')} could not be uploaded — this Beezi server ` +
+        'does not accept Claude cost records yet. They are kept for the next run.',
+    );
+  } else if (result.costStatesFailed > 0) {
+    parts.push(
+      `${plural(result.costStatesFailed, 'session')} could not be delivered — re-run /beezi:login to retry them.`,
     );
   }
   if (result.reportsFailed > 0 || result.unattributed > 0 || result.permanentRejections > 0) {

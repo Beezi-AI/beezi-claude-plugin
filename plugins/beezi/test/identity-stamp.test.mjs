@@ -112,7 +112,8 @@ test('buildIdentityStamp — a token too short to fingerprint suppresses nothing
 // suppression site resolves, so it names no token the env cannot see; it can only disagree, and
 // every disagreement is a stale record. Honouring it would strand a self-reported key-scoped
 // machine that moved back to an interactive login: shouldKeepExisting's key guard blocks the
-// rewrite on the forced path too, so the suppression would never lift. See oauth-identity.mjs.
+// automatic rewrite, so the suppression would hold until the user ran /beezi:refresh, which is the
+// one path that stands the guard down. See oauth-identity.mjs.
 test('buildIdentityStamp — a stored fingerprint is not a substitute for a live token', () => {
   const stamp = buildIdentityStamp(ACCOUNT, {
     ...BILLING,

@@ -279,15 +279,22 @@ export function shouldKeepExisting(freshConfig, existingConfig, options = {}) {
   // is a real observation about this key), and does not reach the account-switch path, which
   // bypasses this function entirely.
   //
-  // `options.keyRevertConfirmed` is the one thing that stands this rule down: the reconcile saw no
-  // token in ANY env tier and the CLI positively answered for an interactive login. Without that
-  // escape a genuine migration off a setup token could never update the record — not on session
-  // start, not on the weekly heartbeat, and not through /beezi:refresh, since this rule applies to
-  // the forced path too. The caller owns that judgement because only it has the env and the CLI's
-  // answer; this function has neither.
+  // `options.keyRevertConfirmed` is the one thing that stands this rule down on an AUTOMATIC pass:
+  // the reconcile saw no token in ANY env tier and the CLI positively answered for an interactive
+  // login. Without that escape a genuine migration off a setup token could never update the record
+  // on session start or on the weekly heartbeat. The caller owns that judgement because only it has
+  // the env and the CLI's answer; this function has neither.
+  //
+  // `options.force` stands it down the other way, and for a different reason: /beezi:refresh IS the
+  // user asking for this record to be re-read. Until it did, a key-scoped record whose escape the
+  // clauses above excused was unreachable by every local action there is — the heartbeat kept it,
+  // the forced command kept it, and only the portal could ever move it again. A command that cannot
+  // correct the one state it exists to correct is the defect; the conservatism above is for passes
+  // the user did not ask for.
   if (isKeyScoped(existingConfig)
     && freshConfig.keyFingerprint == null
     && freshConfig.planSource === 'claude_login'
+    && options.force !== true
     && options.keyRevertConfirmed !== true) return true;
   if (existingConfig.selfReported !== true) return false;
   const declaredTier = Boolean(existingConfig.plan) && existingConfig.plan !== 'unknown';
@@ -403,8 +410,9 @@ function authModeSwitched(existing, tokenAnchor) {
 // record versus `email`/`account_uuid` in force is a cross-source pair. Worse, shouldKeepExisting
 // deliberately blocks a `claude_login` capture from overwriting a key-scoped record, so the plan the
 // portal resolved for a key that is no longer in use kept shipping under the new login forever: the
-// heartbeat re-ran, took the `kept` branch, and even /beezi:refresh could not correct it (the guard
-// applies to the forced path too).
+// heartbeat re-ran and took the `kept` branch every time. /beezi:refresh is no longer part of that
+// trap — `options.force` stands the guard down — but an automatic pass still needs this question
+// answered, and answered without the user present.
 //
 // This says only that the question is worth asking. What answers it is the CLI — see the reconcile,
 // which additionally requires that it POSITIVELY answered for an interactive login.
@@ -429,6 +437,15 @@ function authModeReverted(existing, tokenAnchor) {
   //
   // This also stands the revert clause's CLI spawn down for such records, exactly as
   // authModeSwitched does: they are left to the heartbeat, /beezi:refresh and anchorChanged.
+  //
+  // A `key_resolution` plan is NOT testimony, so the exclusion above must not cover it. The flag
+  // and the plan have different owners on the same record: plan-writeback.mjs merges the portal's
+  // answer onto whatever is already on disk, so a machine that once declared its plan keeps
+  // `selfReported: true` while its plan becomes the server's answer for a fingerprint. Reading that
+  // flag as the user's word left exactly one state no local capture could ever correct — the
+  // heartbeat kept it and so did /beezi:refresh — while the plan being protected describes a key
+  // the machine no longer has. There is no testimony to lose here: the portal overwrote it.
+  if (existing.planSource === 'key_resolution') return true;
   return existing.selfReported !== true;
 }
 
@@ -753,10 +770,12 @@ export function reconcileBillingConfig(deps = {}, options = {}) {
       // leave the stale tuple in place on every heartbeat.
       const clearsPlan = fresh.planSource === 'unresolved';
       // The machine moved off its setup token and the CLI confirmed the login that replaced it.
-      // This is the ONLY thing that lets a claude_login capture overwrite a key-scoped record; see
+      // This is what lets an AUTOMATIC claude_login capture overwrite a key-scoped record; see
       // shouldKeepExisting, and confirmsInteractiveLogin for what "confirmed" is worth.
       const keyRevertConfirmed = authModeReverted(existing, tokenAnchor) && confirmsInteractiveLogin(sub);
-      const overwrite = sub != null && !shouldKeepExisting(fresh, existing, { keyRevertConfirmed })
+      // `force` travels with it so the key guard knows the difference between a pass nobody asked
+      // for and the user running /beezi:refresh, which exists to re-read exactly this record.
+      const overwrite = sub != null && !shouldKeepExisting(fresh, existing, { keyRevertConfirmed, force })
         && (force || learnedPlan(fresh) || clearsPlan);
       if (switched) {
         // The account changed: the old record — self-reported or not — describes someone else.

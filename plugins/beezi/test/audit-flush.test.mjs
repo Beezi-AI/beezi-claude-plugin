@@ -497,3 +497,162 @@ test('26. completeBackfill POSTs the seal route and reports the coded refusals',
   assert.equal(denial.completed, false);
   assert.equal(denial.code, 'BACKFILL_NOT_ALLOWED');
 });
+
+// ─── cost states in a chunk ─────────────────────────────────────────────────
+
+const costState = (sessionId, over = {}) => ({
+  sessionId,
+  total_cost_usd: 2.5,
+  has_unknown_model_cost: false,
+  captured_at: '2026-03-01T12:00:00.000Z',
+  started_at: '2026-03-01T09:00:00.000Z',
+  ended_at: '2026-03-01T11:00:00.000Z',
+  models: [
+    {
+      model: 'claude-opus-5',
+      token_input: 10,
+      token_output: 5,
+      token_cache_read: 0,
+      token_cache_creation: 0,
+      web_search_requests: 0,
+      cost_usd: 2.5,
+    },
+  ],
+  ...over,
+});
+
+const costGroup = (sessionId) => ({ sessionId, reports: [], timeline: null, costState: costState(sessionId) });
+
+test('27. packs cost-state-only sessions into a chunk of their own shape', () => {
+  const chunks = planChunks([costGroup('c1'), costGroup('c2')]);
+
+  assert.equal(chunks.length, 1);
+  assert.deepEqual(chunks[0].sessionIds, ['c1', 'c2']);
+  assert.equal(chunks[0].reports.length, 0);
+  assert.equal(chunks[0].costStates.length, 2);
+});
+
+test('28. packs cost states alongside segment sessions in one chunk', () => {
+  const chunks = planChunks([group('s1', 2), costGroup('c1')]);
+
+  assert.equal(chunks.length, 1);
+  assert.deepEqual(chunks[0].sessionIds, ['s1', 'c1']);
+  assert.equal(chunks[0].reports.length, 2);
+  assert.equal(chunks[0].costStates.length, 1);
+});
+
+test('29. counts a cost state against the item cap', () => {
+  const groups = Array.from({ length: MAX_CHUNK_ITEMS + 5 }, (_unused, i) => costGroup(`c${i}`));
+  const chunks = planChunks(groups);
+
+  assert.ok(chunks.length > 1, 'the cap must force a second chunk');
+  for (const chunk of chunks) {
+    assert.ok(chunk.costStates.length <= MAX_CHUNK_ITEMS);
+  }
+  const total = chunks.reduce((sum, chunk) => sum + chunk.costStates.length, 0);
+  assert.equal(total, MAX_CHUNK_ITEMS + 5);
+});
+
+test('30. omits costStates from the wire when a chunk carries none', async () => {
+  const post = fakePost([{ status: 200, body: okBody() }]);
+  await flushBackfillChunks([group('s1', 1)], 'tok', { postJsonImpl: post.impl });
+
+  assert.equal('costStates' in post.calls[0].body, false);
+});
+
+test('31. sends a cost-state-only chunk with an empty sessions array', async () => {
+  const post = fakePost([{ status: 200, body: okBody({ stored: 0, costStates: { stored: 1, skipped: 0, errors: [] } }) }]);
+  const result = await flushBackfillChunks([costGroup('c1')], 'tok', { postJsonImpl: post.impl });
+
+  assert.deepEqual(post.calls[0].body.sessions, []);
+  assert.equal(post.calls[0].body.costStates.length, 1);
+  assert.equal(result.costStatesStored, 1);
+  assert.equal(result.bySession.get('c1').status, BackfillSessionStatus.ACCEPTED);
+});
+
+// The whole point of the separate response block: errors[] is segment-scoped and a session named
+// there is ledgered as never-retry.
+test('32. a cost-state rejection never taints a session whose segments stored', async () => {
+  const post = fakePost([
+    {
+      status: 200,
+      body: okBody({
+        stored: 1,
+        errors: [],
+        costStates: { stored: 0, skipped: 1, errors: [{ sessionId: 'c1', reason: 'no priced model usage' }] },
+      }),
+    },
+  ]);
+  const result = await flushBackfillChunks([group('s1', 1), costGroup('c1')], 'tok', { postJsonImpl: post.impl });
+
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.bySession.get('c1').status, BackfillSessionStatus.REJECTED);
+});
+
+// A server-side write failure is transient. REJECTED is ledgered and would never be retried.
+test('33. a cost-state write failure stays retryable', async () => {
+  const post = fakePost([
+    {
+      status: 200,
+      body: okBody({
+        stored: 0,
+        errors: [],
+        costStates: { stored: 0, skipped: 1, errors: [{ sessionId: 'c1', reason: 'write failed' }] },
+      }),
+    },
+  ]);
+  const result = await flushBackfillChunks([costGroup('c1')], 'tok', { postJsonImpl: post.impl });
+
+  assert.equal(result.bySession.get('c1').status, BackfillSessionStatus.FAILED);
+});
+
+test('34. a 2xx that never acknowledges the cost states leaves them undelivered', async () => {
+  const post = fakePost([{ status: 200, body: okBody({ stored: 0, errors: [] }) }]);
+  const result = await flushBackfillChunks([costGroup('c1')], 'tok', { postJsonImpl: post.impl });
+
+  assert.equal(result.costStatesUnsupported, true);
+  assert.equal(result.bySession.get('c1').status, BackfillSessionStatus.FAILED);
+});
+
+test('35. a 400 on the unknown costStates field still lands the chunk segment sessions', async () => {
+  const post = fakePost((body) => {
+    if (body.costStates != null) {
+      return { status: 400, raw: JSON.stringify({ message: ['property costStates should not exist'] }) };
+    }
+    return { status: 200, body: okBody({ stored: 1, errors: [] }) };
+  });
+  const result = await flushBackfillChunks([group('s1', 1), costGroup('c1')], 'tok', { postJsonImpl: post.impl });
+
+  assert.equal(result.costStatesUnsupported, true);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.ACCEPTED);
+  assert.equal(result.bySession.get('c1').status, BackfillSessionStatus.FAILED);
+  assert.equal(post.calls.length, 2);
+});
+
+// The retry must not post `sessions: []` back into the same 400 — there is nothing left to send.
+test('36. a 400 on a cost-state-only chunk is not retried at all', async () => {
+  const post = fakePost([{ status: 400, raw: JSON.stringify({ message: ['property costStates should not exist'] }) }]);
+  const result = await flushBackfillChunks([costGroup('c1')], 'tok', { postJsonImpl: post.impl });
+
+  assert.equal(post.calls.length, 1);
+  assert.equal(result.costStatesUnsupported, true);
+  assert.equal(result.bySession.get('c1').status, BackfillSessionStatus.FAILED);
+});
+
+test('37. bisecting a mixed chunk keeps each cost state with its own half', async () => {
+  const post = fakePost((body, call) => {
+    // The whole chunk 400s once on something other than costStates, then each half is judged.
+    if (call === 1) return { status: 400, raw: 'bad request' };
+    return { status: 200, body: okBody({ stored: body.sessions.length, errors: [], costStates: { stored: (body.costStates || []).length, skipped: 0, errors: [] } }) };
+  });
+  const result = await flushBackfillChunks(
+    [group('s1', 1), group('s2', 1), costGroup('c1'), costGroup('c2')],
+    'tok',
+    { postJsonImpl: post.impl },
+  );
+
+  assert.equal(result.costStatesStored, 2);
+  for (const id of ['s1', 's2', 'c1', 'c2']) {
+    assert.equal(result.bySession.get(id).status, BackfillSessionStatus.ACCEPTED, id);
+  }
+});

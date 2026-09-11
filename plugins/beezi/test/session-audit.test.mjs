@@ -892,3 +892,262 @@ test('backfill — the audit path uploads advisor_message tokens, not just top-l
   assert.equal(models['model-a'].token_input, 4, 'the parent tally still comes off top-level usage');
   assert.equal(models['model-a'].token_output, 60);
 });
+
+// ─── the cost-state fast path ───────────────────────────────────────────────
+
+const COST_BLOCK = {
+  type: 'cost-state',
+  sessionId: 's1',
+  totalCostUSD: 3.75,
+  hasUnknownModelCost: false,
+  modelUsage: {
+    'claude-opus-5': {
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheReadInputTokens: 10,
+      cacheCreationInputTokens: 5,
+      webSearchRequests: 0,
+      costUSD: 3.75,
+    },
+  },
+};
+
+const SHELL = { startedAt: '2026-03-01T09:00:00.000Z', endedAt: '2026-03-01T11:00:00.000Z', cwd: 'C:/work/app' };
+
+// The default deps run the real readers, which find nothing for a fixture path. These stub them.
+function fastPathDeps(overrides = {}) {
+  return makeDeps({
+    readLastCostStateImpl: (_path, sessionId) => ({ ...COST_BLOCK, sessionId }),
+    readSessionShellImpl: () => ({ ...SHELL }),
+    sessionNameFromImpl: () => 'a past session',
+    loadRepoMapImpl: () => ({ version: 1, roots: {} }),
+    runCheckpointImpl: () => { throw new Error('the segment path must not run'); },
+    computeSessionTimelineImpl: () => { throw new Error('no timeline on the fast path'); },
+    ...overrides,
+  });
+}
+
+test('37. a session with a cost-state block uploads that block and never parses its segments', async () => {
+  const groupsSeen = [];
+  const { deps } = fastPathDeps({
+    flushBackfillChunksImpl: async (groups) => {
+      groupsSeen.push(...groups);
+      return flushResult({
+        bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }])),
+        costStatesStored: groups.length,
+      });
+    },
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.costStateSessions, 1);
+  assert.equal(result.sessionsImported, 1);
+  assert.equal(result.costStatesStored, 1);
+  assert.equal(groupsSeen.length, 1);
+  assert.equal(groupsSeen[0].reports.length, 0);
+  assert.equal(groupsSeen[0].timeline, null);
+  assert.equal(groupsSeen[0].costState.total_cost_usd, 3.75);
+  assert.equal(groupsSeen[0].costState.started_at, SHELL.startedAt);
+  assert.equal(groupsSeen[0].costState.ended_at, SHELL.endedAt);
+  assert.equal(groupsSeen[0].costState.session_name, 'a past session');
+});
+
+test('38. the shell carries a repo key resolved without shelling out to git', async () => {
+  const groupsSeen = [];
+  const { deps } = fastPathDeps({
+    flushBackfillChunksImpl: async (groups) => {
+      groupsSeen.push(...groups);
+      return flushResult({
+        bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }])),
+      });
+    },
+  });
+
+  await runAudit(deps, {});
+
+  // No repo map entry and no .git on the fixture path: the `local:` stand-in, exactly what
+  // checkpoint.mjs falls back to.
+  assert.deepEqual(groupsSeen[0].costState.repo_urls, ['local:app']);
+});
+
+test('39. a transcript with no cost-state block falls back to the segment path', async () => {
+  const { deps, events } = fastPathDeps({
+    readLastCostStateImpl: () => null,
+    runCheckpointImpl: async (input, _d, options) => {
+      options.sink({ segmentId: `${input.session_id}:0-1`, sessionId: input.session_id, remote: 'r', branch: 'main' });
+      return { enqueued: 1, flush: null, sessionErrors: [] };
+    },
+    computeSessionTimelineImpl: () => ({ periods: [{ state: 'working' }], plan_events: [], subagents: [] }),
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.costStateSessions, 0);
+  assert.equal(result.sessionsImported, 1);
+  assert.ok(events.includes('flush'));
+});
+
+// started_at is the session's only date basis. Without one the segment path, which can still
+// recover a span from its own timing anchors, is the better answer.
+test('40. a block whose transcript has no usable start falls back to the segment path', async () => {
+  const { deps } = fastPathDeps({
+    readSessionShellImpl: () => ({ startedAt: null, endedAt: null, cwd: 'C:/work/app' }),
+    runCheckpointImpl: async (input, _d, options) => {
+      options.sink({ segmentId: `${input.session_id}:0-1`, sessionId: input.session_id, remote: 'r', branch: 'main' });
+      return { enqueued: 1, flush: null, sessionErrors: [] };
+    },
+    computeSessionTimelineImpl: () => ({ periods: [], plan_events: [], subagents: [] }),
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.costStateSessions, 0);
+  assert.equal(result.sessionsImported, 1);
+});
+
+test('41. a block that prices no model usage falls back to the segment path', async () => {
+  const { deps } = fastPathDeps({
+    readLastCostStateImpl: () => ({ ...COST_BLOCK, modelUsage: {} }),
+    runCheckpointImpl: async (input, _d, options) => {
+      options.sink({ segmentId: `${input.session_id}:0-1`, sessionId: input.session_id, remote: 'r', branch: 'main' });
+      return { enqueued: 1, flush: null, sessionErrors: [] };
+    },
+    computeSessionTimelineImpl: () => ({ periods: [], plan_events: [], subagents: [] }),
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.costStateSessions, 0);
+  assert.equal(result.sessionsImported, 1);
+});
+
+test('42. /beezi:sync takes the fast path too', async () => {
+  const groupsSeen = [];
+  const { deps } = fastPathDeps({
+    flushQueueImpl: async () => {},
+    fetchCoverageImpl: async () => new Map(),
+    flushBackfillChunksImpl: async (groups) => {
+      groupsSeen.push(...groups);
+      return flushResult({
+        bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }])),
+        costStatesStored: groups.length,
+      });
+    },
+  });
+
+  const result = await runAudit(deps, { mode: 'sync' });
+
+  assert.equal(result.costStateSessions, 1);
+  assert.equal(groupsSeen[0].reports.length, 0);
+  assert.equal(groupsSeen[0].costState.total_cost_usd, 3.75);
+});
+
+// The sync route, not the one-time pull: /beezi:sync must stay repeatable and must never seal.
+test('43. the fast path in sync posts to the sync endpoint and never finalizes', async () => {
+  const endpoints = [];
+  const { deps, events } = fastPathDeps({
+    flushQueueImpl: async () => {},
+    fetchCoverageImpl: async () => new Map(),
+    flushBackfillChunksImpl: async (groups, _t, _d, options) => {
+      endpoints.push(options.endpoint);
+      return flushResult({
+        bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }])),
+      });
+    },
+  });
+
+  const result = await runAudit(deps, { mode: 'sync' });
+
+  assert.deepEqual(endpoints, ['/sessions/sync']);
+  assert.equal(result.finalized, false);
+  assert.equal(events.includes('complete'), false);
+});
+
+// A cost-state block carries no line window, so there is nothing to resume for those sessions.
+// fetchCoverage batches 200 ids per request, sequentially, with a 60s budget each.
+test('44. sync never asks coverage about a session taking the fast path', async () => {
+  const asked = [];
+  const { deps } = fastPathDeps({
+    listTranscripts: () => [transcript('fast'), transcript('slow')],
+    readLastCostStateImpl: (_path, sessionId) =>
+      (sessionId === 'fast' ? { ...COST_BLOCK, sessionId } : null),
+    runCheckpointImpl: async (input, _d, options) => {
+      options.sink({ segmentId: `${input.session_id}:0-1`, sessionId: input.session_id, remote: 'r', branch: 'main' });
+      return { enqueued: 1, flush: null, sessionErrors: [] };
+    },
+    computeSessionTimelineImpl: () => ({ periods: [], plan_events: [], subagents: [] }),
+    flushQueueImpl: async () => {},
+    fetchCoverageImpl: async (ids) => { asked.push(...ids); return new Map(); },
+  });
+
+  const result = await runAudit(deps, { mode: 'sync' });
+
+  assert.deepEqual(asked, ['slow']);
+  assert.equal(result.costStateSessions, 1);
+  assert.equal(result.coverageKnown, true);
+});
+
+// The note /beezi:sync prints on a false coverageKnown says Beezi "could not confirm what it
+// already has". On a run with nothing to confirm that reads as a failure it was not.
+test('45. a sync where every session takes the fast path reports coverage as known', async () => {
+  let called = 0;
+  const { deps } = fastPathDeps({
+    flushQueueImpl: async () => {},
+    fetchCoverageImpl: async () => { called += 1; return null; },
+  });
+
+  const result = await runAudit(deps, { mode: 'sync' });
+
+  assert.equal(called, 0);
+  assert.equal(result.coverageKnown, true);
+});
+
+// A cost-state group has no reports, so reportsFailed stays 0 for it — the seal has to be held
+// open by a counter of its own or the session's whole cost is lost.
+test('46. a failed cost-state session holds the pull open', async () => {
+  const { deps, events } = fastPathDeps({
+    flushBackfillChunksImpl: async (groups) => flushResult({
+      bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.FAILED, reason: 'network' }])),
+      retryableFailures: 1,
+      lastError: 'network',
+    }),
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.costStatesFailed, 1);
+  assert.equal(result.reportsFailed, 0);
+  assert.equal(result.finalized, false);
+  assert.equal(events.includes('complete'), false);
+});
+
+test('47. a server that cannot take cost states holds the pull open', () => {
+  const base = {
+    ok: true, halt: null, reportsFailed: 0, unattributed: 0, permanentRejections: 0,
+    retriableUnreadable: 0, costStatesFailed: 0, costStatesUnsupported: false,
+  };
+
+  assert.equal(shouldFinalize(base, {}), true);
+  assert.equal(shouldFinalize({ ...base, costStatesUnsupported: true }, {}), false);
+  assert.equal(shouldFinalize({ ...base, costStatesFailed: 1 }, {}), false);
+});
+
+// One over-long field 400s the whole chunk, and on this path that chunk IS the session's cost.
+test('48. an over-long remote is dropped rather than sent or truncated', async () => {
+  const groupsSeen = [];
+  const { deps } = fastPathDeps({
+    readSessionShellImpl: () => ({ ...SHELL, cwd: `C:/work/${'x'.repeat(600)}` }),
+    flushBackfillChunksImpl: async (groups) => {
+      groupsSeen.push(...groups);
+      return flushResult({
+        bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }])),
+      });
+    },
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.costStateSessions, 1);
+  assert.equal('repo_urls' in groupsSeen[0].costState, false);
+});
