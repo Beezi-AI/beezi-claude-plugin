@@ -1,6 +1,7 @@
 ---
 name: analytics
 description: Show a short personal Beezi analytics summary (spend, sessions, status, recommendations) for the last 7 or 30 days. Use when the user asks for their Beezi analytics, usage summary, or spend summary from the terminal.
+argument-hint: "7d | 30d"
 ---
 
 # Beezi: Personal Analytics Summary
