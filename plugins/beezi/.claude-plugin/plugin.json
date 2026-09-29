@@ -1,8 +1,10 @@
 {
   "name": "beezi",
-  "version": "0.30.2",
+  "version": "0.30.3",
   "description": "Reports Claude Code session token analytics for Beezi task branches and gives you a personal usage summary on demand.",
   "author": {
     "name": "Beezi"
-  }
+  },
+  "license": "Apache-2.0",
+  "icon": "./assets/beezi_logo.svg"
 }

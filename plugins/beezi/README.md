@@ -21,6 +21,54 @@ that picks everything up; the plugin also prints this reminder once per machine.
 if you do not — the machine stays linked either way — but authentication status and diagnostics
 only read correctly from a fresh session.
 
+## What this plugin sends, and where
+
+The plugin sends data to **one place: the Beezi API at `https://beezi-api-prod.azurewebsites.net`**.
+It sends nothing until you run `/beezi:login`, and nothing after `/beezi:logout`. The
+`/beezi:analytics` skill reaches the same API through the plugin's local MCP bridge
+(`scripts/mcp.mjs`).
+
+What it sends, per session and per repository/branch the session touched:
+
+- **Usage numbers** — input, output and cache token counts, per model and effort level; tool-call
+  counts by category (file, search, shell, MCP server name, skill name); active duration; start and
+  end times and your timezone; a working/waiting/idle timeline; lines added and removed per file
+  extension; and the line count of the `CLAUDE.md` the work ran under.
+  Session history is uploaded the same way: once at the end of `/beezi:login`, and again when you run
+  `/beezi:sync`.
+- **Where the work happened** — the repository's `origin` remote with any credentials stripped, the
+  branch name and Beezi task id, and, for work outside a git repository, the folder name
+  (`local:<folder>`).
+- **The session name** that Claude Code shows in `/status`. Claude Code may derive it from your
+  first prompt.
+- **Claude API error events** — the error type and Claude Code's error message, such as a rate
+  limit or billing error.
+- **This machine and its Claude account** — the machine's hostname, your Claude account id and
+  email, the subscription type, and your plan's usage-limit levels.
+- **A fingerprint of each Claude credential set in this machine's environment** —
+  `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` when Claude Code runs
+  through a gateway, and `AWS_ACCESS_KEY_ID` when it runs on Amazon Bedrock. A fingerprint is the
+  first 12 characters, the last 4, and the length; for an Anthropic key the first 12 are the fixed
+  key-type prefix (such as `sk-ant-oat01`). It lets Beezi tell which subscription pays for the
+  usage. The credential itself cannot be rebuilt from it and is never sent.
+- **Plugin diagnostics, only if you turn them on** with `/beezi:telemetry` — see
+  [Plugin diagnostics](#plugin-diagnostics-beezitelemetry). They are off by default.
+
+What it never sends: your prompts and Claude's replies, file contents, code, diffs, file paths,
+tool inputs or outputs, your Beezi or Claude sign-in tokens, and API keys.
+
+Two other network requests carry none of the data above:
+
+- **Sign-in**: `/beezi:login` opens your browser at Beezi's sign-in service, `https://clerk.beezi.ai`,
+  and the plugin exchanges the sign-in code there for its token. It registers this machine as a
+  sign-in client named after its hostname. `/beezi:logout` revokes that client.
+- **Update check**: the plugin reads this marketplace's public `marketplace.json` from
+  `https://raw.githubusercontent.com` to tell you when a newer version is out. That request sends
+  nothing but the fetch itself.
+
+Beezi stores your login token in the OS secret store (see [Credential storage](#credential-storage)).
+Local state lives in `~/.beezi/`.
+
 ## Commands
 
 - `/beezi:login` — link this machine (browser sign-in with your Beezi account via Clerk OAuth + PKCE); stores the credentials in the OS secret store, or a restricted-permission file when no store is available (see Credential storage below). After upgrading from 0.1.x, run it once — old device-flow tokens are invalid. The flow then captures the machine's Claude subscription plan and finishes with the **history backfill** (see below) — re-running `/beezi:login` on an already-linked machine is the way to refresh the plan or resume an interrupted backfill.

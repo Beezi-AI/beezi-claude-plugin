@@ -1,9 +1,10 @@
 {
   "name": "beezi",
-  "version": "0.30.2",
+  "version": "0.30.3",
   "private": true,
   "type": "module",
   "description": "Beezi analytics plugin for Claude Code.",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=13.2"
   },

@@ -9,10 +9,11 @@
       "name": "beezi",
       "source": "./plugins/beezi",
       "description": "Reports Claude Code session token analytics for Beezi task branches and gives you a personal usage summary on demand.",
-      "version": "0.30.2",
+      "version": "0.30.3",
       "author": {
         "name": "Beezi"
       },
+      "license": "Apache-2.0",
       "keywords": [
         "analytics",
         "token-usage",

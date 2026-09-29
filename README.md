@@ -59,3 +59,7 @@ The analytics plugin reports token counts, tool-call counts, durations, branch a
 ids, the sanitized origin remote, and the session name. Your auth token and the contents
 of `~/.claude.json` never leave the machine. Full details, including credential storage
 per OS: [`plugins/beezi/README.md`](plugins/beezi/README.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
