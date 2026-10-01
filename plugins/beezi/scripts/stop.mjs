@@ -1,6 +1,7 @@
 import { readHookInput } from '../lib/hook-input.mjs';
 import { runHook, importHookModule } from '../lib/hook-runner.mjs';
 import { maybeSpawnCostStateSync } from '../lib/cost-state-trigger.mjs';
+import { maybeSpawnCoworkLive } from '../lib/cowork-live.mjs';
 import { DIAGNOSTIC_SOURCES } from '../lib/telemetry-codes.mjs';
 
 const input = readHookInput();
@@ -13,4 +14,5 @@ runHook(DIAGNOSTIC_SOURCES.STOP, async () => {
   // this hook never learns what it did. Chosen over the statusline collector (not every user
   // installs it) and over SessionStart (already the heaviest hook we have).
   maybeSpawnCostStateSync();
+  maybeSpawnCoworkLive();
 });

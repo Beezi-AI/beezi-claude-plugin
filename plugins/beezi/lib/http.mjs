@@ -7,7 +7,14 @@ import { resolveAbortController } from './abort-compat.mjs';
 
 const DEFAULT_TIMEOUT_MS = 3000;
 
-export async function postJson(url, token, body, deps = {}) {
+export function authHeaders(session) {
+  if (session == null || typeof session.token !== 'string' || !session.token) {
+    throw new TypeError('An authenticated account session is required.');
+  }
+  return { Authorization: `Bearer ${session.token}`, ...machineHeaders(session.clientId) };
+}
+
+export async function postJson(url, session, body, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const timeoutMs = deps.timeoutMs == null ? DEFAULT_TIMEOUT_MS : deps.timeoutMs;
   const AbortControllerImpl = resolveAbortController();
@@ -17,9 +24,8 @@ export async function postJson(url, token, body, deps = {}) {
     return await fetchImpl(url, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        ...authHeaders(session),
         'Content-Type': 'application/json',
-        ...machineHeaders(),
       },
       body: JSON.stringify(body),
       signal: controller.signal,

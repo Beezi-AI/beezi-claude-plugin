@@ -104,10 +104,11 @@ export function buildSnapshotPayload(utilization, account, stamp = {}, billing =
   };
 }
 
-// Ships the rate-limit observations the status line recorded locally. Each row already carries
-// its own fetched_at, so the server's (account, fetched_at) unique key dedupes replays for free.
-// Rows are cleared only up to the last confirmed store, so a mid-drain failure retries the rest.
-export async function drainStatuslineSnapshots(token, deps = {}) {
+// Ships the rate-limit observations the status line recorded locally to EVERY linked account.
+// Each row already carries its own fetched_at, so the server's (account, fetched_at) unique key
+// dedupes replays for free. A row clears only once every account settled it, and rows are cleared
+// only up to the last settled one, so a mid-drain failure retries the rest.
+export async function drainStatuslineSnapshots(sessions, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   // The RESOLVED env when the caller has one (runCheckpoint does), so a token living in Claude
   // Code's settings file or the OS environment is visible here too. Falling back to process.env
@@ -116,7 +117,11 @@ export async function drainStatuslineSnapshots(token, deps = {}) {
   const readPending = deps.readPendingStatuslineUsage == null ? _readPendingStatuslineUsage : deps.readPendingStatuslineUsage;
   const clearPending = deps.clearPendingStatuslineUsage == null ? _clearPendingStatuslineUsage : deps.clearPendingStatuslineUsage;
   const readAccount = deps.readClaudeAccount == null ? _readClaudeAccount : deps.readClaudeAccount;
-  if (!token) return { posted: 0, reason: 'no-token' };
+  // Only accounts holding both a token and a key can settle a row, so nothing else joins the fan-out.
+  const recipients = (sessions || []).filter((s) => s && s.key);
+  const live = recipients.filter((s) => s.token);
+  const waitingForToken = live.length < recipients.length;
+  if (live.length === 0) return { posted: 0, reason: 'no-token' };
 
   const pending = readPending();
   if (!pending.length) return { posted: 0, reason: 'empty' };
@@ -151,18 +156,19 @@ export async function drainStatuslineSnapshots(token, deps = {}) {
 
   let posted = 0;
   for (const row of pending) {
-    try {
-      const res = await postJson(
-        `${apiBase()}${ENDPOINTS.usageSnapshot}`,
-        token,
-        { ...identity, ...row, limits: null, raw: null },
-        { fetchImpl },
-      );
-      if (res.status < 200 || res.status >= 300) break;
-      posted += 1;
-    } catch {
-      break;
-    }
+    const body = { ...identity, ...row, limits: null, raw: null };
+    // Settled = stored (2xx) or refused for good (any 4xx, a dark or unauthorized tenant included);
+    // only a 5xx or a transport failure is retryable, so one refusing account cannot pin the queue.
+    const settled = await Promise.all(live.map(async (session) => {
+      try {
+        const res = await postJson(`${apiBase()}${ENDPOINTS.usageSnapshot}`, session, body, { fetchImpl });
+        return (res.status >= 200 && res.status < 300) || (res.status >= 400 && res.status < 500);
+      } catch {
+        return false;
+      }
+    }));
+    if (waitingForToken || settled.some((ok) => !ok)) break;
+    posted += 1;
   }
   if (posted > 0) clearPending(posted);
   return { posted };
@@ -172,21 +178,19 @@ export async function drainStatuslineSnapshots(token, deps = {}) {
 // The marker advances only on a confirmed 2xx, so any failure (404 on an old API included)
 // retries at the next turn-end. Concurrent sessions can race and double-post; the server drops
 // duplicates on its unique key.
-export async function maybePostUsageSnapshot(token, deps = {}) {
+export async function maybePostUsageSnapshot(session, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   // See drainStatuslineSnapshots: the resolved env when the caller has one.
   const env = deps.env == null ? process.env : deps.env;
   const readUtilization = deps.readUsageUtilization == null ? _readUsageUtilization : deps.readUsageUtilization;
   const readAccount = deps.readClaudeAccount == null ? _readClaudeAccount : deps.readClaudeAccount;
-  if (!token) return { reported: false, reason: 'no-token' };
+  if (!session || !session.token || session.key == null) return { reported: false, reason: 'no-token' };
 
   let utilization = null;
   try { utilization = readUtilization(); } catch { utilization = null; }
   if (!utilization) return { reported: false, reason: 'no-utilization' };
 
-  const stateFile = usageSnapshotStateFile();
-  // The whole state is carried forward, not just lastSent: usage-ping.mjs keeps its config-mtime
-  // gate in this same file, and replacing the object would blow that marker away on every post.
+  const stateFile = usageSnapshotStateFile(session.key);
   const storedState = readJson(stateFile);
   const state = storedState == null ? {} : storedState;
   const sent = state.lastSent == null ? {} : state.lastSent;
@@ -206,10 +210,9 @@ export async function maybePostUsageSnapshot(token, deps = {}) {
   const stamp = buildIdentityStamp(account, billing, env);
   const payload = buildSnapshotPayload(utilization, account, stamp, billing);
   try {
-    const res = await postJson(`${apiBase()}${ENDPOINTS.usageSnapshot}`, token, payload, { fetchImpl });
+    const res = await postJson(`${apiBase()}${ENDPOINTS.usageSnapshot}`, session, payload, { fetchImpl });
     if (res.status >= 200 && res.status < 300) {
       writeJsonSecure(stateFile, {
-        ...state,
         version: 1,
         lastSent: { accountUuid: utilization.accountUuid, fetchedAtMs: utilization.fetchedAtMs },
       });

@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import { configCandidates } from './claude-account.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { usageSnapshotStateFile } from './paths.mjs';
+import { usagePingStateFile } from './paths.mjs';
 
 // Standalone capture of the subscription-limit cache, decoupled from runCheckpoint.
 //
@@ -42,7 +42,8 @@ export async function pingUsageSnapshot(deps = {}) {
   const mtimeMs = newestConfigMtimeMs(env, homedir, statFn);
   if (mtimeMs === 0) return { reported: false, reason: 'no-config' };
 
-  const stateFile = usageSnapshotStateFile();
+  // Machine-level: the config file is one file, so the mtime gate is asked once, not per account.
+  const stateFile = usagePingStateFile();
   const storedState = readJson(stateFile);
   const state = storedState == null ? {} : storedState;
   // The file has not been touched since we last looked, so the cache inside it cannot have moved.
@@ -54,23 +55,28 @@ export async function pingUsageSnapshot(deps = {}) {
   // with usage, so record the mtime first and let the (account, fetchedAt) marker decide whether
   // anything is actually worth sending.
   try {
-    writeJsonSecure(stateFile, { ...state, version: 1, lastSeenConfigMtimeMs: mtimeMs });
+    writeJsonSecure(stateFile, { version: 1, lastSeenConfigMtimeMs: mtimeMs });
   } catch {
     /* best-effort: a failed marker write only costs one redundant check next time */
   }
 
   // Heavy imports stay off the fast path — reached only when the config file actually changed.
-  const { getAccessToken } = await import('./token.mjs');
+  const { linkedSessions } = await import('./sessions.mjs');
   const { maybePostUsageSnapshot } = await import('./usage-snapshot-report.mjs');
   const { oauthTokenEnvWithOsProbe } = await import('./claude-settings-env.mjs');
+  const { isLiveTrackingAllowed, readTrackingState } = await import('./tracking.mjs');
 
-  let token = null;
+  let sessions = [];
   try {
-    token = await getAccessToken();
+    sessions = await linkedSessions();
   } catch {
     return { reported: false, reason: 'no-token' };
   }
-  if (!token) return { reported: false, reason: 'no-token' };
+  if (sessions.length === 0) return { reported: false, reason: 'no-token' };
+
+  // Each account answers for itself: a dark tenant is dropped before the fan-out, not at the server.
+  sessions = sessions.filter((s) => isLiveTrackingAllowed(readTrackingState(s.key)));
+  if (sessions.length === 0) return { reported: false, reason: 'tracking-disabled' };
 
   // The SAME env resolution runCheckpoint performs, so the snapshot this path posts carries the
   // same identity as the session reports that path sends. A setup token can live in Claude Code's
@@ -79,7 +85,7 @@ export async function pingUsageSnapshot(deps = {}) {
   // here would post the stale uuid this machine's other reports withhold, and the two would
   // resolve to two different accounts server-side.
   //
-  // Resolved LAST, after the mtime gate and after the token: the OS probe is the expensive part,
+  // Resolved LAST, after the mtime gate and after the sessions: the OS probe is the expensive part,
   // and a machine that never ran /beezi:login must not pay for it on every config rewrite. An
   // injected deps.env is trusted verbatim, exactly as in checkpoint — it describes a machine under
   // test, and a developer's own settings file must not leak into it.
@@ -87,9 +93,8 @@ export async function pingUsageSnapshot(deps = {}) {
     ? oauthTokenEnvWithOsProbe(process.env, { osEnvOauthToken: deps.osEnvOauthToken })
     : deps.env;
 
-  try {
-    return await maybePostUsageSnapshot(token, { ...deps, env: probedEnv });
-  } catch {
-    return { reported: false, reason: 'network' };
-  }
+  const postDeps = { ...deps, env: probedEnv };
+  const results = await Promise.all(sessions.map((s) => maybePostUsageSnapshot(s, postDeps)
+    .catch(() => ({ reported: false, reason: 'network' }))));
+  return { reported: results.some((r) => r.reported), results };
 }

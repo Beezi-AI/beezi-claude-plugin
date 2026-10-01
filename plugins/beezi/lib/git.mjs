@@ -20,8 +20,19 @@ export function git(args, cwd) {
   }).trim();
 }
 
+// A local-path origin carries the OS username; only the folder name may travel, with the same
+// `local:` prefix checkpoint.mjs's localRemote() uses so it never canonicalises onto a real server.
+// scp-style ssh (`host:path`, `user@host:path`) is NOT local: its colon follows a host of 2+ chars.
+// No `new URL()`: `remote` is the server-side repo key, and URL normalisation would fork it.
+const LOCAL_ORIGIN_RE = /^(?:file:|[A-Za-z]:[\\/]|\\\\|\/|\.{1,2}[\\/])/;
+
 export function sanitizeRemote(url) {
-  return url.replace(/\/\/[^@/]+@/, '//');
+  if (typeof url !== 'string') return url;
+  if (LOCAL_ORIGIN_RE.test(url)) {
+    const name = url.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+    return name ? `local:${name}` : 'local:';
+  }
+  return url.replace(/\/\/[^@/]+@/, '//').replace(/[?#].*$/, '');
 }
 
 // Resolve a repo's origin remote with embedded credentials stripped, or null on any

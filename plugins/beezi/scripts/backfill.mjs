@@ -1,5 +1,6 @@
 import { parseArgs, runAudit } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
+import { parseAccountFlag } from '../lib/accounts.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 
 // The login flow's final step: uploads this machine's past sessions into Beezi. There is no
@@ -15,7 +16,10 @@ function fail(message) {
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 async function main() {
-  const options = parseArgs(process.argv.slice(2));
+  const { account, rest } = await parseAccountFlag(process.argv.slice(2));
+  const options = parseArgs(rest);
+  if (account == null) fail('Beezi: backfill needs --account <key|email|n>. /beezi:login passes it automatically.');
+  options.account = account;
   const viaLogin = options.via === 'login';
 
   const result = await runAudit(
@@ -30,7 +34,14 @@ async function main() {
     options,
   );
 
-  if (result.reason === 'no-token') {
+  if (result.reason === 'busy') {
+    console.log('Beezi: another session sync is running. Run /beezi:sync after it finishes.');
+    return;
+  }
+  if (result.coworkWarnings > 0) {
+    console.log('Beezi: some Cowork cache data could not be read; run /beezi:sync again to retry.');
+  }
+  if (result.reason === 'no-account') {
     fail('Beezi: this machine is not linked. Run /beezi:login first.');
   }
   // Linked, but the credential could not be read right now — a busy OS credential store, a

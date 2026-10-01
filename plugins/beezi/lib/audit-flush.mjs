@@ -171,7 +171,7 @@ export async function readResponseBody(res) {
 // Returns { chunks, stored, skipped, itemErrors, retryableFailures, permanentRejections,
 //           unattributed, costStatesStored, costStatesSkipped, costStatesUnsupported,
 //           bySession: Map, halt, lastError }.
-export async function flushBackfillChunks(sessionGroups, token, deps = {}, options = {}) {
+export async function flushBackfillChunks(sessionGroups, session, deps = {}, options = {}) {
   const postJsonImpl = deps.postJsonImpl == null ? postJson : deps.postJsonImpl;
   const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
@@ -212,12 +212,13 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
   const url = `${apiBase()}${endpointPath}`;
   // A 401 is authentication, not a verdict on the payload. Renew once for the whole run and retry;
   // if renewal fails, the remaining chunks count as failed and stay eligible for a re-run.
+  let current = session;
   let renewed = false;
   const renewToken = async () => {
     if (renewed) return null;
     renewed = true;
-    const next = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
-    if (next && next !== token) { token = next; return next; }
+    const next = await getAccessToken({}, { account: session.key, forceRefresh: true }).catch(() => null);
+    if (next && next !== current.token) { current = { ...current, token: next }; return current; }
     return null;
   };
 
@@ -227,7 +228,7 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
     const body = { sessions: chunk.reports };
     if (chunk.timelines != null && chunk.timelines.length) body.timelines = chunk.timelines;
     if (chunk.costStates != null && chunk.costStates.length) body.costStates = chunk.costStates;
-    return postJsonImpl(url, token, body, { fetchImpl, timeoutMs });
+    return postJsonImpl(url, current, body, { fetchImpl, timeoutMs });
   };
 
   const setSession = (sessionId, status, reason) => {
@@ -500,13 +501,13 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
 
 // Seal this user's pull for the calling tool. Idempotent server-side (snapshot_taken_at is
 // COALESCEd), so retrying a lost response is safe.
-export async function completeBackfill(token, deps = {}, options = {}) {
+export async function completeBackfill(session, deps = {}, options = {}) {
   const postJsonImpl = deps.postJsonImpl == null ? postJson : deps.postJsonImpl;
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const timeoutMs = options.timeoutMs == null ? DEFAULT_BACKFILL_TIMEOUT_MS : options.timeoutMs;
   const url = `${apiBase()}${ENDPOINTS.sessionsBackfillComplete}`;
   try {
-    const res = await postJsonImpl(url, token, {}, { fetchImpl, timeoutMs });
+    const res = await postJsonImpl(url, session, {}, { fetchImpl, timeoutMs });
     if (res.status >= 200 && res.status < 300) return { completed: true, code: null };
     const { code, message } = await readResponseBody(res);
     return { completed: false, code, reason: message == null ? `HTTP ${res.status}` : message };

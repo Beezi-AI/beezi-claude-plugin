@@ -1,5 +1,5 @@
 ---
-description: Show this machine's Beezi analytics link status
+description: Show the Beezi accounts linked on this machine and which one analytics reads from
 allowed-tools: Bash(node:*)
 ---
 

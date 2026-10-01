@@ -27,17 +27,17 @@ const FRESH_MS = 6 * 60 * 60 * 1000;
 // a fast start — the nudge simply waits for the next session.
 const PROBE_TIMEOUT_MS = 1500;
 
-export function readOauthKeyStatus(deps = {}) {
+export function readOauthKeyStatus(key, deps = {}) {
   const read = deps.readJsonImpl == null ? readJson : deps.readJsonImpl;
-  const raw = read(oauthKeyStatusFile(), null);
+  const raw = read(oauthKeyStatusFile(key), null);
   if (!raw || raw.version !== STATE_VERSION) return null;
   return raw;
 }
 
-function writeOauthKeyStatus(state, deps = {}) {
+function writeOauthKeyStatus(key, state, deps = {}) {
   const write = deps.writeJsonImpl == null ? writeJsonSecure : deps.writeJsonImpl;
   try {
-    write(oauthKeyStatusFile(), { version: STATE_VERSION, ...state });
+    write(oauthKeyStatusFile(key), { version: STATE_VERSION, ...state });
   } catch { /* best-effort */ }
 }
 
@@ -46,10 +46,10 @@ function writeOauthKeyStatus(state, deps = {}) {
 // Called after a resolve lands: the answer the user just gave makes the cached one wrong, and
 // without this a key resolved seconds ago keeps its needsAttention:true verdict for up to six
 // hours and produces one more nudge telling the user to do what they already did.
-export function clearOauthKeyStatus(deps = {}) {
+export function clearOauthKeyStatus(key, deps = {}) {
   const remove = deps.unlinkImpl == null ? ((p) => fs.unlinkSync(p)) : deps.unlinkImpl;
   try {
-    remove(oauthKeyStatusFile());
+    remove(oauthKeyStatusFile(key));
     return true;
   } catch {
     // Absent already, or an unwritable home. Neither is worth surfacing — the cache is a cache.
@@ -83,16 +83,16 @@ function isUsable(cached, fingerprint, nowMs) {
 // billing is unresolved, because that is not what it observed.
 //
 // Best-effort by contract, like every other hook path: it never throws.
-export async function fetchOauthKeyStatus(token, deps = {}) {
+export async function fetchOauthKeyStatus(session, deps = {}) {
   // A token set in ~/.claude/settings.json reaches us as process.env in a normal session; when it
   // does not, oauthTokenEnv fills that one key. An INJECTED deps.env is trusted verbatim — it
   // describes a machine under test, and a developer's own settings file must not leak into it.
   const env = deps.env == null ? oauthTokenEnv(process.env) : deps.env;
   const fingerprint = keyFingerprint(env.CLAUDE_CODE_OAUTH_TOKEN);
-  if (!token || fingerprint == null) return null;
+  if (!session || !session.token || session.key == null || fingerprint == null) return null;
 
   const now = deps.now == null ? new Date() : deps.now;
-  const cached = readOauthKeyStatus(deps);
+  const cached = readOauthKeyStatus(session.key, deps);
   // `refresh` forces a live read. Used right after a check-in registers this key: the cached answer
   // is from before it existed server-side, and believing it would report the key as unknown for
   // another six hours.
@@ -115,7 +115,7 @@ export async function fetchOauthKeyStatus(token, deps = {}) {
     const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
     const res = await postJson(
       `${apiBase()}${ENDPOINTS.credentialStatus}`,
-      token,
+      session,
       { prefix: fingerprint.prefix, last4: fingerprint.last4, length: fingerprint.length },
       { fetchImpl, timeoutMs: PROBE_TIMEOUT_MS },
     );
@@ -143,6 +143,7 @@ export async function fetchOauthKeyStatus(token, deps = {}) {
       planSource: typeof body.planSource === 'string' ? body.planSource : null,
     };
     writeOauthKeyStatus(
+      session.key,
       { fingerprint, checkedAt: now.toISOString(), ...status },
       deps,
     );

@@ -159,17 +159,17 @@ export function payloadHash(payload) {
   return crypto.createHash('sha256').update(canonicalJson(payload)).digest('hex');
 }
 
-export function readAccountSyncState(deps = {}) {
+export function readAccountSyncState(key, deps = {}) {
   const read = deps.readJsonImpl == null ? readJson : deps.readJsonImpl;
-  const raw = read(accountSyncStateFile(), null);
+  const raw = read(accountSyncStateFile(key), null);
   if (!raw || raw.version !== STATE_VERSION) return null;
   return raw;
 }
 
-function writeAccountSyncState(state, deps = {}) {
+function writeAccountSyncState(key, state, deps = {}) {
   const write = deps.writeJsonImpl == null ? writeJsonSecure : deps.writeJsonImpl;
   try {
-    write(accountSyncStateFile(), { version: STATE_VERSION, ...state });
+    write(accountSyncStateFile(key), { version: STATE_VERSION, ...state });
   } catch { /* best-effort */ }
 }
 
@@ -190,7 +190,7 @@ function dueForResync(state, nowMs) {
 // re-read, and a fresh login may inherit the previous identity's cached hash). `options.via` names
 // the caller for local reasoning only — it is NEVER part of the wire body: the API whitelists the
 // DTO, so one unknown key would 400 the whole check-in silently.
-export async function syncAccountIfNeeded(token, options = {}, deps = {}) {
+export async function syncAccountIfNeeded(session, options = {}, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const readConfig = deps.readBillingConfig == null ? _readBillingConfig : deps.readBillingConfig;
   // A token set in ~/.claude/settings.json reaches us as process.env in a normal session; when it
@@ -199,7 +199,7 @@ export async function syncAccountIfNeeded(token, options = {}, deps = {}) {
   const env = deps.env == null ? oauthTokenEnv(process.env) : deps.env;
   const now = deps.now == null ? new Date() : deps.now;
   const force = options.force === true;
-  if (!token) return { synced: false, reason: 'no-token' };
+  if (!session || !session.token) return { synced: false, reason: 'no-token' };
 
   try {
     let config = null;
@@ -208,15 +208,19 @@ export async function syncAccountIfNeeded(token, options = {}, deps = {}) {
     if (isEmptyPayload(payload)) return { synced: false, reason: 'nothing-known' };
 
     const hash = payloadHash(payload);
-    const state = readAccountSyncState(deps);
+    // A keyless session (the pre-index login handshake) still checks in; it just has nowhere to
+    // record the marker, so it re-sends next time.
+    const state = session.key == null ? null : readAccountSyncState(session.key, deps);
     const unchanged = state != null && state.lastSyncedHash === hash;
     if (!force && unchanged && !dueForResync(state, now.getTime())) {
       return { synced: false, reason: 'unchanged' };
     }
 
-    const res = await postJson(`${apiBase()}${ENDPOINTS.accountSync}`, token, payload, { fetchImpl });
+    const res = await postJson(`${apiBase()}${ENDPOINTS.accountSync}`, session, payload, { fetchImpl });
     if (res != null && res.status >= 200 && res.status < 300) {
-      writeAccountSyncState({ lastSyncedHash: hash, lastSyncedAt: now.toISOString() }, deps);
+      if (session.key != null) {
+        writeAccountSyncState(session.key, { lastSyncedHash: hash, lastSyncedAt: now.toISOString() }, deps);
+      }
       return { synced: true, status: res.status };
     }
     // The marker is left untouched on any refusal, so the next trigger retries.

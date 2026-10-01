@@ -55,9 +55,39 @@ export function homeSuffix() {
   return `-h${crypto.createHash('sha256').update(resolved).digest('hex').slice(0, 8)}`;
 }
 
+// The machine's account index: { version, default, accounts: [...] }. Root-level beside the
+// per-account dirs, so one read names every linked account and which one the default reads.
+export function accountsIndexFile() {
+  return path.join(beeziHome(), 'accounts.json');
+}
+
+export function accountsRoot() {
+  return path.join(beeziHome(), 'accounts');
+}
+
+// Held by mkdir while the single-account store is folded into accounts/<key>/; see
+// migrateSingleAccountStore. Outside accountsRoot() so the migration never nests inside its work.
+export function migrationLockDir() {
+  return path.join(beeziHome(), 'accounts.migrate.lock');
+}
+
+// Every account-keyed path goes through this: the key reaches OS-store entry names and directory
+// names, so anything but 8 lowercase hex is rejected here rather than escaping into a path.
+function requireKey(key) {
+  if (typeof key !== 'string' || !/^[0-9a-f]{8}$/.test(key)) {
+    throw new Error(`invalid account key: ${key}`);
+  }
+  return key;
+}
+
+export function accountDir(key) {
+  return path.join(accountsRoot(), requireKey(key));
+}
+
 // OS-store service holding the generation entries ('beezi-credentials-dev-h1a2b3c4d' on a dev
 // variant with a custom home). Distinct from the legacy service on every platform: the
 // pre-generation plugin's delete keys on that name alone and must not reach the new entries.
+// One service for the machine: the ACCOUNT key is carried by each entry's account field.
 export function credentialService() {
   return `beezi-credentials${envSuffix()}${homeSuffix()}`;
 }
@@ -68,41 +98,48 @@ export function legacyCredentialService() {
 }
 
 // Generation store: control.json names the committed generation; gen-<n>.json holds a
-// file-backed generation. Root-level like credentials.json — pruneStale() sweeps state/ and queue/.
-export function credentialStoreDir() {
+// file-backed generation. Inside the account dir, which pruneStale() never sweeps.
+export function credentialStoreDir(key) {
+  return path.join(accountDir(key), 'credentials');
+}
+
+export function credentialControlFile(key) {
+  return path.join(credentialStoreDir(key), 'control.json');
+}
+
+export function credentialGenerationFile(key, generation) {
+  return path.join(credentialStoreDir(key), `gen-${generation}.json`);
+}
+
+// The account's credential lock shared by refresh, login's final commit and logout. Not
+// token-refresh.lock: a pre-generation process still running breaks that one by age. Per account,
+// so a refresh on one account never queues behind another's.
+export function credentialLockDir(key) {
+  return path.join(accountDir(key), 'credentials.lock');
+}
+
+// The pre-multi-account generation store, at <home>/credentials with its own control.json. Read
+// and emptied once by migrateSingleAccountStore; nothing else ever touches it.
+export function legacyGenerationStoreDir() {
   return path.join(beeziHome(), 'credentials');
-}
-
-export function credentialControlFile() {
-  return path.join(credentialStoreDir(), 'control.json');
-}
-
-export function credentialGenerationFile(generation) {
-  return path.join(credentialStoreDir(), `gen-${generation}.json`);
-}
-
-// The namespace-wide credential lock shared by refresh, login's final commit and logout. Not
-// token-refresh.lock: a pre-generation process still running breaks that one by age.
-export function credentialLockDir() {
-  return path.join(beeziHome(), 'credentials.lock');
 }
 
 // Written by the refresh worker under the credential lock, just before it submits a grant, and
 // cleared when the attempt settles. A marker left behind by a dead worker is the only evidence
 // that a rotating refresh token may have been consumed without its replacement being stored.
-export function refreshInflightFile() {
-  return path.join(credentialStoreDir(), 'refresh.inflight.json');
+export function refreshInflightFile(key) {
+  return path.join(credentialStoreDir(key), 'refresh.inflight.json');
 }
 
 // Everything the accessor needs to answer without touching a backend: the last non-ready
 // reason, the retry backoff for the current generation, and the reauth marker naming the ONE
 // generation the provider rejected. Never holds a token.
-export function authStateFile() {
-  return path.join(credentialStoreDir(), 'auth-state.json');
+export function authStateFile(key) {
+  return path.join(credentialStoreDir(key), 'auth-state.json');
 }
 
-export function queueDir() {
-  return path.join(beeziHome(), 'queue');
+export function queueDir(key) {
+  return path.join(accountDir(key), 'queue');
 }
 
 export function stateDir() {
@@ -114,36 +151,42 @@ export function repoMapFile() {
   return path.join(beeziHome(), 'repo-map.json');
 }
 
-// Durable "already imported" ledger for /beezi:import. Deliberately at the beeziHome() ROOT and
+// Durable "already imported" ledger for /beezi:import. Deliberately at the account dir ROOT and
 // not under state/ or queue/: pruneStale() deletes 14-day-old files in both of those, so a marker
 // living there would expire and make every old session look importable again on the next run.
-export function auditLedgerFile() {
-  return path.join(beeziHome(), 'audit-ledger.json');
+export function auditLedgerFile(key) {
+  return path.join(accountDir(key), 'audit-ledger.json');
 }
 
-// Cached tenant tracking state (whoami's trackingMode/tier/backfillCompleted). Root-level for
-// the same pruneStale() reason as the audit ledger — an expiring gate would silently re-enable
-// tracking for dark-mode tenants.
-export function trackingStateFile() {
-  return path.join(beeziHome(), 'tracking.json');
+// Cached tenant tracking state (whoami's trackingMode/tier/backfillCompleted). At the account dir
+// root for the same pruneStale() reason as the audit ledger — an expiring gate would silently
+// re-enable tracking for dark-mode tenants.
+export function trackingStateFile(key) {
+  return path.join(accountDir(key), 'tracking.json');
 }
 
 // Last-sent account check-in marker: { version, lastSyncedHash, lastSyncedAt }. Root-level for
 // the same pruneStale() reason as the audit ledger and the tracking cache — an expiring marker
 // would re-POST the same unchanged account payload on every session start.
-// The portal's last answer about this machine's setup token. Root of beeziHome() beside
-// billing.json, not under state/: pruneStale() sweeps state/ and queue/, and an expiring answer
-// would re-nag a user who already fixed their plan.
-export function oauthKeyStatusFile() {
-  return path.join(beeziHome(), 'oauth-key-status.json');
+// The portal's last answer about this machine's setup token. Root of the account dir, not under
+// state/: pruneStale() sweeps state/ and queue/, and an expiring answer would re-nag a user who
+// already fixed their plan.
+export function oauthKeyStatusFile(key) {
+  return path.join(accountDir(key), 'oauth-key-status.json');
 }
 
 // Which key fingerprints have already been told that they bill a subscription some earlier sign-in
-// established: { version, notified: [ "<prefix>...<last4>:<length>", ... ] }. Root-level for the
-// same pruneStale() reason as the others — an expiring marker would re-deliver a notice the user
-// has already read and cannot act on from here.
-export function keyNoticeFile() {
-  return path.join(beeziHome(), 'key-notice.json');
+// established: { version, notified: [ "<prefix>...<last4>:<length>", ... ] }. At the account dir
+// root for the same pruneStale() reason as the others — an expiring marker would re-deliver a
+// notice the user has already read and cannot act on from here.
+export function keyNoticeFile(key) {
+  return path.join(accountDir(key), 'key-notice.json');
+}
+
+// The one-shot "the store was migrated, restart Claude Code" flag: { upgradeNotice }. Machine-
+// level because the pre-upgrade process it warns about is one per machine, not one per account.
+export function upgradeNoticeFile() {
+  return path.join(beeziHome(), 'upgrade-notice.json');
 }
 
 // The last reading of the published marketplace manifest: { version, checkedAt, pluginName,
@@ -157,12 +200,12 @@ export function updateCheckFile() {
 // The hourly gate for the background cost-state backfill: { version, attemptedAt, lastScanAt }.
 // Root of beeziHome(), NOT state/ — pruneStale() clears that directory after 14 days, and an
 // expiring gate would re-run the whole scan on the next Stop hook after a quiet fortnight.
-export function costStateSyncFile() {
-  return path.join(beeziHome(), 'cost-state-sync.json');
+export function costStateSyncFile(key) {
+  return path.join(key == null ? beeziHome() : accountDir(key), 'cost-state-sync.json');
 }
 
-export function accountSyncStateFile() {
-  return path.join(beeziHome(), 'account-sync.json');
+export function accountSyncStateFile(key) {
+  return path.join(accountDir(key), 'account-sync.json');
 }
 
 // The pre-generation credential file. Read for migration, and still probed as a "linked" hint by
@@ -176,8 +219,14 @@ export function billingConfigFile() {
 }
 
 // Last-sent usage-snapshot marker: { version, lastSent: { accountUuid, fetchedAtMs } }.
-export function usageSnapshotStateFile() {
-  return path.join(beeziHome(), 'usage-snapshot.json');
+export function usageSnapshotStateFile(key) {
+  return path.join(accountDir(key), 'usage-snapshot.json');
+}
+
+// Machine-level mtime gate for usage-ping: the Claude config it watches is one per machine, so
+// every account's ping shares this one reading rather than re-probing the OS per account.
+export function usagePingStateFile() {
+  return path.join(beeziHome(), 'usage-ping.json');
 }
 
 // Rate-limit observations captured by the status line, awaiting the next drain. Separate from

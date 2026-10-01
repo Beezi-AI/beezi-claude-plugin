@@ -93,8 +93,8 @@ start fills it in from the resolution. Either way nothing else needs running.
 ## Step 2 — capture what a non-setup-token machine can prove
 
 Only for the two rows in Step 1 that send you here (`"no_key"` and
-`"not_linked"`). Run EXACTLY this one command — do not modify it and do not
-substitute your own:
+`"not_linked"`). Run EXACTLY this command, adding only the same `--account <key>`
+when one was selected for Step 1:
 
 `node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs --from-claude --via refresh`
 
@@ -108,3 +108,5 @@ not found. If the output says the self-reported plan was kept, report that
 verbatim. If the output contains `gateway=custom`, tell the user this machine goes
 through a custom API endpoint, so only they can say what it bills — point them at
 `/beezi:login`, which asks.
+
+Account selection: Use the default Beezi account unless the user specifies another. Carry the same `--account <key>` through every key-resolve and billing-capture command in this flow.

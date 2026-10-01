@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { credentialLockDir } from './paths.mjs';
+import { beeziHome, credentialLockDir } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
 import { processStartTime as _processStartTime, ownStartTime } from './process-start-time.mjs';
 
@@ -22,6 +22,7 @@ export const START_TIME_TOLERANCE_S = 3;
 const OWNER = 'owner.json';
 const NONCE = /^[0-9a-f]{32}$/;
 const TOMBSTONE = /^owner\.[0-9a-f]{32}\.dead$/;
+const lockDir = (account) => account === 'account-migration' ? path.join(beeziHome(), 'accounts.migrate.lock') : account === 'account-index' ? path.join(beeziHome(), 'accounts.write.lock') : account === 'account-lifecycle' ? path.join(beeziHome(), 'accounts.lifecycle.lock') : account === 'legacy-store' ? path.join(beeziHome(), 'credentials.lock') : credentialLockDir(account);
 const ownerFile = (dir) => path.join(dir, OWNER);
 
 // Signal 0 probes without killing. EPERM means the pid exists under another user: alive.
@@ -89,14 +90,15 @@ function remove(dir) {
 }
 
 // mkdir is the atomic primitive: it either creates the lock or fails because someone holds it.
-function tryAcquire(dir) {
+// The handle carries its own account, so release and the CAS guards never need it passed again.
+function tryAcquire(dir, account) {
   try {
     fs.mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
     fs.mkdirSync(dir, { recursive: false });
   } catch {
     return null;
   }
-  const lock = { pid: process.pid, nonce: crypto.randomBytes(16).toString('hex') };
+  const lock = { account, pid: process.pid, nonce: crypto.randomBytes(16).toString('hex') };
   try {
     writeOwner(dir, { pid: lock.pid, nonce: lock.nonce, startedAt: ownStartTime(), acquiredAt: Date.now() });
   } catch (error) {
@@ -161,8 +163,9 @@ async function reclaimIfDead(dir, probes) {
   return remove(dir);
 }
 
-// Waits up to `waitMs`, polling every `pollMs`, for the namespace's credential lock. Returns the
-// handle { pid, nonce } to pass to the store's commit/delete and to release, or null on timeout.
+// Waits up to `waitMs`, polling every `pollMs`, for `options.account`'s credential lock. Returns
+// the handle { account, pid, nonce } to pass to the store's commit/delete and to release, or null
+// on timeout.
 // The deadline runs on the real clock on purpose: callers inject fake clocks for token expiry.
 // deps: isAlive(pid), processStartTime(pid) → epoch seconds | null, sleep(ms), and reclaimStep(name)
 // — a test seam awaited before the 'tombstone' rename and before the 'remove'.
@@ -182,10 +185,11 @@ export async function acquireCredentialLock(options = {}, deps = {}) {
     },
     reclaimStep: deps.reclaimStep == null ? (() => undefined) : deps.reclaimStep,
   };
-  const dir = credentialLockDir();
+  const account = options.migration === true ? 'account-migration' : options.index === true ? 'account-index' : options.lifecycle === true ? 'account-lifecycle' : options.legacyStore === true ? 'legacy-store' : options.account;
+  const dir = lockDir(account);
   const deadline = Date.now() + waitMs;
   for (;;) {
-    const lock = tryAcquire(dir);
+    const lock = tryAcquire(dir, account);
     if (lock) return lock;
     if (await reclaimIfDead(dir, probes)) continue;
     if (Date.now() >= deadline) return null;
@@ -193,16 +197,17 @@ export async function acquireCredentialLock(options = {}, deps = {}) {
   }
 }
 
-// True while a record carrying the caller's nonce is in the lock directory — as owner.json, or as
-// a tombstone a reclaimer is about to hand back.
+// True while a record carrying the caller's nonce is in the handle's own lock directory — as
+// owner.json, or as a tombstone a reclaimer is about to hand back.
 export function holdsCredentialLock(lock) {
-  return lock != null && findRecord(credentialLockDir(), lock.nonce) != null;
+  if (lock == null || typeof lock.account !== 'string') return false;
+  return findRecord(lockDir(lock.account), lock.nonce) != null;
 }
 
 // Releases only a lock the caller still owns; anything else is a no-op that returns false.
 export function releaseCredentialLock(lock) {
-  if (lock == null) return false;
-  const dir = credentialLockDir();
+  if (lock == null || typeof lock.account !== 'string') return false;
+  const dir = lockDir(lock.account);
   for (let attempt = 0; attempt < 3; attempt++) {
     const record = findRecord(dir, lock.nonce);
     if (record == null) return false;
@@ -215,6 +220,10 @@ export function releaseCredentialLock(lock) {
 }
 
 // The current owner record { pid, nonce, startedAt, acquiredAt }, or null when nothing holds it.
-export function readCredentialLockOwner() {
-  return readOwner(credentialLockDir());
+export function readCredentialLockOwner(account) {
+  return readOwner(lockDir(account));
+}
+
+export function acquireAccountLifecycleLock(options = {}, deps = {}) {
+  return acquireCredentialLock({ ...options, lifecycle: true }, deps);
 }

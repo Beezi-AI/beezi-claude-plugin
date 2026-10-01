@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
@@ -86,14 +86,22 @@ function tokenFrom(r) {
 // without ever reporting anything.
 function runRead(run, file, args, input, options) {
   const interactive = options != null && options.interactive === true;
-  return run(file, args, input, {
-    timeoutMs: interactive ? INTERACTIVE_READ_TIMEOUT_MS : HOOK_READ_TIMEOUT_MS,
+  const timeoutMs = interactive ? INTERACTIVE_READ_TIMEOUT_MS : HOOK_READ_TIMEOUT_MS;
+  if (run !== defaultRun) return run(file, args, input, { timeoutMs });
+  return new Promise((resolve) => {
+    const child = execFile(file, args, { encoding: 'utf-8', windowsHide: true,
+      timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 }, (error, stdout) => {
+      resolve({ ok: !error, stdout: stdout || '', timedOut: Boolean(error && (error.killed || error.code === 'ETIMEDOUT')) });
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(input == null ? undefined : input);
   });
 }
 
 // { token, timedOut } from a read attempt, so the store can tell an absent credential from one it
 // simply could not get to in time.
 function readResult(r) {
+  if (r && typeof r.then === "function") return r.then(readResult);
   return { token: tokenFrom(r), timedOut: r.timedOut === true };
 }
 
@@ -107,7 +115,10 @@ function fileDelete(file) {
 // Every backend defines read(entry) -> { token, timedOut }; get(entry) -> string|null is derived
 // from it, so the many callers that only want a token keep working unchanged.
 function withGet(backend) {
-  backend.get = (entry, options) => backend.read(entry, options).token;
+  backend.get = (entry, options) => {
+    const value = backend.read(entry, options);
+    return value && typeof value.then === "function" ? value.then((r) => r.token) : value.token;
+  };
   return backend;
 }
 

@@ -4,7 +4,7 @@ import { readCredentials, CREDENTIAL_STATUS, UNAVAILABLE_REASONS } from './crede
 import { readCredentialLockOwner } from './credential-lock.mjs';
 import { credentialControlFile } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
-import { setMachineClientId } from './machine-identity.mjs';
+import { getDefaultKey } from './accounts.mjs';
 import { spawnDetached } from './background-spawn.mjs';
 import { AUTH_STATES, AUTH_REASONS } from './auth-state.mjs';
 import { recordAuthResult } from './telemetry-auth.mjs';
@@ -47,6 +47,17 @@ function result(authState, reason, extra) {
 // better evidence of expiry than this client's own estimate of an opaque token's lifetime.
 // `options.waitMs` is how long to wait on the detached worker (default: the hook budget).
 export async function getAuthentication(deps = {}, options = {}) {
+  let account = options.account;
+  if (account == null) {
+    try { account = await getDefaultKey(deps); }
+    catch (error) {
+      const reason = error.credentialStatus === CREDENTIAL_STATUS.STORAGE_CONFLICT
+        ? AUTH_REASONS.STORAGE_CONFLICT : (STORAGE_REASONS[error.reason] || AUTH_REASONS.STORAGE_UNAVAILABLE);
+      return result(AUTH_STATES.UNAVAILABLE, reason);
+    }
+  }
+  if (account == null) return result(AUTH_STATES.UNLINKED, AUTH_REASONS.NO_CREDENTIALS);
+  const settle = (value) => settleAccount(account, value);
   const now = deps.now == null ? Date.now : deps.now;
   const looksFresh = (c) => (c == null || c.expires_at == null ? 0 : c.expires_at) - now() > SKEW_MS;
 
@@ -57,7 +68,7 @@ export async function getAuthentication(deps = {}, options = {}) {
 
   let first;
   try {
-    first = await readCredentials(deps, { interactive });
+    first = await readCredentials(deps, { account, interactive });
   } catch { first = null; }
   if (first == null) return settle(result(AUTH_STATES.UNAVAILABLE, AUTH_REASONS.STORAGE_UNAVAILABLE));
   if (first.status === CREDENTIAL_STATUS.NONE) {
@@ -73,18 +84,18 @@ export async function getAuthentication(deps = {}, options = {}) {
     return settle(result(AUTH_STATES.UNAVAILABLE, reason));
   }
 
-  setMachineClientId(first.credentials.client_id);
+
   const generation = first.generation;
   // The migrating read can land in ANY process — the MCP bridge, the statusline, a checkpoint —
   // so the flag is parked here and session-start prints the notice whenever it next runs.
-  const migrated = first.migrated === true ? { migrated: true } : {};
+  const migrated = { clientId: first.credentials.client_id, ...(first.migrated === true ? { migrated: true } : {}) };
   if (first.migrated === true) {
     try { markUpgradeNoticePending(); } catch { /* best-effort */ }
   }
 
   // A generation the provider has definitively rejected. Nothing was deleted; the credentials
   // and the registered client are still there, and only a new login clears this.
-  const reauth = readReauthMarker(generation);
+  const reauth = readReauthMarker(account, generation);
   if (reauth != null) {
     return settle(result(AUTH_STATES.REAUTH_REQUIRED, reauth.reason, { generation, ...migrated }));
   }
@@ -99,7 +110,7 @@ export async function getAuthentication(deps = {}, options = {}) {
 
   // Somebody is already on it. A marker whose owner is gone means the grant may have been spent
   // without its replacement landing — the worker records that and preserves the credentials.
-  const inflight = readInflight();
+  const inflight = readInflight(account);
   if (inflight != null && inflight.generation === generation && isWorkerAlive(inflight, deps)) {
     return settle(result(
       AUTH_STATES.REFRESHING, AUTH_REASONS.REFRESH_IN_PROGRESS, { generation, ...migrated },
@@ -109,23 +120,23 @@ export async function getAuthentication(deps = {}, options = {}) {
   // Seven hooks can fire together on one expiring token. A live lock owner means somebody is
   // already doing this work, and spawning six more workers that all answer `busy` costs six
   // node processes for nothing.
-  const owner = readCredentialLockOwner();
+  const owner = readCredentialLockOwner(account);
   if (owner != null && isWorkerAlive({ pid: owner.pid, startedAt: owner.startedAt }, deps)) {
     return settle(result(
       AUTH_STATES.REFRESHING, AUTH_REASONS.REFRESH_IN_PROGRESS, { generation, ...migrated },
     ));
   }
 
-  const backoff = inflight == null ? readBackoff(generation) : null;
+  const backoff = inflight == null ? readBackoff(account, generation) : null;
   if (backoff != null && backoff.nextAttemptAt > now() && !options.ignoreBackoff) {
     return settle(result(AUTH_STATES.UNAVAILABLE, backoff.reason, { generation, ...migrated }));
   }
 
   const spawn = deps.spawnWorker == null ? defaultSpawnWorker : deps.spawnWorker;
-  const spawned = spawn(generation, Boolean(options.forceRefresh), deps);
+  const spawned = spawn(generation, Boolean(options.forceRefresh), { ...deps, account });
   const waitMs = options.waitMs == null ? HOOK_REFRESH_WAIT_MS : options.waitMs;
-  const settledResult = await waitForWorker(generation, waitMs, deps);
-  if (settledResult != null) return settle({ ...settledResult, ...migrated });
+  const settledResult = await waitForWorker(account, generation, waitMs, deps);
+  if (settledResult != null) return settle({ ...migrated, ...settledResult });
   if (!spawned) {
     // A machine that refuses to spawn (EPERM, EMFILE, a locked-down policy) can still recover:
     // the next hook tries again. Its own reason, not refresh_interrupted — no worker ever
@@ -145,25 +156,25 @@ function ready(accessToken, generation, migrated = {}) {
 
 // Records the transition and turns the first `ready` after any non-ready state into `recovered`,
 // which is the event Task 5 reports as a recovery rather than as normal traffic.
-function settle(value) {
-  const recovering = value.authState === AUTH_STATES.READY && !wasReady();
+function settleAccount(account, value) {
+  const recovering = value.authState === AUTH_STATES.READY && !wasReady(account);
   const reason = recovering ? AUTH_REASONS.RECOVERED : value.reason;
-  recordAuthResult({ authState: value.authState, reason });
-  try { recordLastAuthState(value.authState, value.authState === AUTH_STATES.READY ? AUTH_REASONS.OK : reason); }
+  recordAuthResult({ authState: value.authState, reason }, { account });
+  try { recordLastAuthState(account, value.authState, value.authState === AUTH_STATES.READY ? AUTH_REASONS.OK : reason); }
   catch { /* a state hint is never worth failing a hook over */ }
   return { ...value, reason };
 }
 
-function wasReady() {
+function wasReady(account) {
   try {
-    return wasLastStateReady();
+    return wasLastStateReady(account);
   } catch {
     return true; // unknown: report `ok`, never a false recovery
   }
 }
 
 function defaultSpawnWorker(generation, force, deps) {
-  const args = ['--generation', String(generation)];
+  const args = ['--account', deps.account, '--generation', String(generation)];
   if (force) args.push('--force');
   return spawnDetached(WORKER_SCRIPT, deps, args);
 }
@@ -171,25 +182,25 @@ function defaultSpawnWorker(generation, force, deps) {
 // Polls the CHEAP files only — the control record and the two markers. Rereading the credential
 // store here would spawn `security`/`secret-tool` on every poll, which costs more than the wait
 // it is trying to bound. One real read happens, at most, once a change is visible.
-async function waitForWorker(generation, waitMs, deps) {
+async function waitForWorker(account, generation, waitMs, deps) {
   const now = deps.now == null ? Date.now : deps.now;
   const sleep = deps.sleep == null ? defaultSleep : deps.sleep;
   const pollMs = deps.pollMs == null ? POLL_MS : deps.pollMs;
   const deadline = now() + waitMs;
   for (;;) {
-    const control = readJson(credentialControlFile(), null);
+    const control = readJson(credentialControlFile(account), null);
     if (control != null && typeof control.generation === 'number' && control.generation !== generation) {
-      const next = await readCredentials(deps).catch(() => null);
+      const next = await readCredentials(deps, { account }).catch(() => null);
       if (next != null && next.status === CREDENTIAL_STATUS.READY) {
-        return ready(next.credentials.access_token, next.generation);
+        return ready(next.credentials.access_token, next.generation, { clientId: next.credentials.client_id });
       }
       return result(AUTH_STATES.UNAVAILABLE, AUTH_REASONS.STORAGE_UNAVAILABLE, { generation: null });
     }
-    const reauth = readReauthMarker(generation);
+    const reauth = readReauthMarker(account, generation);
     if (reauth != null) {
       return result(AUTH_STATES.REAUTH_REQUIRED, reauth.reason, { generation });
     }
-    const backoff = readBackoff(generation);
+    const backoff = readBackoff(account, generation);
     if (backoff != null && backoff.nextAttemptAt > now()) {
       return result(AUTH_STATES.UNAVAILABLE, backoff.reason, { generation });
     }

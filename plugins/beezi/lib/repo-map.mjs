@@ -81,7 +81,8 @@ export function knownOrigin(root, map) {
   if (!nr || map == null || map.roots == null) return null;
   const entry = map.roots[nr];
   if (!entry) return null;
-  return entry.origin == null ? null : entry.origin;
+  // Re-sanitize: cached values may predate the current sanitizer (query strings, local paths).
+  return entry.origin == null ? null : sanitizeRemote(entry.origin);
 }
 
 // Drop roots whose .git no longer exists. Mutates `map`; returns the count removed.

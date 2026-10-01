@@ -3,8 +3,8 @@ description: Upload past Claude Code sessions to Beezi analytics, skipping ones 
 allowed-tools: Bash(node:*)
 ---
 
-Run EXACTLY this one command — do not modify it, do not add flags, and do not read
-or inspect any files yourself:
+Run EXACTLY this one command — do not modify it apart from the `--account` flag
+below, and do not read or inspect any files yourself:
 
 `node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs`
 
@@ -23,3 +23,5 @@ Notes for interpreting the output:
 - If it says the portal does not support `/beezi:sync` yet, the workspace's Beezi
   server needs updating — the user's history is not lost, and the command will work
   after the update.
+
+Account selection: With no flag, sync processes every linked account in turn. Add `--account <key>` to target one account.

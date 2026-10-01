@@ -15,6 +15,8 @@ import { keyNoticeFile } from './paths.mjs';
 // actionable nudges beside it stop being read.
 //
 // Keyed by fingerprint, so rotating the token re-arms it: a different key is a different question.
+// And keyed per ACCOUNT, because the verdict it delivers is one account's portal answer — one
+// account having read the notice must not silence the same question asked of another.
 
 const NOTICE_VERSION = 1;
 
@@ -31,20 +33,20 @@ function noticeKey(fingerprint) {
   return `${prefix}...${last4}:${length}`;
 }
 
-function readNotices(deps) {
+function readNotices(key, deps) {
   const read = deps.readJsonImpl == null ? readJson : deps.readJsonImpl;
-  const raw = read(keyNoticeFile(), null);
+  const raw = read(keyNoticeFile(key), null);
   if (!raw || raw.version !== NOTICE_VERSION || !Array.isArray(raw.notified)) return [];
   return raw.notified.filter((entry) => typeof entry === 'string');
 }
 
 // Has this key already been told? Unreadable state reads as "not yet": showing a notice twice is a
 // smaller failure than never showing it at all.
-export function hasKeyBeenNotified(fingerprint, deps = {}) {
-  const key = noticeKey(fingerprint);
-  if (key == null) return false;
+export function hasKeyBeenNotified(key, fingerprint, deps = {}) {
+  const notice = noticeKey(fingerprint);
+  if (key == null || notice == null) return false;
   try {
-    return readNotices(deps).indexOf(key) !== -1;
+    return readNotices(key, deps).indexOf(notice) !== -1;
   } catch {
     return false;
   }
@@ -52,19 +54,19 @@ export function hasKeyBeenNotified(fingerprint, deps = {}) {
 
 // Record that it has. Best-effort by contract — the caller is a session-start hook, and a failed
 // marker write must cost at most one repeated line, never a broken session.
-export function markKeyNotified(fingerprint, deps = {}) {
-  const key = noticeKey(fingerprint);
-  if (key == null) return false;
+export function markKeyNotified(key, fingerprint, deps = {}) {
+  const notice = noticeKey(fingerprint);
+  if (key == null || notice == null) return false;
   const write = deps.writeJsonImpl == null ? writeJsonSecure : deps.writeJsonImpl;
   try {
-    const notified = readNotices(deps);
-    if (notified.indexOf(key) !== -1) return true;
-    notified.push(key);
+    const notified = readNotices(key, deps);
+    if (notified.indexOf(notice) !== -1) return true;
+    notified.push(notice);
     // Bounded: a machine that rotates its token often must not grow this file without limit. The
     // oldest entries go first — a key nobody has used for that many rotations asking again is a
     // fair trade against an unbounded file.
     const capped = notified.length > 20 ? notified.slice(notified.length - 20) : notified;
-    write(keyNoticeFile(), { version: NOTICE_VERSION, notified: capped });
+    write(keyNoticeFile(key), { version: NOTICE_VERSION, notified: capped });
     return true;
   } catch {
     return false;

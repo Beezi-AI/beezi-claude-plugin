@@ -14,6 +14,7 @@ const generation = Number(argValue('--generation'));
 const watchdog = setTimeout(() => process.exit(0), WORKER_BUDGET_MS + 5_000);
 
 runRefreshWorker({
+  account: argValue("--account"),
   generation: Number.isFinite(generation) ? generation : null,
   force: process.argv.includes('--force'),
 })

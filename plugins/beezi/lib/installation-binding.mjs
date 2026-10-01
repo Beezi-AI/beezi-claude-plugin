@@ -16,11 +16,11 @@ import { ensureInstallationId, markBound, needsBinding, rotateInstallationId } f
 // The diagnostics events carry no explicit source: binding runs on whichever authenticated hook
 // called it, and recordIssue inherits that. Stamping diagnostics_worker here said the binding
 // happened somewhere it never does.
-export async function bindInstallationIfNeeded(token, deps = {}) {
+export async function bindInstallationIfNeeded(session, deps = {}) {
   const postJsonImpl = deps.postJsonImpl == null ? postJson : deps.postJsonImpl;
   const recordIssue = deps.recordIssue == null ? _recordIssue : deps.recordIssue;
   const now = (deps.now == null ? () => Date.now() : deps.now)();
-  if (!token || !needsBinding(now)) return { status: 'skipped' };
+  if (!session || !session.token || !needsBinding(now)) return { status: 'skipped' };
 
   const installationId = ensureInstallationId(now);
   if (installationId == null) return { status: 'skipped' };
@@ -31,7 +31,7 @@ export async function bindInstallationIfNeeded(token, deps = {}) {
     // and any extra key is a 400.
     const res = await postJsonImpl(
       `${apiBase()}${ENDPOINTS.pluginDiagnosticsInstallation}`,
-      token,
+      session,
       { installationId, consentVersion: CORRELATION_CONSENT_VERSION },
       { timeoutMs: deps.timeoutMs },
     );

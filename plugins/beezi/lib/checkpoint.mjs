@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { computeDelta as _computeDelta } from './delta.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
+import { linkedSessions as _linkedSessions, diagnosticsSession } from './sessions.mjs';
+import { getDefaultKey, listAccounts as _listAccounts, AccountStatus } from './accounts.mjs';
 import { queueDir, stateDir } from './paths.mjs';
 import { git, currentBranch, resolveOriginRemote } from './git.mjs';
 import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } from './reflog.mjs';
@@ -31,7 +33,7 @@ import {
 import { claimIntervals, mergeIntervals, subtractIntervals, totalMs } from './active-time.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { claudeMdLines } from './claude-md.mjs';
-import { isLiveTrackingAllowed, markTrackingDisabled } from './tracking.mjs';
+import { isLiveTrackingAllowed, markTrackingDisabled, readTrackingState } from './tracking.mjs';
 import { readUsageUtilization as _readUsageUtilization } from './usage-utilization.mjs';
 import { readClaudeAccount as _readClaudeAccount } from './claude-account.mjs';
 import { buildIdentityStamp } from './identity-stamp.mjs';
@@ -53,10 +55,28 @@ function saveState(id, state) {
   writeJsonSecure(path.join(stateDir(), `${id}.json`), state);
 }
 
-function enqueue(payload) {
+export function enqueue(key, payload) {
   // 0600: these payloads carry session_name (prompt text), remote, and branch.
   const filename = payload.segmentId.replace(/[:/\s]/g, '_') + '.json';
-  writeJsonSecure(path.join(queueDir(), filename), payload);
+  writeJsonSecure(path.join(queueDir(key), filename), payload);
+}
+
+const FLUSH_COUNTERS = ['flushed', 'rejected', 'failed', 'expired', 'salvaged', 'quarantined'];
+
+// Sums one flush result per account into the single summary older call sites still read.
+export function mergeFlushResults(list) {
+  const merged = { flushed: 0, rejected: 0, failed: 0, expired: 0, salvaged: 0, quarantined: 0, trackingDisabled: false, lastError: null };
+  for (const r of list) {
+    if (r == null) continue;
+    for (const c of FLUSH_COUNTERS) merged[c] += r[c] == null ? 0 : r[c];
+    if (r.trackingDisabled) merged.trackingDisabled = true;
+    if (r.lastError) merged.lastError = r.lastError;
+  }
+  return merged;
+}
+
+function allowsLive(session) {
+  return isLiveTrackingAllowed(readTrackingState(session.key));
 }
 
 // Stand-in "remote" for work with no git origin behind it — a directory that isn't a repo, or a
@@ -91,8 +111,9 @@ function detectTimezone() {
 
 // `deps` holds substitutable implementations (test seams); `options` holds caller-driven execution
 // modes. Keeping them separate stops a behavior flag from masquerading as an injectable.
-// Returns { enqueued, flush, sessionErrors } — flush is the flushQueue summary (or null when it
-// never ran); sessionErrors is populated only under options.collectSessionErrors.
+// Returns { enqueued, flush, flushes, sessionErrors, skipped, gated } — flush merges the per-account
+// flushQueue summaries in `flushes` (null when the flush never ran); sessionErrors is populated only
+// under options.collectSessionErrors. `options.sessions` overrides the linked-account lookup.
 //
 // The bulk import (/beezi:import) drives this same function per past session, which is why three
 // options exist to redirect its side effects: `sink` (payloads to the caller instead of the disk
@@ -103,37 +124,42 @@ function detectTimezone() {
 // own coverage — see the three reads it overrides below.
 export async function runCheckpoint(input, deps = {}, options = {}) {
   const { session_id, transcript_path, cwd } = input;
-  const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
   const gitImpl = deps.gitImpl == null ? git : deps.gitImpl;
   const computeDelta = deps.computeDelta == null ? _computeDelta : deps.computeDelta;
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
-  // Where a built payload goes. The import collects them in memory and batches them itself;
-  // letting it fall through to the disk queue would drip-feed hundreds of segments to the
-  // single-report endpoint on the next hook, bypassing the batch route's whole-session dedupe.
-  const emit = options.sink == null ? enqueue : options.sink;
   const collectedErrors = [];
-
-  let token = null;
-  try { token = await getAccessToken(); } catch { return { enqueued: 0, flush: null, sessionErrors: collectedErrors }; }
-  if (!token) return { enqueued: 0, flush: null, sessionErrors: collectedErrors };
-
-  // Diagnostics themselves no longer ride this path — they go out over the authorization-free
-  // route from the diagnostics worker. What is left here is the one authenticated half: this is
-  // successful authenticated activity, which is exactly when a correlation ID may be bound.
-  try { await bindInstallationIfNeeded(token, { postJsonImpl: deps.postJsonImpl }); } catch { /* never block the checkpoint */ }
-  // A bounded tail-read of the transcript, cached in telemetry.json for the recorder to stamp
-  // future events with — must never throw into the checkpoint either.
-  try { rememberClaudeCodeVersion(transcript_path); } catch { /* best-effort */ }
-
-  // Tenant gate: audit-mode workspaces never track live — the server would 403 every report
-  // anyway (TrackingEnabledGuard), this just spares the work and the noise. `gated` lets
-  // /beezi:track tell "tracking is off" apart from "nothing new". The audit run passes
-  // skipLiveTrackingGate — an explicit flag, never inferred from the sink seam.
-  if (options.skipLiveTrackingGate !== true && !isLiveTrackingAllowed()) {
-    return { enqueued: 0, flush: null, sessionErrors: collectedErrors, gated: true };
+  const empty = (extra) => ({ enqueued: 0, flush: null, flushes: [], sessionErrors: collectedErrors, ...(extra || {}) });
+  let sessions;
+  try {
+    sessions = options.sessions == null ? await (deps.linkedSessions == null ? _linkedSessions : deps.linkedSessions)(deps) : options.sessions;
+  } catch { sessions = []; }
+  sessions = sessions || [];
+  // A temporarily unreadable/refreshing credential must not lose this delta: queue for every
+  // linked account, and defer only the network work until its token is usable again.
+  let recipients = sessions;
+  if (options.sessions == null) {
+    const rows = await (deps.listAccounts == null ? _listAccounts : deps.listAccounts)(deps).catch(() => []);
+    const byKey = new Map(sessions.map((session) => [session.key, session]));
+    for (const row of rows) {
+      if (row.status === AccountStatus.LINKED && !byKey.has(row.key)) byKey.set(row.key, row);
+    }
+    recipients = [...byKey.values()];
   }
+  if (recipients.length === 0) return empty();
 
-  // Below the token gate: skip this work entirely on an unlinked machine.
+  // Diagnostics use the machine-wide anonymous worker; only identity correlation is authenticated.
+  let defaultKey = null;
+  try { defaultKey = await getDefaultKey(); } catch { /* best-effort */ }
+  const diag = diagnosticsSession(sessions, defaultKey);
+  try { await bindInstallationIfNeeded(diag, { postJsonImpl: deps.postJsonImpl }); } catch { /* best-effort */ }
+  try { rememberClaudeCodeVersion(transcript_path); } catch { /* best-effort */ }
+  const targets = options.skipLiveTrackingGate === true ? recipients : recipients.filter(allowsLive);
+  if (targets.length === 0) return empty({ gated: true });
+  const liveTargets = targets.filter((session) => session.token);
+  // Fan each payload into the eligible accounts before recording a successful emission.
+  const emit = options.sink == null
+    ? (payload) => { for (const session of targets) enqueue(session.key, payload); }
+    : options.sink;
   const resolvedSessionName = resolveSessionName(session_id, transcript_path);
 
   // Memoized git shell-outs for this checkpoint: dir→root, root→remote, root→reflog/HEAD.
@@ -193,7 +219,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // upload, and nothing wrong) from one we dropped for a reason worth reporting. Only the
   // problem cases are counted: "no usage" is the absence of all of them.
   const skipped = { noRemote: 0, emitFailed: 0, deltaFailed: false };
-  const emptyResult = { enqueued: 0, flush: null, sessionErrors: collectedErrors, skipped };
+  const emptyResult = empty({ skipped });
   const state = loadState(session_id);
   // The server is the authority on what actually landed: a local cursor can sit at EOF while the
   // upload was lost, and a re-linked or fresh machine has no state at all. Null = trust local state.
@@ -454,7 +480,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       collectedErrors.push(errorPayload);
       continue;
     }
-    await postSessionError(errorPayload, token, { fetchImpl });
+    await Promise.all(liveTargets.map((s) => postSessionError(errorPayload, s, { fetchImpl })));
   }
 
   let stateDirty = false;
@@ -470,12 +496,11 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       if (timeline && (timeline.periods.length > 0 || timeline.subagents.length > 0 || timeline.plan_events.length > 0)) {
         const sig = `${JSON.stringify(timeline.periods)}|${JSON.stringify(timeline.subagents)}|${JSON.stringify(timeline.plan_events)}`;
         if (sig !== state.sentTimelineSig) {
-          const { reported } = await postSessionTimeline(
-            { sessionId: session_id, ...timeline },
-            token,
-            { fetchImpl },
+          const results = await Promise.all(
+            liveTargets.map((s) => postSessionTimeline({ sessionId: session_id, ...timeline }, s, { fetchImpl })),
           );
-          // Only remember the signature on a confirmed send, so a failed post retries next turn.
+          // Only remember the signature once every account confirmed, so a failed post retries next turn.
+          const reported = results.length === targets.length && results.every((r) => r.reported);
           if (reported) {
             state.sentTimelineSig = sig;
             stateDirty = true;
@@ -492,11 +517,11 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // settings file or the OS environment, where a bare process.env cannot see it. Without this
     // the two would report different identities from the same machine, in the same second.
     const postSnapshot = deps.maybePostUsageSnapshot == null ? _maybePostUsageSnapshot : deps.maybePostUsageSnapshot;
-    try { await postSnapshot(token, { fetchImpl, env }); } catch { /* best-effort */ }
+    try { await Promise.all(liveTargets.map((s) => postSnapshot(s, { fetchImpl, env }))); } catch { /* best-effort */ }
     // Live rate-limit rows the status line recorded between hooks — the observations no
     // hook was running to see.
     const drainSnapshots = deps.drainStatuslineSnapshots == null ? _drainStatuslineSnapshots : deps.drainStatuslineSnapshots;
-    try { await drainSnapshots(token, { fetchImpl, env }); } catch { /* best-effort */ }
+    try { await drainSnapshots(targets, { fetchImpl, env }); } catch { /* best-effort */ }
   }
 
   // Claude Code renames a session after the first prompt. The new name normally rides on the
@@ -553,8 +578,11 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 
   // The import owns its own batched delivery, so it must not drain the live queue per session —
   // that would add unrelated HTTP calls mid-import and muddy its summary.
-  const flush = options.skipFlush ? null : await flushQueue(token, { fetchImpl });
-  return { enqueued, flush, sessionErrors: collectedErrors, skipped };
+  const flushes = options.skipFlush
+    ? []
+    : await Promise.all(liveTargets.map(async (s) => ({ key: s.key, email: s.email, tenantName: s.tenantName, ...(await flushQueue(s, { fetchImpl })) })));
+  const flush = options.skipFlush ? null : mergeFlushResults(flushes);
+  return { enqueued, flush, flushes, sessionErrors: collectedErrors, skipped };
 }
 
 // Once tracking is off, queued reports are held for this long: a tenant that converts to paid
@@ -586,15 +614,15 @@ function sweepHeldQueue(dir, result, now = Date.now()) {
 // linked), failed = transient or reversible (5xx/network/code-less 403, file kept for retry),
 // expired = held files past the 3-day window, trackingDisabled = the server said the workspace
 // is dark (audit mode) and the flush stopped.
-export async function flushQueue(token, deps = {}) {
+export async function flushQueue(session, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
   const result = { flushed: 0, rejected: 0, failed: 0, expired: 0, salvaged: 0, quarantined: 0, trackingDisabled: false, lastError: null };
-  const dir = queueDir();
+  const dir = queueDir(session.key);
 
   // Dark workspace: no readdir-and-post loop, just the hold-window sweep. Files stay for
   // QUEUE_HOLD_MS in case the tenant converts to paid, then expire.
-  if (!isLiveTrackingAllowed()) {
+  if (!allowsLive(session)) {
     result.trackingDisabled = true;
     sweepHeldQueue(dir, result);
     return result;
@@ -603,12 +631,13 @@ export async function flushQueue(token, deps = {}) {
   // A 401 is authentication, not a verdict on the payload, so it must not count as a permanent
   // rejection — that would delete queued analytics that were never actually refused. Renew once
   // for the whole flush and retry; if renewal fails, keep every file for the next attempt.
+  let current = session;
   let renewed = false;
   const renewToken = async () => {
     if (renewed) return null;
     renewed = true;
-    const next = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
-    if (next && next !== token) { token = next; return next; }
+    const next = await getAccessToken({}, { account: session.key, forceRefresh: true }).catch(() => null);
+    if (next && next !== current.token) { current = { ...current, token: next }; return current; }
     return null;
   };
 
@@ -640,7 +669,7 @@ export async function flushQueue(token, deps = {}) {
     if (salvaged) result.salvaged += 1;
 
     try {
-      let res = await postJson(reportUrl, token, payload, { fetchImpl });
+      let res = await postJson(reportUrl, current, payload, { fetchImpl });
       // 401 only: a 403 is authenticated-but-not-permitted, which no new token resolves.
       if (res.status === 401) {
         const next = await renewToken();
@@ -662,7 +691,7 @@ export async function flushQueue(token, deps = {}) {
         let body = null;
         try { body = await res.json(); } catch { /* non-JSON body */ }
         if (body != null && body.code === 'TRACKING_DISABLED') {
-          try { markTrackingDisabled(body.message == null ? null : body.message); } catch { /* best-effort */ }
+          try { markTrackingDisabled(session.key, body.message == null ? null : body.message); } catch { /* best-effort */ }
           result.trackingDisabled = true;
           result.lastError = body.message == null ? 'HTTP 403' : body.message;
           sweepHeldQueue(dir, result);

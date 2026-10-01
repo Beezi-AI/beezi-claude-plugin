@@ -2,7 +2,8 @@ import { parseArgs, buildConfig, reconcileBillingConfig } from '../lib/billing-c
 import { writeBillingConfig } from '../lib/billing-config.mjs';
 import { readClaudeAccount, readClaudeAccountAnchor } from '../lib/claude-account.mjs';
 import { hasCustomGateway } from '../lib/billing.mjs';
-import { getAccessToken } from '../lib/token.mjs';
+import { defaultSession, sessionFor } from '../lib/sessions.mjs';
+import { parseAccountFlag } from '../lib/accounts.mjs';
 import { syncAccountIfNeeded } from '../lib/account-sync.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { oauthTokenEnvWithOsProbe } from '../lib/claude-settings-env.mjs';
@@ -11,9 +12,9 @@ import { oauthTokenEnvWithOsProbe } from '../lib/claude-settings-env.mjs';
 // and an account switch is exactly what must not wait for the hash to drift. Silent throughout: an
 // unlinked machine has no token and this script must keep working offline, so nothing here can
 // change the command's output or its exit code.
-async function reportAccount() {
+async function reportAccount(account) {
   let token = null;
-  try { token = await getAccessToken(); } catch { token = null; }
+  try { token = account ? await sessionFor(account) : await defaultSession(); } catch { token = null; }
   if (!token) return;
   // Interactive command, so the token resolution runs the full chain — process.env → user
   // settings file → persistent OS environment. Claude Code deletes CLAUDE_CODE_OAUTH_TOKEN from
@@ -28,7 +29,8 @@ async function reportAccount() {
 }
 
 async function run() {
-  const parsed = parseArgs(process.argv.slice(2));
+  const { account: beeziAccount, rest } = await parseAccountFlag(process.argv.slice(2));
+  const parsed = parseArgs(rest);
   // A custom endpoint is reported as a fact, not a conclusion: whether it bills this machine's
   // subscription or its own credits is the one thing only the user can say, and /beezi:login reads
   // this flag to know it has to ask.
@@ -64,7 +66,7 @@ async function run() {
       console.log(`✓ Beezi billing captured: source=${config.source} plan=${config.plan == null ? 'n/a' : config.plan}${via}${switched}${gateway}.`);
     }
     // After the reconcile, so the check-in carries the account this run just resolved.
-    await reportAccount();
+    await reportAccount(beeziAccount);
   } else {
     // Self-report (--plan) or raw-field capture: the user's answer always writes. The cheap file
     // anchor rides along so a later account switch can invalidate this testimony; the CLI is not
@@ -84,7 +86,7 @@ async function run() {
     console.log(`✓ Beezi billing captured: source=${config.source} plan=${config.plan == null ? 'n/a' : config.plan}${gateway}.`);
     // The user just declared how this machine pays — that answer is exactly what the check-in
     // exists to carry, so it must not wait for the next session start's hash drift.
-    await reportAccount();
+    await reportAccount(beeziAccount);
   }
 }
 

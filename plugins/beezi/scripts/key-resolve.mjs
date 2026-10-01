@@ -1,3 +1,4 @@
+import { parseAccountFlag, getDefaultKey, getAccount } from '../lib/accounts.mjs';
 import { getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from '../lib/token.mjs';
 import { AUTH_STATES } from '../lib/auth-state.mjs';
 import {
@@ -183,9 +184,12 @@ async function runStatus(token, env, auth) {
 }
 
 async function main() {
-  const parsed = parseArgs(process.argv.slice(2));
-  const auth = await getAuthentication({}, { waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
-  const token = auth != null && auth.authState === AUTH_STATES.READY ? auth.accessToken : null;
+  const { account: selected, rest } = await parseAccountFlag(process.argv.slice(2));
+  const account = selected || await getDefaultKey();
+  const row = account ? await getAccount(account) : null;
+  const parsed = parseArgs(rest);
+  const auth = await getAuthentication({}, { account, waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
+  const token = auth != null && auth.authState === AUTH_STATES.READY ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId) } : null;
   const env = oauthTokenEnvWithOsProbe(process.env);
 
   if (parsed.mode === 'status') {
@@ -200,7 +204,7 @@ async function main() {
     recordResolvedKeyPlan(submittedPlanFrom(result));
     // The cached verdict predates this answer and still says the key needs attention. Left in
     // place it would nudge the user, for up to six hours, to do what they just did.
-    clearOauthKeyStatus();
+    clearOauthKeyStatus(account);
     console.log(`✓ Beezi: this key’s subscription is now recorded as ${result.subscriptionPlan}.`);
     return;
   }
@@ -213,7 +217,7 @@ async function main() {
   // fills it from the resolution instead.
   recordResolvedKeyPlan(submittedPlanFrom(result));
   // Same reason as the plan path: the cached verdict is about the world before this link.
-  clearOauthKeyStatus();
+  clearOauthKeyStatus(account);
   console.log(formatLinkOutcome(result));
 }
 

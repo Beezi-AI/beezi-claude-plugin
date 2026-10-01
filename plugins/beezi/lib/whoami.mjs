@@ -1,5 +1,5 @@
 import { apiBase, ENDPOINTS } from './config.mjs';
-import { machineHeaders } from './machine-identity.mjs';
+import { authHeaders } from './http.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { AUTH_REASONS } from './auth-state.mjs';
 
@@ -21,13 +21,13 @@ const VERIFICATION_UNAVAILABLE = 'OAUTH_VERIFICATION_UNAVAILABLE';
 // Resolve the stored access token against the portal. Returns
 // { outcome, httpStatus, identity } — identity is the whoami body's fields on AUTHENTICATED
 // and null otherwise. httpStatus is null when the request never reached a response.
-export async function probeIdentity(token, deps = {}) {
+export async function probeIdentity(session, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const base = deps.base == null ? apiBase() : deps.base;
   let res;
   try {
     res = await fetchImpl(`${base}${ENDPOINTS.whoami}`, {
-      headers: { Authorization: `Bearer ${token}`, ...machineHeaders() },
+      headers: authHeaders(session),
     });
   } catch {
     // No response at all, so there is no status to preserve — its own reason says which.
@@ -73,6 +73,8 @@ export async function probeIdentity(token, deps = {}) {
     identity: {
       email: body.email == null ? null : body.email,
       name: body.name == null ? null : body.name,
+      tenantId: typeof body.tenantId === 'string' ? body.tenantId : null,
+      tenantName: typeof body.tenantName === 'string' ? body.tenantName : null,
       tenantTier: body.tenantTier == null ? null : body.tenantTier,
       trackingMode: body.trackingMode == null ? null : body.trackingMode,
       backfillCompleted: body.backfillCompleted === true,
@@ -83,8 +85,8 @@ export async function probeIdentity(token, deps = {}) {
 // Compatibility shape for the many callers that only ask "is this token good": { valid: true,
 // … } | { valid: false } | null (offline/unknown). It cannot express forbidden-vs-unauthorized
 // -vs-unavailable — every user-facing decision reads probeIdentity instead.
-export async function whoami(token, deps = {}) {
-  const probe = await probeIdentity(token, deps);
+export async function whoami(session, deps = {}) {
+  const probe = await probeIdentity(session, deps);
   if (probe.outcome === PROBE_OUTCOMES.AUTHENTICATED) return { valid: true, ...probe.identity };
   if (probe.outcome === PROBE_OUTCOMES.UNAVAILABLE) return null;
   return { valid: false };

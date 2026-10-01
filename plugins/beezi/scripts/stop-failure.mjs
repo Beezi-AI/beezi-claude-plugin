@@ -9,8 +9,10 @@ if (!input) process.exit(0);
 runHook(DIAGNOSTIC_SOURCES.STOP_FAILURE, async () => {
   const failure = await importHookModule('./stop-failure.mjs');
   const checkpoint = await importHookModule('./checkpoint.mjs');
+  const accounts = await importHookModule('./sessions.mjs');
+  const sessions = accounts == null ? [] : await accounts.linkedSessions().catch(() => []);
   await Promise.allSettled([
-    failure == null ? null : failure.reportSessionError(input),
+    failure == null ? null : failure.reportSessionError(input, { sessions }),
     checkpoint == null ? null : checkpoint.runCheckpoint(input, {}, { emitTimeline: true }),
   ]);
 });

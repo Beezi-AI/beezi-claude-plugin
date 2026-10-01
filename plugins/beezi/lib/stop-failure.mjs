@@ -1,7 +1,7 @@
 import fs from 'fs';
-import { getAccessToken } from './token.mjs';
+import { linkedSessions as _linkedSessions } from './sessions.mjs';
 import { postSessionError } from './session-error-report.mjs';
-import { isLiveTrackingAllowed } from './tracking.mjs';
+import { isLiveTrackingAllowed, readTrackingState } from './tracking.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 
 // Best-effort: pull the last assistant message text, any API-error detail, and the error line's
@@ -77,12 +77,12 @@ function truncate(s, n = 1000) {
 export async function reportSessionError(input, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const now = deps.now == null ? () => new Date() : deps.now;
-  const getTokenImpl = deps.getAccessToken == null ? getAccessToken : deps.getAccessToken;
-  const isAllowed = deps.isLiveTrackingAllowedImpl == null ? isLiveTrackingAllowed : deps.isLiveTrackingAllowedImpl;
-
+  const getSessions = deps.linkedSessions == null ? _linkedSessions : deps.linkedSessions;
   // /sessions/errors carries the same tracking gate as /sessions/report — this path posts
-  // outside runCheckpoint, so it needs its own check or a dark tenant 403s on every failure.
-  if (!isAllowed()) return { reported: false, reason: 'tracking-disabled' };
+  // outside runCheckpoint, so each account needs its own check or a dark tenant 403s on every failure.
+  const isAllowed = deps.isLiveTrackingAllowedImpl == null
+    ? ((s) => isLiveTrackingAllowed(readTrackingState(s.key)))
+    : deps.isLiveTrackingAllowedImpl;
 
   const sessionId = input == null ? undefined : input.session_id;
   // Claude Code names this field `error` on the StopFailure payload; `error_type` was the
@@ -91,8 +91,10 @@ export async function reportSessionError(input, deps = {}) {
   if (error == null) error = input == null ? undefined : input.error_type;
   if (!sessionId || !error) return { reported: false, reason: 'missing-fields' };
 
-  const token = await getTokenImpl(deps);
-  if (!token) return { reported: false, reason: 'no-token' };
+  // deps.sessions lets the hook script share one linkedSessions() result with runCheckpoint.
+  const all = deps.sessions == null ? await getSessions(deps).catch(() => []) : deps.sessions;
+  const sessions = all.filter(isAllowed);
+  if (sessions.length === 0) return { reported: false, reason: all.length ? 'tracking-disabled' : 'no-token' };
 
   const context = readErrorContext(input.transcript_path, deps);
   const payload = {
@@ -105,5 +107,6 @@ export async function reportSessionError(input, deps = {}) {
     // checkpoint's transcript scan, which can't see the hook's clock.
     occurredAt: context.occurredAt == null ? now().toISOString() : context.occurredAt,
   };
-  return postSessionError(payload, token, { fetchImpl });
+  const results = await Promise.all(sessions.map((s) => postSessionError(payload, s, { fetchImpl })));
+  return { reported: results.some((r) => r.reported), results };
 }

@@ -1,12 +1,21 @@
 ---
-description: Unlink this machine from Beezi analytics (sign out)
-allowed-tools: Bash(node:*)
+description: Log out one or all Beezi accounts on this machine
+allowed-tools: Bash(node:*), AskUserQuestion
 ---
 
-Do NOT read, open, or inspect any files. Run only this command:
+Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs --list` and show the accounts.
+If none are linked, stop. With one account, select it directly. With several, ask which
+account to log out, including an "All accounts" option. Use account names and workspaces
+as labels; the bracketed key is for the command only.
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs`
+If removing the default while any accounts remain, ask which remaining account should become
+the analytics default (when only one remains, use that key). Pass it as `--next-default`.
 
-Report its output verbatim. It distinguishes a confirmed server unlink from a local-only
-one, and it fails rather than claim a logout it did not perform — if it reports an error,
-the machine is still linked. Never echo any token.
+Run one of:
+
+- `node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs --account <key>`
+- `node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs --account <key> --next-default <remaining-key>`
+- `node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs --all`
+
+Report output verbatim, including any unconfirmed server unlink. Never echo credentials.
+If a question is dismissed, perform no logout.

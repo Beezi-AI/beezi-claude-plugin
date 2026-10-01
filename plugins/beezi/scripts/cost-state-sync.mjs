@@ -1,4 +1,5 @@
 import { runCostStateScan } from '../lib/cost-state-scan.mjs';
+import { runCoworkSync } from '../lib/cowork-sync.mjs';
 import { acquireLock, releaseLock } from '../lib/single-instance-lock.mjs';
 import { exitClean } from '../lib/shutdown.mjs';
 
@@ -41,6 +42,7 @@ async function main() {
   held = acquireLock(LOCK_NAME);
   if (!held) return;
   await runCostStateScan();
+  await runCoworkSync();
 }
 
 main().then(() => finish(0), () => finish(0));

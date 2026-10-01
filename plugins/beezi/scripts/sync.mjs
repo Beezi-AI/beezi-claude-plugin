@@ -1,6 +1,8 @@
 import { parseArgs, runAudit, SYNC_MODE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
+import { parseAccountFlag, listAccounts, describeAccount, AccountStatus } from '../lib/accounts.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
+import { maybeSpawnCoworkLive } from '../lib/cowork-live.mjs';
 
 // /beezi:sync — uploads every past session this machine still has on disk, skipping whatever Beezi
 // already holds. Unlike the one-time import at the end of /beezi:login, this is repeatable: it asks
@@ -17,43 +19,54 @@ function fail(message) {
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
-async function main() {
-  const options = parseArgs(process.argv.slice(2));
-  if (options.sinceMs != null) {
-    fail('Beezi: /beezi:sync does not take --since — it uploads exactly what Beezi is missing. Run it with no flags.');
-  }
-  if (options.force) {
-    fail('Beezi: /beezi:sync does not take --force — there is no one-time seal to force past.');
-  }
+// One account's run. Per-account problems print and return so the accounts after it still run.
+async function syncOne(account, options, label) {
+  options.account = account;
   options.mode = SYNC_MODE;
+  const prefix = label == null ? 'Beezi' : `Beezi (${label})`;
 
   const result = await runAudit(
     {
       onProgress: ({ processed, total }) => {
-        console.log(`Beezi: ${processed}/${total} sessions read…`);
+        console.log(`${prefix}: ${processed}/${total} sessions read…`);
       },
     },
     options,
   );
 
-  if (result.reason === 'no-token') {
-    fail('Beezi: this machine is not linked. Run /beezi:login first.');
+  if (result.coworkWarnings > 0) {
+    console.log('Beezi: some Cowork cache data could not be read; this sync may be incomplete.');
+  }
+  if (result.reason === 'busy') {
+    console.log('Beezi: another session sync is running. Try again after it finishes.');
+    return;
+  }
+  if (result.reason === 'auth-unavailable') {
+    console.error('✗ Beezi: authentication is temporarily unavailable. Try /beezi:sync again.');
+    return;
+  }
+  if (result.reason === 'no-account') {
+    console.error('✗ Beezi: that account is not linked or its link expired. Run /beezi:login and sign in as it.');
+    return;
   }
   if (result.halt === BackfillHalt.NOT_ALLOWED) {
-    fail('Beezi: uploads are disabled for this workspace — the audit period has ended.');
+    console.error('✗ Beezi: uploads are disabled for this workspace — the audit period has ended.');
+    return;
   }
   if (result.halt === BackfillHalt.UNSUPPORTED_SERVER) {
-    fail('Beezi: this portal does not support /beezi:sync yet — try again after the next portal update.');
+    console.error('✗ Beezi: this portal does not support /beezi:sync yet — try again after the next portal update.');
+    return;
   }
   if (result.halt === BackfillHalt.FORBIDDEN) {
-    fail(
-      `Beezi: the server refused the upload (${result.lastError == null ? 'forbidden' : result.lastError}). ` +
+    console.error(
+      `✗ Beezi: the server refused the upload (${result.lastError == null ? 'forbidden' : result.lastError}). ` +
         'Check your seat with your workspace admin, then try again.',
     );
+    return;
   }
 
   if (result.scanned === 0) {
-    console.log('✓ Beezi: no Claude Code sessions found on this machine.');
+    console.log('✓ Beezi: no Claude Code or cached Cowork sessions found on this machine.');
     return;
   }
 
@@ -91,15 +104,17 @@ async function main() {
     // A server that refuses the cost records outright is a version mismatch, not an unreachable
     // one, and a retry against the same build fails identically. Say which it is.
     if (result.costStatesUnsupported) {
-      fail(
+      console.error(
         'Beezi: upload stopped — this Beezi server does not accept Claude cost records yet. ' +
           'Nothing was uploaded and nothing was lost; run /beezi:sync again after the portal update.',
       );
+      return;
     }
-    fail(
+    console.error(
       `Beezi: upload stopped — could not reach the server (${result.lastError == null ? 'unknown error' : result.lastError}). ` +
         'Run /beezi:sync again to continue where it left off.',
     );
+    return;
   }
 
   // `empty` is the headline number here, not a footnote: a session already fully uploaded produces
@@ -166,4 +181,28 @@ async function main() {
   );
 }
 
-main().catch((error) => fail(friendlyMessage(error)));
+async function main() {
+  const { account, rest } = await parseAccountFlag(process.argv.slice(2));
+  const options = parseArgs(rest);
+  if (options.sinceMs != null) {
+    fail('Beezi: /beezi:sync does not take --since — it uploads exactly what Beezi is missing. Run it with no flags.');
+  }
+  if (options.force) {
+    fail('Beezi: /beezi:sync does not take --force — there is no one-time seal to force past.');
+  }
+
+  if (account != null) {
+    await syncOne(account, { ...options }, null);
+    return;
+  }
+  const accounts = (await listAccounts()).filter((a) => a.status === AccountStatus.LINKED);
+  if (accounts.length === 0) fail('Beezi: this machine is not linked. Run /beezi:login first.');
+  for (const a of accounts) {
+    if (accounts.length > 1) console.log(`\n— ${describeAccount(a)} —`);
+    await syncOne(a.key, { ...options }, null);
+  }
+}
+
+main().then(() => {
+  if (!process.argv.includes('--dry-run')) maybeSpawnCoworkLive();
+}).catch((error) => fail(friendlyMessage(error)));

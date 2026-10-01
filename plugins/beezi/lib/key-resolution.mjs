@@ -12,8 +12,8 @@ import { oauthTokenEnv } from './claude-settings-env.mjs';
 // either a plan they picked or a subscription they chose to attach the key to.
 //
 // TWO TOKENS, kept strictly apart:
-//   - `token` (the argument) is the BEEZI access token from getAccessToken(); it authenticates the
-//     request and is the only thing in the Authorization header.
+//   - `session.token` (the argument) is the BEEZI access token for one linked account; it
+//     authenticates the request and is the only thing in the Authorization header.
 //   - env.CLAUDE_CODE_OAUTH_TOKEN is the ANTHROPIC setup token; it is NEVER sent. Only its
 //     fingerprint (prefix / last4 / length, from keyFingerprint) travels, in the body's `key`.
 // The plugin never learns an account id, so the fingerprint is the whole subject of every call.
@@ -58,9 +58,9 @@ function keyBody(fingerprint) {
   return { key: { prefix: fingerprint.prefix, last4: fingerprint.last4, length: fingerprint.length } };
 }
 
-async function post(path, token, body, deps) {
+async function post(path, session, body, deps) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
-  return postJson(`${apiBase()}${path}`, token, body, { fetchImpl, timeoutMs: REQUEST_TIMEOUT_MS });
+  return postJson(`${apiBase()}${path}`, session, body, { fetchImpl, timeoutMs: REQUEST_TIMEOUT_MS });
 }
 
 // A response body, or null. A 502 from a gateway is HTML, and an empty 204-ish error body is
@@ -125,12 +125,12 @@ function subscriptions(value) {
 // Returns the normalized payload, or NULL when the question could not be asked or answered — no
 // token, a token too short to fingerprint, offline, a timeout, an older server without the route.
 // Null is "could not ask", never "not resolved": those lead to opposite words at the prompt.
-export async function fetchKeyResolution(token, deps = {}) {
+export async function fetchKeyResolution(session, deps = {}) {
   const fingerprint = fingerprintFrom(deps);
-  if (!token || fingerprint == null) return null;
+  if (!session || !session.token || fingerprint == null) return null;
 
   try {
-    const res = await post(ENDPOINTS.keyResolution, token, keyBody(fingerprint), deps);
+    const res = await post(ENDPOINTS.keyResolution, session, keyBody(fingerprint), deps);
     if (res == null || res.status < 200 || res.status >= 300) return null;
     const body = await safeJson(res);
     if (body == null) return null;
@@ -152,9 +152,9 @@ export async function fetchKeyResolution(token, deps = {}) {
 
 // Record the plan the user picked for this key. { ok: true, subscriptionPlan } on success;
 // { ok: false, message } for every refusal, with the server's wording where it gave one.
-export async function submitKeyPlan(token, plan, deps = {}) {
+export async function submitKeyPlan(session, plan, deps = {}) {
   const fingerprint = fingerprintFrom(deps);
-  if (!token) return { ok: false, message: 'Beezi: this machine is not linked. Run /beezi:login to link it.' };
+  if (!session || !session.token) return { ok: false, message: 'Beezi: this machine is not linked. Run /beezi:login to link it.' };
   if (fingerprint == null) {
     return {
       ok: false,
@@ -168,7 +168,7 @@ export async function submitKeyPlan(token, plan, deps = {}) {
   try {
     const body = keyBody(fingerprint);
     body.plan = chosen;
-    res = await post(ENDPOINTS.keyResolutionPlan, token, body, deps);
+    res = await post(ENDPOINTS.keyResolutionPlan, session, body, deps);
   } catch {
     return { ok: false, message: 'Could not reach the Beezi server. Check your connection and try again.' };
   }
@@ -186,9 +186,9 @@ export async function submitKeyPlan(token, plan, deps = {}) {
 // the server named neither. 'linked' and 'claimed' mean genuinely different things, so an
 // unrecognized value must not be coerced into either (see formatLinkOutcome).
 // { ok: false, message } otherwise.
-export async function submitKeyLink(token, target, deps = {}) {
+export async function submitKeyLink(session, target, deps = {}) {
   const fingerprint = fingerprintFrom(deps);
-  if (!token) return { ok: false, message: 'Beezi: this machine is not linked. Run /beezi:login to link it.' };
+  if (!session || !session.token) return { ok: false, message: 'Beezi: this machine is not linked. Run /beezi:login to link it.' };
   if (fingerprint == null) {
     return {
       ok: false,
@@ -202,7 +202,7 @@ export async function submitKeyLink(token, target, deps = {}) {
   try {
     const body = keyBody(fingerprint);
     body.target = chosen;
-    res = await post(ENDPOINTS.keyResolutionLink, token, body, deps);
+    res = await post(ENDPOINTS.keyResolutionLink, session, body, deps);
   } catch {
     return { ok: false, message: 'Could not reach the Beezi server. Check your connection and try again.' };
   }

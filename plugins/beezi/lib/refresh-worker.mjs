@@ -1,3 +1,4 @@
+import { getDefaultKey, updateAccount, AccountStatus } from './accounts.mjs';
 import {
   readCredentials, commitCredentials, CREDENTIAL_STATUS, COMMIT_STATUS,
 } from './credentials.mjs';
@@ -56,6 +57,8 @@ export async function runRefreshWorker(options = {}, deps = {}) {
 }
 
 async function refreshOnce(options, deps) {
+  const account = options.account == null ? await getDefaultKey(deps) : options.account;
+  if (account == null) return { outcome: "no_credentials", reason: AUTH_REASONS.NO_CREDENTIALS };
   const now = deps.now == null ? Date.now : deps.now;
   const budgetMs = options.budgetMs == null ? WORKER_BUDGET_MS : options.budgetMs;
   const deadline = now() + budgetMs;
@@ -63,22 +66,22 @@ async function refreshOnce(options, deps) {
 
   // waitMs 0: a held lock means another worker, a login or a logout owns this generation.
   // Queuing behind it would only submit a grant that is about to be superseded.
-  const lock = await acquireCredentialLock({ waitMs: 0 }, deps);
+  const lock = await acquireCredentialLock({ account, waitMs: 0 }, deps);
   if (lock == null) return { outcome: 'busy', reason: AUTH_REASONS.REFRESH_IN_PROGRESS };
   try {
-    const current = await readCredentials(deps, { lock }).catch(() => null);
+    const current = await readCredentials(deps, { account, lock }).catch(() => null);
     if (current == null || current.status !== CREDENTIAL_STATUS.READY) {
-      clearInflight();
+      clearInflight(account);
       return { outcome: 'no_credentials', reason: AUTH_REASONS.STORAGE_UNAVAILABLE };
     }
 
     // A marker still naming this generation, from a process that is gone: the grant may have
     // been consumed and its replacement lost. Credentials are preserved; the caller is told.
-    const stale = readInflight();
+    const stale = readInflight(account);
     if (stale != null && stale.generation === current.generation && !isWorkerAlive(stale, deps)) {
-      clearInflight();
-      recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.REFRESH_INTERRUPTED }, { source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
-      recordBackoff(current.generation, AUTH_REASONS.REFRESH_INTERRUPTED, now());
+      clearInflight(account);
+      recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.REFRESH_INTERRUPTED }, { account, source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
+      recordBackoff(account, current.generation, AUTH_REASONS.REFRESH_INTERRUPTED, now());
       return { outcome: 'interrupted', reason: AUTH_REASONS.REFRESH_INTERRUPTED };
     }
 
@@ -89,19 +92,19 @@ async function refreshOnce(options, deps) {
     const fresh = (creds.expires_at == null ? 0 : creds.expires_at) - now() > SKEW_MS;
     if (!options.force && fresh) return { outcome: 'fresh', reason: AUTH_REASONS.OK };
     if (typeof creds.refresh_token !== 'string' || !creds.refresh_token) {
-      recordAuthResult({ authState: AUTH_STATES.REAUTH_REQUIRED, reason: AUTH_REASONS.MISSING_REFRESH_TOKEN }, { source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
-      recordReauthRequired(current.generation, AUTH_REASONS.MISSING_REFRESH_TOKEN, now());
+      recordAuthResult({ authState: AUTH_STATES.REAUTH_REQUIRED, reason: AUTH_REASONS.MISSING_REFRESH_TOKEN }, { account, source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
+      recordReauthRequired(account, current.generation, AUTH_REASONS.MISSING_REFRESH_TOKEN, now());
       return { outcome: 'reauth_required', reason: AUTH_REASONS.MISSING_REFRESH_TOKEN };
     }
     if (overBudget()) {
-      recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.REFRESH_TIMEOUT }, { source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
-      recordBackoff(current.generation, AUTH_REASONS.REFRESH_TIMEOUT, now());
+      recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.REFRESH_TIMEOUT }, { account, source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
+      recordBackoff(account, current.generation, AUTH_REASONS.REFRESH_TIMEOUT, now());
       return { outcome: 'failed', reason: AUTH_REASONS.REFRESH_TIMEOUT };
     }
 
     // Before the grant leaves this machine, not after: if the process dies mid-request this is
     // the only record that a rotating token may already have been spent.
-    recordInflight(current.generation, process.pid, ownStartTime());
+    recordInflight(account, current.generation, process.pid, ownStartTime());
 
     const refresh = deps.refreshTokens == null ? _refreshTokens : deps.refreshTokens;
     const r = await refresh({
@@ -111,14 +114,15 @@ async function refreshOnce(options, deps) {
     }, { ...deps, timeoutMs: deps.timeoutMs == null ? REFRESH_REQUEST_TIMEOUT_MS : deps.timeoutMs });
 
     if (r.invalidGrant) {
+      await updateAccount(account, { status: AccountStatus.REVOKED }, deps);
       // The one definitive rejection. Nothing is deleted — not the refresh token, not the
       // registered client, not the diagnostic identity — only this generation's retries stop.
       const reason = r.error === 'invalid_client'
         ? AUTH_REASONS.INVALID_CLIENT
         : AUTH_REASONS.INVALID_GRANT;
-      recordAuthResult({ authState: AUTH_STATES.REAUTH_REQUIRED, reason }, { source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
-      recordReauthRequired(current.generation, reason, now());
-      clearInflight();
+      recordAuthResult({ authState: AUTH_STATES.REAUTH_REQUIRED, reason }, { account, source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
+      recordReauthRequired(account, current.generation, reason, now());
+      clearInflight(account);
       return { outcome: 'reauth_required', reason };
     }
     if (r.tokens == null || !r.tokens.access_token) {
@@ -126,13 +130,13 @@ async function refreshOnce(options, deps) {
         ? AUTH_REASONS.MISSING_REFRESH_TOKEN
         : (FAILURE_REASONS[r.failure] == null ? AUTH_REASONS.REFRESH_SERVER_ERROR : FAILURE_REASONS[r.failure]);
       if (reason === AUTH_REASONS.MISSING_REFRESH_TOKEN) {
-        recordAuthResult({ authState: AUTH_STATES.REAUTH_REQUIRED, reason }, { source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
-        recordReauthRequired(current.generation, reason, now());
+        recordAuthResult({ authState: AUTH_STATES.REAUTH_REQUIRED, reason }, { account, source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
+        recordReauthRequired(account, current.generation, reason, now());
       } else {
-        recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason }, { source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
-        recordBackoff(current.generation, reason, now());
+        recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason }, { account, source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
+        recordBackoff(account, current.generation, reason, now());
       }
-      clearInflight();
+      clearInflight(account);
       return { outcome: reason === AUTH_REASONS.MISSING_REFRESH_TOKEN ? 'reauth_required' : 'failed', reason };
     }
 
@@ -144,19 +148,19 @@ async function refreshOnce(options, deps) {
     };
     let commit;
     try {
-      commit = await commitCredentials(next, { lock, expectedGeneration: current.generation }, deps);
+      commit = await commitCredentials(next, { account, lock, expectedGeneration: current.generation }, deps);
     } catch {
       commit = { status: COMMIT_STATUS.LOCK_LOST };
     }
-    clearInflight();
+    clearInflight(account);
     if (commit.status === COMMIT_STATUS.COMMITTED) {
-      clearRefreshFailureState();
+      clearRefreshFailureState(account);
       return { outcome: 'committed', reason: AUTH_REASONS.OK, generation: commit.generation };
     }
     if (commit.status === COMMIT_STATUS.SUPERSEDED) return { outcome: 'superseded', reason: null };
     // The replacement never became durable, and the grant that produced it may be spent.
-    recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.REFRESH_STORAGE_FAILED }, { source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
-    recordBackoff(current.generation, AUTH_REASONS.REFRESH_STORAGE_FAILED, now());
+    recordAuthResult({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.REFRESH_STORAGE_FAILED }, { account, source: DIAGNOSTIC_SOURCES.REFRESH_WORKER });
+    recordBackoff(account, current.generation, AUTH_REASONS.REFRESH_STORAGE_FAILED, now());
     return { outcome: 'failed', reason: AUTH_REASONS.REFRESH_STORAGE_FAILED };
   } finally {
     releaseCredentialLock(lock);

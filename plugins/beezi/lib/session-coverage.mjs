@@ -23,8 +23,9 @@ export function planCoverageBatches(sessionIds, size = MAX_COVERAGE_IDS) {
 // such route, a transport failure, or a partial batch. Null means "fall back to local state
 // cursors"; an empty Map would mean "the server has nothing", and re-sending every session from
 // line 0 on a transient blip is the one thing this module exists to prevent.
-export async function fetchCoverage(sessionIds, token, deps = {}, options = {}) {
+export async function fetchCoverage(sessionIds, session, deps = {}, options = {}) {
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) return new Map();
+  if (!session || !session.token) return null;
   const postJsonImpl = deps.postJsonImpl == null ? postJson : deps.postJsonImpl;
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const timeoutMs = options.timeoutMs == null ? DEFAULT_COVERAGE_TIMEOUT_MS : options.timeoutMs;
@@ -34,7 +35,7 @@ export async function fetchCoverage(sessionIds, token, deps = {}, options = {}) 
   for (const batch of planCoverageBatches(sessionIds)) {
     let res;
     try {
-      res = await postJsonImpl(url, token, { sessionIds: batch }, { fetchImpl, timeoutMs });
+      res = await postJsonImpl(url, session, { sessionIds: batch }, { fetchImpl, timeoutMs });
     } catch {
       return null;
     }

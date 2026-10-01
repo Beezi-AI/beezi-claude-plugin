@@ -1,5 +1,5 @@
 ---
-description: Link this machine to Beezi analytics (browser sign-in with your Beezi account)
+description: Link a Beezi account to this machine (browser sign-in); repeat to add more accounts
 allowed-tools: Bash(node:*), AskUserQuestion
 ---
 
@@ -30,11 +30,14 @@ Step 1 — sign in (opens the browser; blocks until the sign-in completes):
 
 `node ${CLAUDE_PLUGIN_ROOT}/scripts/login.mjs`
 
-The command opens the user's browser to Beezi's sign-in page and finishes by
-itself once they approve there. Show the user the command's output. If it says
-the machine is **already linked**, tell the user — then still continue with
-Step 2 below, so a user whose subscription tier changed can still refresh it.
-Never echo any token or credential.
+The command opens the user's browser to Beezi's sign-in page and finishes by itself once they
+approve there. Show the user the command's output. Its LAST line is `account=<key>` — remember
+that key; every later step passes it as `--account <key>`. Never echo any token or credential.
+
+If it says the machine is **already linked** as that account, tell the user, then still continue
+with Step 2 below so a changed subscription tier is refreshed and an interrupted history upload
+resumes. If it says a workspace **is already linked as another account**, STOP: show that line
+verbatim; nothing was linked. If it prints no `account=` line, STOP and show the output.
 
 If the sign-in fails with a network or connection error, do NOT retry and do NOT continue
 to Step 2. The preflight only proves this session can write files, not that it can reach
@@ -50,9 +53,10 @@ that verbatim — do not tell the user they have been logged out.
 
 Step 2 — capture the subscription plan for analytics (run this after a
 successful Step 1 link, OR when Step 1 reported the machine was already
-linked). Run EXACTLY this one command, unmodified:
+linked). Run EXACTLY this one command, substituting only `<key>` with the key from
+Step 1:
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs --from-claude --via login`
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs --from-claude --via login --account <key>`
 
 It asks Claude Code itself for the non-secret subscription info (`claude auth
 status`) and reads the non-secret account metadata from `~/.claude.json` — never
@@ -61,7 +65,7 @@ any token, never the credentials file. Report its one-line summary. If it could 
 Step 3s — is this machine's plan Step 2's to know? ALWAYS run this, before
 anything in Step 3, whatever Step 2 printed. Run EXACTLY:
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/key-resolve.mjs status`
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/key-resolve.mjs status --account <key>`
 
 It prints exactly one JSON object and answers the question by itself — nothing
 about Step 2's output needs interpreting for it.
@@ -75,7 +79,8 @@ about Step 2's output needs interpreting for it.
   silently is how a wrong plan gets reported for months. Do not ask the tier
   question either: the answer lives on the server, not with the user. Follow
   `/beezi:refresh`'s Step 1 dispatch table on the JSON you just printed,
-  including its questions where that table asks them, then skip to Step 3b.
+  including its questions where that table asks them, carrying `--account <key>`
+  from Step 1 on every key-resolve or billing-capture command, then skip to Step 3b.
   Do not run Step 3, 3a or 3c for this machine.
 
 Step 3 — ask the user how this machine pays. Two questions live here; which
@@ -129,9 +134,9 @@ Map the final answer through this table — no other values are valid:
 | The gateway or provider's own billing | `gateway`    |
 
 Run the capture EXACTLY ONCE, with the single value the questions above landed
-on, substituting only `<value>`:
+on, substituting only `<value>` and `<key>` (the key from Step 1):
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs --plan <value> --via login-user`
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs --plan <value> --via login-user --account <key>`
 
 Report its one-line summary. If the user dismisses a question or answers
 something not in the table, skip the capture — the link itself already
@@ -167,10 +172,11 @@ If they decline, run EXACTLY:
 
 so the machine is not asked again at session start. Report its one-line output.
 
-Step 4 — upload past sessions (ALWAYS run this last, after Steps 2/3/3b, on both
-fresh links and already-linked machines). Run EXACTLY this one command:
+Step 4 — upload past sessions (ALWAYS run this after Steps 2/3/3b/3d, on both fresh
+links and already-linked accounts; only Step 5 may follow it). Run EXACTLY this one
+command, substituting only `<key>` with the key from Step 1:
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/backfill.mjs --via login`
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/backfill.mjs --via login --account <key>`
 
 It is the one-time upload of this machine's Claude Code history into Beezi and
 can take several minutes; it prints progress lines as it goes. Report its
@@ -184,9 +190,20 @@ If it reports the one-time import **has already been used**, that is final —
 the import is once per account and cannot be re-run. Do NOT retry, do NOT run
 the script again with different flags, and refuse politely if the user asks
 you to bypass it; relay the script's message (including the upgrade suggestion
-when it prints one) and stop.
+when it prints one), then continue to Step 5 without retrying the import.
 
 Note for the user, only when Step 4 reports the pull finalized: the pull is
 one-time per account and tool — if they have Claude Code history on other
 machines, they should run /beezi:login there BEFORE it finalizes; a finalized
 pull cannot be re-opened.
+
+Step 5 — default account for analytics (only when Step 1's output contained the line
+`/beezi:analytics still reads from …`). Ask the user ONE yes/no question with the
+AskUserQuestion tool: "Make <the account Step 1 linked> the account /beezi:analytics reads
+from?" If yes, run EXACTLY, substituting only `<key>` with the key from Step 1:
+
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/accounts.mjs use <key>`
+
+and report its one-line output. If no, say the default is unchanged and that
+/beezi:accounts switches it later. Session tracking goes to every linked account
+regardless of this answer.

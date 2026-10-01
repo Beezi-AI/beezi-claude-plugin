@@ -12,9 +12,9 @@ import { maybeSpawnDiagnostics as _maybeSpawnDiagnostics } from './diagnostics-t
 const safely = (fn) => { try { return fn(); } catch { return false; } };
 
 // An unreadable record reads as "changed": one diagnostic too many beats one never sent.
-function isUnchanged(authState, reason) {
+function isUnchanged(authState, reason, account) {
   try {
-    const last = readAuthState();
+    const last = readAuthState(account);
     return last != null && last.lastState === authState && last.lastReason === reason;
   } catch {
     return false;
@@ -35,7 +35,7 @@ export function recordAuthResult(result, deps = {}) {
     if (result == null) return false;
     const { authState, reason } = result;
     const source = deps.source;
-    if (deps.skipUnchanged !== false && isUnchanged(authState, reason)) return false;
+    if (deps.skipUnchanged !== false && isUnchanged(authState, reason, deps.account)) return false;
     if (authState === AUTH_STATES.READY) {
       if (reason !== AUTH_REASONS.RECOVERED) return false;
       return recordIssue({

@@ -1,6 +1,7 @@
 import { getAccessToken as _getAccessToken, getAuthentication as _getAuthentication } from './token.mjs';
 import { AUTH_STATES } from './auth-state.mjs';
-import { machineHeaders } from './machine-identity.mjs';
+import { authHeaders } from './http.mjs';
+import { getDefaultKey as _getDefaultKey, getAccount as _getAccount } from './accounts.mjs';
 import { apiBase } from './config.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { resolveAbortController } from './abort-compat.mjs';
@@ -26,7 +27,7 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const HANDSHAKE_TIMEOUT_MS = 20_000;
 const SESSION_HEADER = 'mcp-session-id';
 const NOT_LINKED_MESSAGE =
-  'This machine is not linked to Beezi. Run /beezi:login in Claude Code, then retry.';
+  'This machine is not linked to Beezi. Run /beezi:login, or /beezi:accounts to choose another linked account, then retry.';
 const REJECTED_MESSAGE =
   "Beezi rejected this machine's credentials. Run /beezi:login to relink.";
 // Not linked at all versus temporarily without a token are different answers, and telling a
@@ -36,7 +37,7 @@ const RETRY_MESSAGE =
   'Beezi is renewing this machine\u2019s authorization. Your login is saved — retry in a moment.';
 const REAUTH_MESSAGE =
   'Beezi\u2019s login server no longer accepts this machine\u2019s saved authorization. '
-  + 'Run /beezi:login to authorize it again.';
+  + 'Run /beezi:login to authorize it again, or /beezi:accounts to choose another account.';
 // While unlinked, poll for the credentials /beezi:login is about to store. A failed initialize
 // would mark this server "failed" for the whole session — stdio servers are never retried — so
 // the handshake must succeed even with no token, and this poll turns the eventual login into
@@ -90,6 +91,10 @@ export function createBridge(deps = {}) {
   const timeoutMs = deps.timeoutMs == null ? DEFAULT_TIMEOUT_MS : deps.timeoutMs;
   const handshakeMs = Math.min(timeoutMs, HANDSHAKE_TIMEOUT_MS);
 
+  const getDefaultKey = deps.getDefaultKey || _getDefaultKey;
+  const getAccount = deps.getAccount || _getAccount;
+  let sessionAccount;
+  let requestQueue = Promise.resolve();
   let sessionId = null;
   let initializeMsg = null;
   let reinit = null; // in-flight transparent re-initialize, shared by concurrent 404s
@@ -140,11 +145,11 @@ export function createBridge(deps = {}) {
     return fetchImpl(url, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        ...authHeaders(token),
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream',
         ...(sessionId ? { [SESSION_HEADER]: sessionId } : {}),
-        ...machineHeaders(),
+
       },
       body: JSON.stringify(msg),
       signal: deadline.signal,
@@ -205,14 +210,21 @@ export function createBridge(deps = {}) {
   function startWatcher() {
     if (watcher) return;
     watcher = setIntervalImpl(async () => {
-      const token = await getToken().catch(() => null);
-      if (!token) return;
+      requestQueue = requestQueue.then(async () => {
+      const account = await getDefaultKey();
+      const accessToken = await getToken({}, { account }).catch(() => null);
+      if (!accessToken) return;
+      const row = account ? await getAccount(account) : null;
+      selectAccount(account);
+      const token = { key: account, token: accessToken, clientId: (row && row.clientId) };
       try {
         await reinitialize(token);
         // The client accepted an empty tool list during the synthetic handshake; this makes
         // it re-fetch, so the Beezi tools appear the moment the login lands.
         writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
       } catch { /* portal unreachable — keep watching */ }
+      }).catch(() => {});
+      return requestQueue;
     }, watchIntervalMs);
     if (watcher != null && typeof watcher.unref === 'function') watcher.unref();
   }
@@ -241,7 +253,9 @@ export function createBridge(deps = {}) {
 
   function handleUnlinked(msg, ids, authState) {
     if (isInitialize(msg)) {
-      synthesizeHandshake(msg, 'Beezi tools activate after /beezi:login links this machine.');
+      synthesizeHandshake(msg, authState === AUTH_STATES.UNLINKED
+        ? 'Beezi tools activate after /beezi:login links this machine.'
+        : unavailableMessage(authState));
       return;
     }
     if (!Array.isArray(msg) && msg.method === 'tools/list' && msg.id !== undefined) {
@@ -275,16 +289,40 @@ export function createBridge(deps = {}) {
     return `Beezi MCP request failed (HTTP ${res.status}).`;
   }
 
-  async function handleMessage(msg) {
+  function selectAccount(account) {
+    if (sessionAccount !== account) {
+      sessionAccount = account;
+      sessionId = null;
+      realInitDone = false;
+      reinit = null;
+    }
+  }
+
+  function handleMessage(msg) {
+    const pending = requestQueue.then(() => handleMessageNow(msg));
+    requestQueue = pending.catch(() => {});
+    return pending;
+  }
+
+  async function handleMessageNow(msg) {
     const ids = requestIds(msg);
     if (isInitialize(msg)) {
       initializeMsg = msg;
       sessionId = null;
     }
+    let account, row;
+    try {
+      account = await getDefaultKey();
+      row = account ? await getAccount(account) : null;
+      selectAccount(account);
+    } catch (_) {
+      handleUnlinked(msg, ids, AUTH_STATES.UNAVAILABLE);
+      return;
+    }
     const auth = await Promise.resolve()
-      .then(() => getAuthentication())
+      .then(() => getAuthentication({}, { account }))
       .catch(() => ({ authState: AUTH_STATES.UNAVAILABLE, accessToken: null }));
-    let token = auth.authState === AUTH_STATES.READY ? auth.accessToken : null;
+    let token = auth.authState === AUTH_STATES.READY ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId) } : null;
     if (!token) {
       // The bridge cannot start with real tools. Recorded with the reason the accessor gave, and
       // delivered without a token — this is exactly the failure a token could not report.
@@ -317,9 +355,9 @@ export function createBridge(deps = {}) {
       // Renew once on its word and retry, so a short-lived token doesn't strand the whole
       // MCP server until the user re-links by hand.
       if (res.status === 401) {
-        const refreshed = await getToken({}, { forceRefresh: true }).catch(() => null);
-        if (refreshed && refreshed !== token) {
-          token = refreshed;
+        const refreshed = await getToken({}, { account, forceRefresh: true }).catch(() => null);
+        if (refreshed && refreshed !== token.token) {
+          token = { ...token, token: refreshed };
           res = await post(msg, token, deadline);
         }
       }

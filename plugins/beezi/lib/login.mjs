@@ -1,16 +1,16 @@
 import { execFileSync } from 'child_process';
 import crypto from 'crypto';
-import fs from 'fs';
 import path from 'path';
 import { apiBase, OAUTH_SCOPES } from './config.mjs';
-import { auditLedgerFile } from './paths.mjs';
-import { clearTrackingState, markLinked, recordWhoami } from './tracking.mjs';
+import { markLinked, recordWhoami } from './tracking.mjs';
 import { discover as _discover, registerClient as _registerClient, pkcePair, exchangeCode as _exchangeCode } from './oauth.mjs';
-import { commitCredentials, readCredentials, CREDENTIAL_STATUS, COMMIT_STATUS } from './credentials.mjs';
+import { commitCredentials, deleteCredentialGeneration, deleteAllGenerationEntries, COMMIT_STATUS, DELETE_STATUS } from './credentials.mjs';
 import { acquireCredentialLock, releaseCredentialLock } from './credential-lock.mjs';
 import { clearAuthMarkers } from './auth-markers.mjs';
 import { startLoopback as _startLoopback } from './loopback.mjs';
-import { setMachineClientId, getMachineClientId } from './machine-identity.mjs';
+import { readIndex, listAccounts, findByEmail, newAccountKey, addAccount, updateAccount, describeAccount } from './accounts.mjs';
+import { unlinkOnServer, revokeAtAuthServer } from './machine-unlink.mjs';
+import { readTrackingState } from './tracking.mjs';
 import { probeIdentity as _probeIdentity, PROBE_OUTCOMES } from './whoami.mjs';
 import { getAuthentication as _getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from './token.mjs';
 import { AUTH_STATES, AUTH_REASONS } from './auth-state.mjs';
@@ -19,10 +19,6 @@ import { oauthTokenEnvWithOsProbe } from './claude-settings-env.mjs';
 import { DIAGNOSTIC_SOURCES } from './telemetry-codes.mjs';
 import { recordAuthResult as _recordAuthResult } from './telemetry-auth.mjs';
 import { UserError } from './friendly-error.mjs';
-
-// The commit at the end of a login must not lose a browser round-trip to a refresh worker that
-// happens to hold the lock, so the wait is generous — a human is already waiting anyway.
-const LOGIN_LOCK_WAIT_MS = 30_000;
 
 export function openBrowser(url) {
   // The URL comes from the server response — never pass it through a shell. Require a
@@ -52,253 +48,164 @@ export function openBrowser(url) {
   }
 }
 
-// Whether this machine's registered client can be reused. It cannot when the provider has
-// definitively rejected it (its Clerk application is likely gone, and reusing it earns
-// invalid_client at the browser step), and it cannot when the stored grant carries no refresh
-// token — that client was registered without offline_access and needs a correctly scoped
-// replacement plus renewed consent (finding 7).
-function reusableClient(credentials, verdict) {
-  if (credentials == null || !credentials.client_id || !credentials.redirect_uri) return null;
-  if (verdict === AUTH_REASONS.CONSENT_REQUIRED || verdict === AUTH_REASONS.UNAUTHORIZED) return null;
-  if (verdict === AUTH_STATES.REAUTH_REQUIRED) return null;
-  return credentials;
-}
-
-// Binds the loopback listener, reusing this machine's registered client when its callback port
-// is free; otherwise registers a fresh client on a new port. Clerk matches redirect URIs exactly
-// (port included), so client_id and redirect_uri always travel together.
-async function bindClient(meta, reusable, state, deps) {
-  const startLoopback = deps.startLoopback == null ? _startLoopback : deps.startLoopback;
-  const registerClient = deps.registerClient == null ? _registerClient : deps.registerClient;
-  if (reusable) {
-    const port = Number(new URL(reusable.redirect_uri).port);
-    try {
-      const lb = await startLoopback({ port, expectedState: state });
-      return { ...lb, clientId: reusable.client_id, registered: false };
-    } catch {
-      // Port taken by another process — fall through to a fresh registration.
-    }
-  }
-  const lb = await startLoopback({ port: 0, expectedState: state });
-  let clientId;
-  try {
-    clientId = await registerClient(meta.registrationEndpoint, lb.redirectUri);
-  } catch (error) {
-    // The old credentials are still committed; nothing has been replaced yet.
-    error.loginReason = AUTH_REASONS.REGISTRATION_FAILED;
-    throw error;
-  }
-  return { ...lb, clientId, registered: true };
-}
-
-// Interactive login. The previous credential generation survives every failure here — a
-// cancelled browser flow, failed discovery, a failed registration, a failed exchange — and is
-// replaced only once a validated token set has actually been committed. Probing the stored
-// access token and deleting on its 401 or 403 is the defect this replaces (finding 1).
+// Browser authorization always mints a separate client; it cannot silently change an existing
+// machine's client id and link date. Publishing credentials still uses the generation CAS lock.
 export async function runLogin(deps = {}) {
-  const log = deps.log == null ? console.log : deps.log;
-  const base = deps.base == null ? apiBase() : deps.base;
-  const getAuthentication = deps.getAuthentication == null ? _getAuthentication : deps.getAuthentication;
-  const probeIdentity = deps.probeIdentity == null ? _probeIdentity : deps.probeIdentity;
-  const discover = deps.discover == null ? _discover : deps.discover;
-  const exchangeCode = deps.exchangeCode == null ? _exchangeCode : deps.exchangeCode;
-  const syncAccountIfNeeded = deps.syncAccountIfNeeded == null ? _syncAccountIfNeeded : deps.syncAccountIfNeeded;
-  const open = deps.openBrowser == null ? openBrowser : deps.openBrowser;
-  const now = deps.now == null ? Date.now : deps.now;
-  const recordAuthResultImpl = deps.recordAuthResult == null ? _recordAuthResult : deps.recordAuthResult;
-
-  // The shared accessor, not the raw stored token: it refreshes if it can, so an ordinary
-  // expired access token never reaches the identity probe as evidence of a dead link.
-  let auth = await getAuthentication({}, { waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
-  if (auth == null) auth = { authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.STORAGE_UNAVAILABLE };
-  let verdict = auth.authState === AUTH_STATES.READY ? null : auth.authState;
-  if (auth.reason === AUTH_REASONS.MISSING_REFRESH_TOKEN) {
-    // A client registered without offline_access. The behaviour — register a correctly scoped
-    // replacement below — was already right; this puts the reason on the wire, so the evidence
-    // says renewed consent was needed rather than just "some reauthorization".
-    verdict = AUTH_REASONS.CONSENT_REQUIRED;
-    recordAuthResultImpl(
-      { authState: AUTH_STATES.REAUTH_REQUIRED, reason: AUTH_REASONS.CONSENT_REQUIRED },
-      { source: DIAGNOSTIC_SOURCES.LOGIN },
-    );
+  const log = deps.log || console.log;
+  const base = deps.base || apiBase();
+  const probeIdentity = deps.probeIdentity || _probeIdentity;
+  const getAuthentication = deps.getAuthentication || _getAuthentication;
+  const sync = deps.syncAccountIfNeeded || _syncAccountIfNeeded;
+  const linked = await listAccounts(deps);
+  const hint = 'To add a different account, sign out of Beezi in the browser first or use a private window.';
+  log('\nBeezi analytics — link an account\n');
+  if (linked.length) {
+    for (const a of linked) log(`  ${describeAccount(a)}${a.status === 'revoked' ? ' (revoked)' : ''}`);
+    log('Your browser signs in as whichever Beezi account it is already signed in as.');
+    log(hint);
   }
-
-  if (auth.authState === AUTH_STATES.READY) {
-    let probe = await probeIdentity(auth.accessToken, { base });
-    if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
-      // Exactly one retry, and only after a real 401. A 403 or a 503 is a verdict on the
-      // account or on the server's ability to check, and no refresh grant can answer either.
-      const retry = await getAuthentication({}, { forceRefresh: true, waitMs: INTERACTIVE_REFRESH_WAIT_MS })
-        .catch(() => null);
-      if (retry != null && retry.authState === AUTH_STATES.READY) {
-        auth = retry;
-        probe = await probeIdentity(retry.accessToken, { base });
-      }
-    }
-    if (probe.outcome === PROBE_OUTCOMES.AUTHENTICATED) {
-      const who = { valid: true, ...probe.identity };
-      // getAuthentication already stamped the machine client id from the committed generation.
-      try { recordWhoami(who, getMachineClientId()); } catch { /* best-effort */ }
-      const account = who.name || who.email;
-      log(`\n✓ This machine is already linked to Beezi${account ? ` as ${account}` : ''}.`);
-      log('  Nothing to do.\n');
-      // Forced: the user asked for a re-link, and this is the one path that reaches the account
-      // check-in with a token already in hand. Bounded and silent — a failure never fails a login.
-      await syncAccountIfNeeded(
-        auth.accessToken,
-        { force: true, via: 'login' },
-        { env: oauthTokenEnvWithOsProbe(process.env) },
-      );
-      return { status: 'already_linked' };
-    }
-    if (probe.outcome === PROBE_OUTCOMES.FORBIDDEN) {
-      // Not a credential problem, and nothing is deleted over it. Signing in as a different
-      // account is the only thing that could help, so the flow continues.
-      log('\nBeezi: this account does not have access here (the server refused with 403).');
-      log('  Ask your Beezi administrator about your seat, or sign in below as another account.\n');
-    }
-    if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) verdict = AUTH_REASONS.UNAUTHORIZED;
-  }
-
-  log('\nBeezi analytics — link this machine\n');
-  const existing = await currentCredentials(deps);
-  const reusable = reusableClient(existing, verdict);
-  if (existing != null && reusable == null) {
-    log('This machine’s saved authorization needs your consent again — registering it afresh.');
-    log('  The existing one is kept until the new one is stored.\n');
-  }
-
   let meta;
-  try {
-    meta = await discover();
-  } catch (error) {
-    error.loginReason = AUTH_REASONS.DISCOVERY_FAILED;
-    throw error;
-  }
+  try { meta = await (deps.discover || _discover)(); }
+  catch (e) { e.loginReason = AUTH_REASONS.DISCOVERY_FAILED; throw e; }
   const { verifier, challenge } = pkcePair();
   const state = crypto.randomBytes(16).toString('base64url');
-  const { redirectUri, clientId, code } = await bindClient(meta, reusable, state, deps);
-
-  const authorizeUrl = `${meta.authorizationEndpoint}?${new URLSearchParams({
-    response_type: 'code',
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    // The same scopes the client was registered with; offline_access is what earns the refresh
-    // token every later hook depends on.
-    scope: OAUTH_SCOPES,
-    state,
-    code_challenge: challenge,
-    code_challenge_method: 'S256',
-  })}`;
-
-  log('Opening your browser to sign in with your Beezi account…');
-  log(`If it does not open, go to:\n  ${authorizeUrl}\n`);
-  open(authorizeUrl);
-
-  let authCode;
+  const lb = await (deps.startLoopback || _startLoopback)({ port: 0, expectedState: state });
+  let clientId;
+  try { clientId = await (deps.registerClient || _registerClient)(meta.registrationEndpoint, lb.redirectUri); }
+  catch (e) { e.loginReason = AUTH_REASONS.REGISTRATION_FAILED; throw e; }
+  const url = `${meta.authorizationEndpoint}?${new URLSearchParams({ response_type: 'code', client_id: clientId,
+    redirect_uri: lb.redirectUri, scope: OAUTH_SCOPES, state, code_challenge: challenge, code_challenge_method: 'S256' })}`;
+  log(`Opening your browser to sign in with your Beezi account…\nIf it does not open, go to:\n  ${url}\n`);
+  (deps.openBrowser || openBrowser)(url);
+  let code;
+  try { code = await lb.code; }
+  catch (e) { e.loginReason = AUTH_REASONS.LOGIN_CANCELLED; throw e; }
+  // Reserve a keyed store before exchange so a lock failure cannot discard an issued grant.
+  const provisional = newAccountKey();
+  const lockOptions = { waitMs: deps.lockWaitMs == null ? 30_000 : deps.lockWaitMs };
+  let lock = await acquireCredentialLock({ ...lockOptions, account: provisional }, deps);
+  if (!lock) throw new UserError('Another Beezi process is using the saved login. Retry /beezi:login in a moment.');
+  let fresh, creds, lifecycle, committed = false;
+  const discardFresh = async () => {
+    if (!fresh) return;
+    const result = await (deps.unlinkOnServer || unlinkOnServer)(fresh, deps);
+    if ((!result || !result.unlinked)) await (deps.revokeAtAuthServer || revokeAtAuthServer)(creds, deps);
+  };
   try {
-    authCode = await code; // blocks until the callback or timeout
-  } catch (error) {
-    // Cancelled or timed out. The previous generation is exactly as it was.
-    error.loginReason = AUTH_REASONS.LOGIN_CANCELLED;
-    throw error;
-  }
-
-  // The lock comes BEFORE the exchange, not after: taking it afterwards means a lock timeout
-  // throws away tokens the server has already issued and the user redoes the browser flow.
-  const lock = await acquireCredentialLock(
-    { waitMs: deps.lockWaitMs == null ? LOGIN_LOCK_WAIT_MS : deps.lockWaitMs }, deps,
-  );
-  if (lock == null) {
-    throw new UserError(
-      'Another Beezi process is using the saved login. Wait a moment and run /beezi:login again.',
-    );
-  }
-  let where;
-  let tokens;
-  try {
-    try {
-      tokens = await exchangeCode({
-        tokenEndpoint: meta.tokenEndpoint, clientId, redirectUri, code: authCode, verifier,
-      });
-    } catch (error) {
-      error.loginReason = AUTH_REASONS.EXCHANGE_FAILED;
-      throw error;
-    }
-    // A grant with no refresh token lasts one access-token lifetime and then submits the string
-    // "undefined" forever; refuse it here rather than store it (finding 7).
+    let tokens;
+    try { tokens = await (deps.exchangeCode || _exchangeCode)({ tokenEndpoint: meta.tokenEndpoint, clientId, redirectUri: lb.redirectUri, code, verifier }); }
+    catch (e) { e.loginReason = AUTH_REASONS.EXCHANGE_FAILED; throw e; }
     if (!nonEmpty(tokens.access_token) || !nonEmpty(tokens.refresh_token)) {
-      const error = new UserError(
-        'The login server did not return a usable session for this machine. Your previous Beezi '
-        + 'authorization is untouched — try /beezi:login again.',
-      );
-      error.loginReason = AUTH_REASONS.EXCHANGE_FAILED;
+      const e = new UserError('The login server did not return a usable session. Your previous Beezi authorization is untouched — try /beezi:login again.');
+      e.loginReason = AUTH_REASONS.EXCHANGE_FAILED; throw e;
+    }
+    creds = { client_id: clientId, redirect_uri: lb.redirectUri, token_endpoint: meta.tokenEndpoint, scope: OAUTH_SCOPES,
+      access_token: tokens.access_token, refresh_token: tokens.refresh_token,
+      expires_at: (deps.now || Date.now)() + (tokens.expires_in == null ? 3600 : tokens.expires_in) * 1000 };
+    fresh = { key: provisional, token: tokens.access_token, clientId };
+    const verified = await probeIdentity(fresh, { ...deps, base });
+    if (verified.outcome !== PROBE_OUTCOMES.AUTHENTICATED || !nonEmpty(verified.identity && verified.identity.email)) {
+      throw new UserError('Signed in, but Beezi could not verify this account. Your saved accounts are untouched. Retry /beezi:login.');
+    }
+    lifecycle = await acquireCredentialLock({ ...lockOptions, lifecycle: true }, deps);
+    if (!lifecycle) throw new UserError('Another Beezi account change is in progress. Retry /beezi:login in a moment.');
+    const who = { valid: true, ...verified.identity };
+    const identity = { email: who.email.toLowerCase(), name: who.name, tenantId: who.tenantId, tenantName: who.tenantName };
+    async function checkStored(a) {
+      let auth = await getAuthentication(deps, { account: a.key, waitMs: INTERACTIVE_REFRESH_WAIT_MS });
+      if (auth.authState !== AUTH_STATES.READY) return { auth, probe: null };
+      let session = { key: a.key, token: auth.accessToken, clientId: auth.clientId || a.clientId };
+      let probe = await probeIdentity(session, { ...deps, base });
+      if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
+        auth = await getAuthentication(deps, { account: a.key, forceRefresh: true, waitMs: INTERACTIVE_REFRESH_WAIT_MS });
+        if (auth.authState === AUTH_STATES.READY) {
+          session = { ...session, token: auth.accessToken, clientId: auth.clientId || a.clientId };
+          probe = await probeIdentity(session, { ...deps, base });
+        } else probe = null;
+      }
+      return { auth, probe, session };
+    }
+    // A migrated row must be identified by its own grant, never guessed from the new login.
+    for (const a of linked.filter(a => !a.email && a.status === 'linked')) {
+      const check = await checkStored(a);
+      if ((check.probe && check.probe.outcome) === PROBE_OUTCOMES.AUTHENTICATED) {
+        await updateAccount(a.key, { ...check.probe.identity, clientId: check.session.clientId }, deps);
+      } else {
+        throw new UserError('An existing account could not be identified. Retry when its authorization can be checked, or remove it with /beezi:logout before adding an account.');
+      }
+    }
+    const existing = await findByEmail(identity.email, deps);
+    if ((existing && existing.status) === 'linked') {
+      const check = await checkStored(existing);
+      if ((check.probe && check.probe.outcome) === PROBE_OUTCOMES.AUTHENTICATED) {
+        await discardFresh(); fresh = null;
+        log(`\n✓ This machine is already linked as ${describeAccount(existing)}.`);
+        log(hint);
+        const index = await readIndex(deps);
+        if (index.default !== existing.key) log(`  /beezi:analytics still reads from ${describeAccount(index.accounts.find(a => a.key === index.default))}.`);
+        log(`account=${existing.key}`);
+        return { status: 'already_linked', account: existing.key };
+      }
+      if (check.auth.reason === AUTH_REASONS.MISSING_REFRESH_TOKEN) {
+        (deps.recordAuthResult || _recordAuthResult)({ authState: AUTH_STATES.REAUTH_REQUIRED, reason: AUTH_REASONS.CONSENT_REQUIRED }, { account: existing.key, source: DIAGNOSTIC_SOURCES.LOGIN });
+      }
+      const dead = check.auth.authState === AUTH_STATES.REAUTH_REQUIRED || check.auth.authState === AUTH_STATES.UNLINKED
+        || (check.probe && check.probe.outcome) === PROBE_OUTCOMES.UNAUTHORIZED;
+      if (!dead) throw new UserError('Your existing account could not be verified right now. Its saved authorization is untouched; retry later.');
+    }
+    const clash = (await listAccounts(deps)).find(a => a.key !== (existing && existing.key) && a.status === 'linked'
+      && who.tenantId != null && a.tenantId === who.tenantId);
+    if (clash) throw new UserError(`Workspace ${who.tenantName || clash.tenantName || who.tenantId} is already linked as ${clash.email}. Log that account out first to link ${identity.email}.`);
+    const key = (existing && existing.key) || provisional;
+    if (key !== provisional) {
+      const targetLock = await acquireCredentialLock({ ...lockOptions, account: key }, deps);
+      if (!targetLock) throw new UserError('Another Beezi process is using this account. Retry /beezi:login in a moment.');
+      releaseCredentialLock(lock); lock = targetLock;
+    }
+    const metadata = { ...identity, clientId, status: 'linked' };
+    // Publish an existing row before replacing its generation: if the index is unwritable,
+    // the previous authorization is still exactly intact and discoverable. The account lock
+    // keeps refresh writers out; session readers derive their client id from the generation.
+    if (existing) await (deps.updateAccount || updateAccount)(key, metadata, deps);
+    let commit;
+    try {
+      commit = await (deps.commitCredentials || commitCredentials)(creds, { account: key, lock, force: true }, deps);
+      if (commit.status !== COMMIT_STATUS.COMMITTED) throw new UserError('Could not store the new Beezi authorization. Try /beezi:login again.');
+    } catch (error) {
+      if (existing) {
+        try { await updateAccount(key, existing, deps); }
+        catch (_) { throw new UserError('Could not save the new authorization or restore its account details. The account is still listed; retry /beezi:login to repair it.'); }
+      }
       throw error;
     }
-    const commit = await commitCredentials({
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      token_endpoint: meta.tokenEndpoint,
-      scope: OAUTH_SCOPES,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token,
-      // Underestimate when the server omits expires_in — see DEFAULT_EXPIRES_IN_S in
-      // lib/refresh-worker.mjs. Guessing long parks a dead token in the keychain for the whole
-      // difference, and nothing refreshes it because expires_at still reads healthy.
-      expires_at: now() + (tokens.expires_in == null ? 3_600 : tokens.expires_in) * 1000,
-    }, { lock, force: true }, deps);
-    if (commit.status !== COMMIT_STATUS.COMMITTED) {
-      throw new UserError(
-        'Could not store the new Beezi authorization on this machine. Try /beezi:login again.',
-      );
+    committed = true;
+    if (!existing) {
+      try { await (deps.addAccount || addAccount)({ key, ...metadata }, deps); }
+      catch (error) {
+        // This key has never been published. Remove only our own generation while its lock
+        // is still held, then let the outer failure path revoke the unused browser grant.
+        committed = false;
+        const removed = await deleteCredentialGeneration({ account: key, lock, expectedGeneration: commit.generation }, deps);
+        if (removed.status !== DELETE_STATUS.DELETED) {
+          throw new UserError(`Could not publish or remove the new account (${key}). Retry /beezi:login; the unused browser grant is being revoked.`);
+        }
+        deleteAllGenerationEntries({ ...deps, account: key, lock });
+        throw new UserError('Could not publish the new Beezi account. Its saved authorization was removed; retry /beezi:login.');
+      }
     }
-    where = commit.where;
-    // The new generation is committed, so every marker about the old one is now inert.
-    clearAuthMarkers();
-  } finally {
-    releaseCredentialLock(lock);
-  }
-
-  setMachineClientId(clientId);
-  // A fresh login is a fresh identity: machine-global tenant state recorded under the previous
-  // one (audit ledger, tracking cache) must not leak into this workspace — a foreign ledger
-  // replayed here would seal the new tenant's pull empty.
-  clearTrackingState();
-  try { fs.rmSync(auditLedgerFile(), { force: true }); } catch { /* best-effort */ }
-  // Stamp the link instant before anything can be tracked under it: the audit skips transcripts
-  // touched after this, which is what stops it re-segmenting sessions live tracking already sent.
-  markLinked();
-  // The portal registers a machine from the X-Beezi-Host/Client headers that ride along on an
-  // authenticated request — it has no registration endpoint. Best-effort: the link is stored.
-  const probe = await probeIdentity(tokens.access_token, { base }).catch(() => null);
-  const who = probe != null && probe.outcome === PROBE_OUTCOMES.AUTHENTICATED
-    ? { valid: true, ...probe.identity }
-    : null;
-  if (who) {
-    try { recordWhoami(who, clientId); } catch { /* best-effort */ }
-  }
-  log(`\n✓ Beezi analytics linked. Credentials stored in ${where}.`);
-  const account = who ? (who.name || who.email) : null;
-  if (account) log(`  Account: ${account}`);
-  if (who && who.trackingMode && who.trackingMode !== 'live') {
-    log('  This workspace is in audit mode — your session history uploads at the end of this login.');
-  }
-  // Forced for the same reason the tracking cache is cleared above: this is a fresh identity, and
-  // an account-sync marker left by the PREVIOUS login would otherwise suppress the check-in.
-  await syncAccountIfNeeded(
-    tokens.access_token,
-    { force: true, via: 'login' },
-    { env: oauthTokenEnvWithOsProbe(process.env) },
-  );
-  return { status: 'linked', where, clientId };
+    clearAuthMarkers(key);
+    const tracking = readTrackingState(key);
+    if (!tracking || !tracking.linkedAt) markLinked(key);
+    recordWhoami(key, who, clientId);
+    log(`\n✓ Beezi analytics linked as ${describeAccount(identity)}. Credentials stored in ${commit.where}.`);
+    const index = await readIndex(deps);
+    if (index.default !== key) log(`  /beezi:analytics still reads from ${describeAccount(index.accounts.find(a => a.key === index.default))}.`);
+    await sync({ ...fresh, key }, { force: true, via: 'login' }, { env: oauthTokenEnvWithOsProbe(process.env) }).catch(() => {});
+    log(`account=${key}`);
+    return { status: 'linked', account: key, where: commit.where, clientId };
+  } catch (error) {
+    if (!committed) await discardFresh().catch(() => {});
+    throw error;
+  } finally { if (lifecycle) releaseCredentialLock(lifecycle); releaseCredentialLock(lock); }
 }
-
-const nonEmpty = (value) => typeof value === 'string' && value.trim() !== '';
-
-// The committed credentials, or null. Read outside the lock on purpose: it only decides whether
-// this machine's registered client can be reused, never what is stored.
-async function currentCredentials(deps) {
-  const read = await readCredentials(deps).catch(() => null);
-  if (read == null || read.status !== CREDENTIAL_STATUS.READY) return null;
-  return read.credentials;
-}
+const nonEmpty = value => typeof value === 'string' && value.trim() !== '';

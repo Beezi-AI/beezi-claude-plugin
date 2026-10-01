@@ -713,16 +713,16 @@ export function computeSessionTimeline(transcriptPath, sessionId, deps = {}) {
 
 // POST the session timeline to Beezi. Session-scoped (upserted by sessionId), fire-and-forget by
 // convention — callers swallow the result. Mirrors session-error-report.mjs.
-export async function postSessionTimeline(payload, token, deps = {}) {
+export async function postSessionTimeline(payload, session, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   if (payload == null || !payload.sessionId || !Array.isArray(payload.periods)) {
     return { reported: false, reason: 'missing-fields' };
   }
-  if (!token) return { reported: false, reason: 'no-token' };
+  if (!session || !session.token) return { reported: false, reason: 'no-token' };
   try {
     // timeoutMs is undefined for every hook caller, so postJson keeps its 3s default; the bulk
     // import raises it, having no 10s hook budget to protect.
-    const res = await postJson(`${apiBase()}${ENDPOINTS.sessionsTimeline}`, token, payload, { fetchImpl, timeoutMs: deps.timeoutMs });
+    const res = await postJson(`${apiBase()}${ENDPOINTS.sessionsTimeline}`, session, payload, { fetchImpl, timeoutMs: deps.timeoutMs });
     return { reported: res.status >= 200 && res.status < 300, status: res.status };
   } catch {
     return { reported: false, reason: 'network' };

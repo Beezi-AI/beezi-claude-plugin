@@ -22,7 +22,8 @@ import { authNotice, FORBIDDEN_NOTICE, UPGRADE_RESTART_NOTICE } from './auth-mes
 import { takeUpgradeNotice as _takeUpgradeNotice } from './auth-markers.mjs';
 import { recordAuthResult as _recordAuthResult } from './telemetry-auth.mjs';
 import { DIAGNOSTIC_SOURCES } from './telemetry-codes.mjs';
-import { getMachineClientId } from './machine-identity.mjs';
+import { listAccounts, updateAccount, getDefaultKey } from './accounts.mjs';
+import { authHeaders } from './http.mjs';
 import {
   recordWhoami,
   readTrackingState,
@@ -139,13 +140,13 @@ export function discoverRepos(cwd, gitImpl, map, deps = {}) {
   return { map, dirty };
 }
 
-async function announceRepo(cwd, token, fetchImpl, gitImpl) {
+async function announceRepo(cwd, session, fetchImpl, gitImpl) {
   const remote = resolveOriginRemote(gitImpl, cwd);
   if (!remote) return null; // not a git repo — silent
   try {
     const res = await fetchImpl(`${apiBase()}${ENDPOINTS.reposStatus}`, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      headers: { ...authHeaders(session), 'Content-Type': 'application/json' },
       body: JSON.stringify({ remote }),
     });
     if (!res.ok) return null;
@@ -161,8 +162,8 @@ async function announceRepo(cwd, token, fetchImpl, gitImpl) {
 // anything else is a check we could not run, which stays silent. Nothing here ever discards
 // credentials — that is the loop that used to delete a refreshable session (findings 1, 2).
 // `who` carries the tenant's tracking policy for the rest of the hook.
-async function probeToken(token, fetchImpl) {
-  const probe = await probeIdentity(token, { fetchImpl });
+async function probeToken(session, fetchImpl) {
+  const probe = await probeIdentity(session, { fetchImpl });
   return {
     outcome: probe.outcome,
     reason: probe.reason == null ? null : probe.reason,
@@ -209,56 +210,60 @@ export async function runSessionStart(input, deps = {}) {
   const restartNotice = takeUpgradeNotice() ? UPGRADE_RESTART_NOTICE : null;
   const stop = (line) => append(append(line, restartNotice), null);
 
-  let auth;
+  let rows;
   try {
-    auth = await getAuthentication();
+    rows = await (deps.listAccounts == null ? listAccounts : deps.listAccounts)(deps);
   } catch {
-    auth = { authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.STORAGE_UNAVAILABLE, accessToken: null };
+    const unavailable = { authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.STORAGE_UNAVAILABLE };
+    return append(stop(authNotice(unavailable)), await updatePromise);
   }
-  if (auth.authState !== AUTH_STATES.READY) {
-    // Each non-ready state says something different: gone, coming back, temporarily out of
-    // reach, or definitively rejected. Reporting all four as "not linked" is what sent users
-    // into a login that then deleted the session they still had (findings 1, 6).
-    return append(stop(authNotice(auth)), await updatePromise);
+  const supplied = deps.linkedSessions == null ? null : await deps.linkedSessions(deps);
+  const entries = supplied == null ? rows : supplied;
+  if (entries.length === 0) {
+    return append(stop(authNotice({ authState: AUTH_STATES.UNLINKED, reason: AUTH_REASONS.NO_CREDENTIALS })), await updatePromise);
   }
-  let token = auth.accessToken;
-
-  let probe = await probeToken(token, fetchImpl);
-  if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
-    // The 401 is the server's verdict on the token; expires_at was only ours, and a server that
-    // omits expires_in leaves it a guess. Take the server's word and refresh once before
-    // declaring the link bad — otherwise a token that died earlier than we estimated is never
-    // renewed, and every session reports a rejection that a single refresh would have fixed.
-    // Only after an actual 401: a 403 or a 503 is never a reason to spend a refresh grant.
-    const retry = await getAuthentication({}, { forceRefresh: true }).catch(() => null);
-    if (retry == null || retry.authState !== AUTH_STATES.READY) {
-      return append(stop(retry == null ? null : authNotice(retry)), await updatePromise);
-    }
-    probe = await probeToken(retry.accessToken, fetchImpl);
+  const label = (session) => entries.length > 1 ? `Beezi (${session.tenantName || session.email || session.key})` : 'Beezi';
+  const warnings = [];
+  const sessions = (await Promise.all(entries.map(async (row) => {
+    const warn = (line) => { if (line) warnings.push(line.replace('Beezi:', `${label(row)}:`)); };
+    let auth = row.token ? { authState: AUTH_STATES.READY, accessToken: row.token }
+      : await getAuthentication(deps, { account: row.key }).catch(() => ({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.STORAGE_UNAVAILABLE }));
+    if (auth.authState !== AUTH_STATES.READY) { warn(authNotice(auth)); return null; }
+    let session = { ...row, token: auth.accessToken, clientId: auth.clientId == null ? row.clientId : auth.clientId };
+    let probe = await probeToken(session, fetchImpl);
     if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
-      return append(stop(
-        '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. '
-        + 'Run /beezi:login to authorize it again.',
-      ), await updatePromise);
+      const retry = await getAuthentication(deps, { account: row.key, forceRefresh: true }).catch(() => null);
+      if (retry == null || retry.authState !== AUTH_STATES.READY) {
+        warn(retry == null ? 'Beezi: authentication is temporarily unavailable.' : authNotice(retry));
+        return null;
+      }
+      session = { ...session, token: retry.accessToken, clientId: retry.clientId == null ? session.clientId : retry.clientId };
+      probe = await probeToken(session, fetchImpl);
+      if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
+        warn('⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Run /beezi:login to authorize it again.');
+        return null;
+      }
     }
-    token = retry.accessToken;
-  }
-  if (probe.outcome === PROBE_OUTCOMES.FORBIDDEN) {
-    recordAuthResultImpl(
-      { authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.FORBIDDEN },
-      { source: DIAGNOSTIC_SOURCES.SESSION_START },
-    );
-    return append(stop(FORBIDDEN_NOTICE), await updatePromise);
-  }
-  // A check we could not run is not a verdict on the credential, so the hook stays silent — but
-  // the reason still has to reach the evidence trail, or a verification outage and an ordinary
-  // 5xx are indistinguishable afterwards.
-  if (probe.outcome === PROBE_OUTCOMES.UNAVAILABLE && probe.reason != null) {
-    recordAuthResultImpl(
-      { authState: AUTH_STATES.UNAVAILABLE, reason: probe.reason },
-      { source: DIAGNOSTIC_SOURCES.SESSION_START },
-    );
-  }
+    if (probe.outcome === PROBE_OUTCOMES.FORBIDDEN) {
+      recordAuthResultImpl({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.FORBIDDEN }, { source: DIAGNOSTIC_SOURCES.SESSION_START, account: row.key });
+      warn(FORBIDDEN_NOTICE);
+      return null;
+    }
+    if (probe.outcome === PROBE_OUTCOMES.UNAVAILABLE && probe.reason != null) {
+      recordAuthResultImpl({ authState: AUTH_STATES.UNAVAILABLE, reason: probe.reason }, { source: DIAGNOSTIC_SOURCES.SESSION_START, account: row.key });
+    }
+    try { recordWhoamiImpl(session.key, probe.who, session.clientId); } catch { /* best-effort */ }
+    if (probe.who != null) {
+      const patch = {};
+      for (const field of ['email', 'name', 'tenantId', 'tenantName']) {
+        if (probe.who[field] != null) patch[field] = probe.who[field];
+      }
+      try { await updateAccount(session.key, patch); } catch { /* best-effort */ }
+      session = { ...session, ...patch };
+    }
+    return session;
+  }))).filter(Boolean);
+  if (sessions.length === 0) return append(stop(warnings.join('\n')), await updatePromise);
 
   // ONE env for the whole hook. Claude Code 2.1.251 deletes CLAUDE_CODE_OAUTH_TOKEN from every
   // child environment it builds, so this hook never inherits a setup token however the user set
@@ -275,25 +280,18 @@ export async function runSessionStart(input, deps = {}) {
     ? oauthTokenEnvWithOsProbe(process.env, { osEnvOauthToken: deps.osEnvOauthToken })
     : deps.env;
 
-  // Persist the tenant's tracking policy BEFORE the flush below, so a freshly-disabled tenant
-  // never gets one last ungated drain. Bound to this login's client id — a workspace switch
-  // must not inherit the previous tenant's flags.
-  try {
-    let clientId = getMachineClientId();
-    if (clientId == null) clientId = probe.who == null ? undefined : probe.who.email;
-    recordWhoamiImpl(probe.who, clientId == null ? null : clientId);
-  } catch { /* best-effort */ }
-  const tracking = readTrackingState();
-  const liveAllowed = isLiveTrackingAllowed(tracking);
-
+  const trackingByKey = new Map(sessions.map((s) => [s.key, readTrackingState(s.key)]));
+  const liveSessions = sessions.filter((s) => isLiveTrackingAllowed(trackingByKey.get(s.key)));
+  const liveAllowed = liveSessions.length > 0;
   initSessionState(input.session_id, { cwd: input.cwd == null ? null : input.cwd, transcriptPath: input.transcript_path == null ? null : input.transcript_path });
-  // Independent network I/O on the per-session hot path — flush queued checkpoints
-  // and probe repo status concurrently rather than serially. A dark workspace skips the repo
-  // probe's promise entirely: "Task-branch sessions will be tracked" would be a lie there.
-  const [, systemMessage] = await Promise.all([
-    flushQueue(token, { fetchImpl }),
-    liveAllowed ? announceRepo(input.cwd, token, fetchImpl, gitImpl) : Promise.resolve(null),
+  const [, announcements] = await Promise.all([
+    Promise.all(sessions.map((s) => flushQueue(s, { fetchImpl }))),
+    Promise.all(liveSessions.map(async (s) => {
+      const line = await announceRepo(input.cwd, s, fetchImpl, gitImpl);
+      return line == null ? null : line.replace('Beezi:', `${label(s)}:`);
+    })),
   ]);
+  const systemMessage = [...warnings, ...announcements.filter(Boolean), restartNotice].filter(Boolean).join('\n') || null;
   try { pruneStale(); } catch { /* best-effort */ }
 
   // Pre-warm + self-heal the repo-map: discover this session's repo(s) and drop dead roots.
@@ -351,18 +349,10 @@ export async function runSessionStart(input, deps = {}) {
   // attached here at creation, so awaiting it later can only yield a value, never throw. The one
   // path that does await it is the unknown-key branch below: that check-in is what registers this
   // key with the portal, so asking again before it lands would just re-read "unknown".
-  let syncPromise = null;
-  try {
-    // 'migrated' belongs here for the same reason 'switched' does: the machine just moved off a
-    // setup token onto an interactive login, so the portal is holding the wrong account and the
-    // wrong plan for it until this check-in lands.
-    const forced = billingOutcome === 'switched'
-      || billingOutcome === 'captured'
-      || billingOutcome === 'migrated';
-    syncPromise = Promise.resolve(
-      syncAccount(token, { force: forced, via: 'session-start' }, syncDeps),
-    ).catch(() => null);
-  } catch { /* best-effort */ }
+  const forced = ['switched', 'captured', 'migrated'].includes(billingOutcome);
+  const syncPromises = new Map(liveSessions.map((session) => [session.key,
+    Promise.resolve().then(() => syncAccount(session, { force: forced, via: 'session-start' }, syncDeps)).catch(() => null),
+  ]));
 
   let message = systemMessage;
   // Billing nudges are noise for a workspace that reports nothing live.
@@ -414,12 +404,17 @@ export async function runSessionStart(input, deps = {}) {
     //
     // Answered from a cached verdict, so the steady state is one file read. A null answer means the
     // question could not be asked, which is not the same as "unresolved" and says nothing.
+    const defaultKey = await (deps.getDefaultKey == null ? getDefaultKey : deps.getDefaultKey)(deps).catch(() => null);
+    // Billing is machine-wide: tenant-specific key answers must not race to rewrite it.
+    const billingAccountKey = defaultKey;
+    await Promise.all(liveSessions.map(async (session) => {
+      const syncPromise = syncPromises.get(session.key);
     const fetchKeyStatus = deps.fetchOauthKeyStatus == null
       ? _fetchOauthKeyStatus
       : deps.fetchOauthKeyStatus;
     let keyStatus = null;
     try {
-      keyStatus = await fetchKeyStatus(token, { fetchImpl, env: oauthEnv });
+      keyStatus = await fetchKeyStatus(session, { fetchImpl, env: oauthEnv });
     } catch { /* best-effort */ }
 
     // A key the portal has never seen reports its usage unpriced and, worse, says nothing about it:
@@ -441,9 +436,9 @@ export async function runSessionStart(input, deps = {}) {
         // needsAttention requires `known`.
         if (syncPromise != null) await syncPromise;
         await Promise.resolve(
-          syncAccount(token, { force: true, via: 'session-start' }, syncDeps),
+          syncAccount(session, { force: true, via: 'session-start' }, syncDeps),
         ).catch(() => null);
-        const reprobed = await fetchKeyStatus(token, { fetchImpl, env: oauthEnv, refresh: true });
+        const reprobed = await fetchKeyStatus(session, { fetchImpl, env: oauthEnv, refresh: true });
         if (reprobed != null) keyStatus = reprobed;
       } catch { /* best-effort */ }
     }
@@ -465,7 +460,7 @@ ${nudge}` : nudge;
       // the reports carry it from this session on, instead of waiting for the user to run
       // /beezi:refresh and instead of shipping whatever a previous interactive login left behind.
       // Best-effort and silent by contract: nothing changed for the user to read about.
-      try { recordKeyData(keyStatus); } catch { /* best-effort */ }
+      try { if (session.key === billingAccountKey) recordKeyData(keyStatus); } catch { /* best-effort */ }
 
       // One exception to the silence. The portal priced this key against an account that carries an
       // identity of its own — an email or a vendor uuid — and the plan was never confirmed for the
@@ -479,15 +474,17 @@ ${nudge}` : nudge;
           : deps.hasKeyBeenNotified;
         const markNotified = deps.markKeyNotified == null ? _markKeyNotified : deps.markKeyNotified;
         try {
-          if (!notified(keyStatus.fingerprint)) {
+          if (!notified(session.key, keyStatus.fingerprint)) {
             const named = keyStatus.accountEmail == null ? '' : ` (${keyStatus.accountEmail})`;
             const notice = `Beezi: this machine's Claude setup token bills a subscription${named} that an earlier sign-in established, not one confirmed for the key itself. If that is the wrong subscription, ask your Beezi admin to re-point it.`;
             message = message ? `${message}\n${notice}` : notice;
-            markNotified(keyStatus.fingerprint);
+            markNotified(session.key, keyStatus.fingerprint);
           }
         } catch { /* best-effort */ }
       }
     }
+
+    }));
 
     // The status-line wrapper is the only source of LIVE plan-usage readings, and it is a
     // settings.json entry anything can overwrite. Silence here would read as "still tracking".
@@ -502,6 +499,8 @@ ${nudge}` : nudge;
   // Tracking-policy messages: tell a dark workspace it is dark, and point at the login flow
   // wherever the one-time history pull has not completed yet (paid tenants included) — the
   // backfill runs as the last step of /beezi:login.
+  for (const session of sessions) {
+    const tracking = trackingByKey.get(session.key);
   const mode = tracking == null || tracking.trackingMode == null ? null : tracking.trackingMode;
   let policy = null;
   if (mode === TrackingMode.BACKFILL_ONLY) {
@@ -513,7 +512,9 @@ ${nudge}` : nudge;
   } else if (shouldBackfill(tracking)) {
     policy = 'Beezi: run /beezi:login once to include your past sessions.';
   }
-  if (policy) message = message ? `${message}\n${policy}` : policy;
+  if (policy) message = append(message, policy.replace('Beezi:', `${label(session)}:`));
+
+  }
 
   const consentAsk = consentPrompt();
   if (consentAsk) message = message ? `${message}\n${consentAsk}` : consentAsk;

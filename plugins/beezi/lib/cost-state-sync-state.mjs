@@ -13,7 +13,7 @@ export const OVERLAP_MS = 10 * 60 * 1000;
 
 export function readSyncState(deps = {}) {
   const read = deps.readJsonImpl == null ? readJson : deps.readJsonImpl;
-  const raw = read(costStateSyncFile(), null);
+  const raw = read(costStateSyncFile(deps.account), null);
   if (raw == null || raw.version !== STATE_VERSION) return null;
   return raw;
 }
@@ -26,7 +26,7 @@ function write(patch, deps) {
   const prior = readSyncState(deps);
   const next = prior == null ? { version: STATE_VERSION } : { ...prior, ...{ version: STATE_VERSION } };
   try {
-    writeImpl(costStateSyncFile(), { ...next, ...patch });
+    writeImpl(costStateSyncFile(deps.account), { ...next, ...patch });
   } catch { /* best-effort: a gate we failed to write costs one extra scan, nothing more */ }
 }
 

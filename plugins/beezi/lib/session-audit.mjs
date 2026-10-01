@@ -1,8 +1,9 @@
 import fs from 'fs';
+import { sessionFor as _sessionFor } from './sessions.mjs';
 import { getAuthentication as _getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from './token.mjs';
 import { AUTH_STATES } from './auth-state.mjs';
 import { runCheckpoint as _runCheckpoint, flushQueue as _flushQueue } from './checkpoint.mjs';
-import { listAllTranscripts as _listAllTranscripts, firstRecordedCwd as _firstRecordedCwd } from './transcript-index.mjs';
+import { firstRecordedCwd as _firstRecordedCwd } from './transcript-index.mjs';
 import {
   loadLedger as _loadLedger,
   saveLedger as _saveLedger,
@@ -24,6 +25,9 @@ import {
 } from './audit-flush.mjs';
 import { ENDPOINTS } from './config.mjs';
 import { readLastCostState as _readLastCostState, toCostStateItem } from './cost-state.mjs';
+import { listAnalyticsSessions } from './analytics-sessions.mjs';
+import { nonRegressingSnapshot, sameCumulativeUsage } from './cowork-snapshot.mjs';
+import { acquireLock, releaseLock } from './single-instance-lock.mjs';
 import { readSessionShell as _readSessionShell } from './transcript-shell.mjs';
 import { sessionNameFrom as _sessionNameFrom } from './session-name.mjs';
 import { loadRepoMap as _loadRepoMap, resolveRemoteOffline } from './repo-map.mjs';
@@ -31,17 +35,15 @@ import { fetchCoverage as _fetchCoverage } from './session-coverage.mjs';
 import { computeSessionTimeline as _computeSessionTimeline } from './session-timeline.mjs';
 import { postSessionError as _postSessionError } from './session-error-report.mjs';
 import { resolveSessionTranscript } from './transcript.mjs';
-import { getMachineClientId } from './machine-identity.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { whoami as _whoami } from './whoami.mjs';
-import { credentialsFile } from './paths.mjs';
 import {
   readTrackingState,
   matchesIdentity,
   isLiveTrackingAllowed,
   markBackfillCompleted,
   recordWhoami,
-  linkedAtMs as _linkedAtMs,
+  linkedAtMs,
   TrackingMode,
 } from './tracking.mjs';
 import { UserError } from './friendly-error.mjs';
@@ -106,27 +108,6 @@ function liveSessionId(env, deps) {
   }
 }
 
-// When live tracking is on, everything after the machine link was (or will be) tracked live —
-// re-sending it through the audit would re-segment the same transcript lines on different
-// boundaries once the per-session cursor has been pruned, and double-count the spend.
-//
-// The link instant comes from tracking.json, stamped by login. It used to be read as the
-// credentials file's mtime, which is written only by the DPAPI/plaintext fallbacks: on any machine
-// with a real credential store (CredMan, Keychain, secret-tool) the file does not exist, so this
-// returned null and the guard below never fired. The mtime stays as the fallback for links made
-// before the stamp existed — and it is the weaker signal, since token refresh rewrites it.
-function linkedAtMs(tracking, deps) {
-  const stamped = _linkedAtMs(tracking);
-  if (stamped != null) return stamped;
-  const statImpl = deps.statImpl == null ? ((p) => fs.statSync(p)) : deps.statImpl;
-  try {
-    const stats = statImpl(credentialsFile());
-    return stats.mtimeMs == null ? null : stats.mtimeMs;
-  } catch {
-    return null;
-  }
-}
-
 // Run `worker` over `items` with at most `limit` in flight.
 async function mapLimited(items, limit, worker) {
   const queue = [...items];
@@ -145,6 +126,7 @@ async function mapLimited(items, limit, worker) {
 // blocking would deadlock the seal forever.
 export function shouldFinalize(result, options = {}) {
   if (!result.ok) return false;
+  if (result.coworkWarnings > 0) return false;
   // /beezi:sync is repeatable by definition; sealing the one-time pull from it would lock the user
   // out of the very command they just ran.
   if (options.mode === SYNC_MODE) return false;
@@ -178,8 +160,18 @@ export function shouldFinalize(result, options = {}) {
 // live-only follow-up — and only for sessions the server judged accepted, so a failed session
 // stays fully retryable.
 export async function runAudit(deps = {}, options = {}) {
+  if (options.account == null) return runAuditUnlocked(deps, options);
+  const lock = deps.acquireAuditLock == null ? acquireLock : deps.acquireAuditLock;
+  const unlock = deps.releaseAuditLock == null ? releaseLock : deps.releaseAuditLock;
+  const name = 'session-audit';
+  if (!lock(name)) return { ok: false, reason: 'busy', scanned: 0 };
+  try { return await runAuditUnlocked(deps, options); }
+  finally { unlock(name); }
+}
+
+async function runAuditUnlocked(deps, options) {
   const getAuthentication = deps.getAuthentication == null ? _getAuthentication : deps.getAuthentication;
-  const listTranscripts = deps.listTranscripts == null ? _listAllTranscripts : deps.listTranscripts;
+  const listTranscripts = deps.listTranscripts == null ? listAnalyticsSessions : deps.listTranscripts;
   const recordedCwd = deps.firstRecordedCwd == null ? _firstRecordedCwd : deps.firstRecordedCwd;
   const runCheckpoint = deps.runCheckpointImpl == null ? _runCheckpoint : deps.runCheckpointImpl;
   const flushBackfillChunks = deps.flushBackfillChunksImpl == null ? _flushBackfillChunks : deps.flushBackfillChunksImpl;
@@ -268,35 +260,24 @@ export async function runAudit(deps = {}, options = {}) {
     lastError: null,
   };
 
-  // The typed accessor, not the collapsing wrapper. Backfill runs as the last step of
-  // /beezi:login, so it has a human in front of it and can wait the interactive budget for a
-  // refresh already in flight. More importantly it must tell "this machine has no saved login"
-  // apart from "the credential store did not answer in time" — reporting the second as the first
-  // is what sent a correctly linked user through three logins, a logout and a reinstall.
-  let token = null;
-  let auth = null;
-  if (deps.getAccessToken != null) {
-    token = await deps.getAccessToken().catch(() => null); // historical seam, honoured as-is
-  } else {
-    auth = await getAuthentication({}, { waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
-    token = auth != null && auth.authState === AUTH_STATES.READY ? auth.accessToken : null;
-  }
-  if (!token) {
-    const unlinked = auth == null || auth.authState === AUTH_STATES.UNLINKED;
-    result.reason = unlinked ? 'no-token' : 'auth-unavailable';
+  if (options.account == null) { result.reason = 'no-account'; return result; }
+  const key = options.account;
+  const auth = await getAuthentication(deps, { account: key, waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
+  if (auth == null || auth.authState !== AUTH_STATES.READY) {
+    result.reason = auth != null && auth.authState === AUTH_STATES.UNLINKED ? 'no-account' : 'auth-unavailable';
     result.authState = auth == null ? null : auth.authState;
     result.authReason = auth == null ? null : auth.reason;
     return result;
   }
-
-  // getAccessToken primed the machine client id — the binding key for the machine-global
-  // ledger and tracking cache (a new login mints a new id, so a workspace switch invalidates
-  // both instead of sealing the new tenant's pull empty).
-  const identity = getMachineClientId();
+  const sessionFor = deps.sessionFor == null ? _sessionFor : deps.sessionFor;
+  const resolved = await sessionFor(key, { ...deps, getAccessToken: async () => auth.accessToken }).catch(() => null);
+  if (resolved == null) { result.reason = 'no-account'; return result; }
+  const session = { ...resolved, token: auth.accessToken };
+  const identity = session.clientId;
   // Sync drops every gate that encodes one-timeness and every skip keyed on the session id alone;
   // the server's per-session line coverage decides what is already uploaded.
   const syncMode = options.mode === SYNC_MODE;
-  const tracking = readTracking();
+  const tracking = readTracking(key);
   const trackingValid = matchesIdentity(tracking, identity);
 
   // Fast path: the local cache already knows the pull is sealed. --force skips the LOCAL
@@ -312,11 +293,11 @@ export async function runAudit(deps = {}, options = {}) {
   // a reinstall never had them), and without this check a re-run would re-parse every
   // transcript only to be 403'd on its first chunk. Offline/old servers answer null — proceed;
   // the chunk-level ALREADY_COMPLETED guard still stands behind us.
-  const who = await whoamiImpl(token, { fetchImpl }).catch(() => null);
+  const who = await whoamiImpl(session, { fetchImpl }).catch(() => null);
   if (who != null && who.valid) {
-    try { recordWhoamiImpl(who, identity); } catch { /* best-effort */ }
+    try { recordWhoamiImpl(key, who, identity); } catch { /* best-effort */ }
     if (!syncMode && who.backfillCompleted === true) {
-      try { markCompleted(); } catch { /* best-effort */ }
+      try { markCompleted(key); } catch { /* best-effort */ }
       result.ok = true;
       result.reason = 'already-completed';
       result.upgradeAdvised = who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE;
@@ -324,7 +305,7 @@ export async function runAudit(deps = {}, options = {}) {
     }
   }
 
-  const ledger = loadLedger(identity);
+  const ledger = loadLedger(key, identity);
   if (!syncMode && !options.force && isComplete(ledger)) {
     result.ok = true;
     result.reason = 'already-completed';
@@ -335,12 +316,13 @@ export async function runAudit(deps = {}, options = {}) {
   // queue/<segmentId>.json; if it landed after this run's wide re-send, the server would hold a
   // narrow row inside a wider one — the one direction its containment supersede cannot dedupe, so
   // both would count in every SUM. Draining first also makes the coverage answer below current.
-  if (syncMode) {
-    try { await flushQueue(token, { fetchImpl }); } catch { /* best-effort; coverage still bounds us */ }
+  if (syncMode && !options.coworkLive) {
+    try { await flushQueue(session, { fetchImpl }); } catch { /* best-effort; coverage still bounds us */ }
   }
 
   const live = liveSessionId(env, deps);
   const all = listTranscripts();
+  result.coworkWarnings = all.coworkWarnings || 0;
   result.scanned = all.length;
 
   // Live-tracking tenants: everything since the machine link was tracked live; re-sending it
@@ -349,14 +331,15 @@ export async function runAudit(deps = {}, options = {}) {
   const liveMode = trackingValid && tracking != null && tracking.trackingMode === TrackingMode.LIVE;
   // Sync keeps post-link sessions in scope on purpose: a session whose hooks died after 200 of 900
   // lines is exactly what it exists to repair, and coverage stops it re-sending what already landed.
-  const linkCutoffMs = liveMode && !syncMode ? linkedAtMs(tracking, deps) : null;
+  const linkCutoffMs = liveMode && !syncMode ? linkedAtMs(tracking) : null;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
 
   const candidates = [];
   for (const entry of all) {
-    if (live && entry.sessionId === live) { result.live += 1; continue; }
-    if (entry.mtimeMs > activeCutoffMs) { result.active += 1; continue; }
-    if (linkCutoffMs != null && entry.mtimeMs >= linkCutoffMs) { result.liveTracked += 1; continue; }
+    const liveCowork = options.coworkLive === true && entry.source === 'claude-cowork';
+    if (!liveCowork && live && entry.sessionId === live) { result.live += 1; continue; }
+    if (!liveCowork && entry.mtimeMs > activeCutoffMs) { result.active += 1; continue; }
+    if (entry.source !== 'claude-cowork' && linkCutoffMs != null && entry.mtimeMs >= linkCutoffMs) { result.liveTracked += 1; continue; }
     // Session-keyed, so it goes stale the moment a session grows — coverage supersedes it in sync.
     if (!syncMode && !options.force && isImported(ledger, entry.sessionId)) { result.alreadyImported += 1; continue; }
     if (options.sinceMs != null && entry.mtimeMs < options.sinceMs) continue;
@@ -375,12 +358,12 @@ export async function runAudit(deps = {}, options = {}) {
 
   const finalize = async () => {
     if (!shouldFinalize(result, options)) return;
-    const sealed = await completeBackfill(token, { fetchImpl }, { timeoutMs: AUDIT_TIMEOUT_MS });
+    const sealed = await completeBackfill(session, { fetchImpl }, { timeoutMs: AUDIT_TIMEOUT_MS });
     if (sealed.completed || sealed.code === 'BACKFILL_ALREADY_COMPLETED') {
       result.finalized = true;
       markComplete(ledger);
-      try { saveLedger(ledger); } catch { /* best-effort */ }
-      try { markCompleted(); } catch { /* best-effort */ }
+      try { saveLedger(key, ledger); } catch { /* best-effort */ }
+      try { markCompleted(key); } catch { /* best-effort */ }
     } else {
       result.lastError = sealed.reason == null ? result.lastError : sealed.reason;
     }
@@ -410,6 +393,9 @@ export async function runAudit(deps = {}, options = {}) {
   let halted = false;
 
   const dispatchBatch = async (batch) => {
+    if (deps.shouldContinue != null && !deps.shouldContinue()) {
+      result.halt = 'tracking-stopped'; halted = true; return;
+    }
     result.plannedReports += batch.reduce((sum, g) => sum + g.reports.length, 0);
     if (options.dryRun) {
       const chunks = planChunks(batch);
@@ -420,7 +406,7 @@ export async function runAudit(deps = {}, options = {}) {
 
     const flushed = await flushBackfillChunks(
       batch,
-      token,
+      session,
       { fetchImpl },
       { timeoutMs: AUDIT_TIMEOUT_MS, endpoint: syncMode ? ENDPOINTS.sessionsSync : ENDPOINTS.sessionsBackfill },
     );
@@ -464,21 +450,30 @@ export async function runAudit(deps = {}, options = {}) {
         status === BackfillSessionStatus.PARTIAL ||
         status === BackfillSessionStatus.REJECTED
       ) {
+        const previousEntry = ledger.sessions[group.sessionId];
         markImported(ledger, group.sessionId, { outcome: status, reports: group.reports.length });
+        if (previousEntry != null && previousEntry.coworkSnapshot != null) {
+          ledger.sessions[group.sessionId].coworkSnapshot = previousEntry.coworkSnapshot;
+        }
+        if (group.cowork === true && status === BackfillSessionStatus.ACCEPTED) {
+          ledger.sessions[group.sessionId].coworkSnapshot = group.costState;
+        }
       } else {
         followups.delete(group.sessionId);
       }
     }
     // Written per dispatch, not once at the end, so Ctrl-C keeps the progress made so far.
-    try { saveLedger(ledger); } catch { /* best-effort */ }
+    if (deps.shouldContinue == null || deps.shouldContinue()) {
+      try { saveLedger(key, ledger); } catch { /* best-effort */ }
+    }
 
     if (flushed.halt) {
       result.halt = flushed.halt;
       halted = true;
       if (flushed.halt === BackfillHalt.ALREADY_COMPLETED) {
         markComplete(ledger);
-        try { saveLedger(ledger); } catch { /* best-effort */ }
-        try { markCompleted(); } catch { /* best-effort */ }
+        try { saveLedger(key, ledger); } catch { /* best-effort */ }
+        try { markCompleted(key); } catch { /* best-effort */ }
       }
       return;
     }
@@ -489,7 +484,7 @@ export async function runAudit(deps = {}, options = {}) {
         followups.delete(sessionId);
         if (!followup) return;
         for (const errorPayload of followup.sessionErrors) {
-          const { reported } = await postSessionError(errorPayload, token, { fetchImpl, timeoutMs: AUDIT_TIMEOUT_MS });
+          const { reported } = await postSessionError(errorPayload, session, { fetchImpl, timeoutMs: AUDIT_TIMEOUT_MS });
           if (reported) result.sessionErrors += 1;
         }
       });
@@ -553,7 +548,7 @@ export async function runAudit(deps = {}, options = {}) {
   const costStateGroupFor = (entry) => {
     let block;
     try {
-      block = readCostState(entry.transcriptPath, entry.sessionId);
+      block = entry.source === 'claude-cowork' ? entry.costState : readCostState(entry.transcriptPath, entry.sessionId);
     } catch {
       return null;
     }
@@ -564,7 +559,7 @@ export async function runAudit(deps = {}, options = {}) {
     if (item == null) return null;
     let shell;
     try {
-      shell = readShell(entry.transcriptPath);
+      shell = entry.source === 'claude-cowork' ? entry.shell : readShell(entry.transcriptPath);
     } catch {
       return null;
     }
@@ -573,10 +568,10 @@ export async function runAudit(deps = {}, options = {}) {
     // back to the segment path, which can still recover a span from its own timing anchors.
     if (shell == null || shell.startedAt == null) return null;
 
-    const costState = { ...item, started_at: shell.startedAt };
+    let costState = { ...item, started_at: shell.startedAt };
     if (shell.endedAt != null) costState.ended_at = shell.endedAt;
     let name = null;
-    try { name = sessionNameFrom(entry.transcriptPath); } catch { /* best-effort */ }
+    try { name = entry.source === 'claude-cowork' ? entry.sessionName : sessionNameFrom(entry.transcriptPath); } catch { /* best-effort */ }
     if (name != null) costState.session_name = name;
     if (shell.cwd != null) {
       try {
@@ -592,7 +587,14 @@ export async function runAudit(deps = {}, options = {}) {
         if (remote != null && remote.length <= MAX_REPO_URL_LENGTH) costState.repo_urls = [remote];
       } catch { /* best-effort */ }
     }
-    return { sessionId: entry.sessionId, reports: [], timeline: null, costState: costState };
+    const cowork = entry.source === 'claude-cowork';
+    let unchanged = false;
+    if (cowork) {
+      const previous = ledger.sessions[entry.sessionId];
+      costState = nonRegressingSnapshot(costState, previous == null ? null : previous.coworkSnapshot);
+      unchanged = options.coworkLive === true && previous != null && sameCumulativeUsage(costState, previous.coworkSnapshot);
+    }
+    return { sessionId: entry.sessionId, reports: [], timeline: null, costState: costState, cowork, unchanged };
   };
 
   // Resolved for EVERY candidate up front, before the coverage question below. Two bounded reads
@@ -615,7 +617,7 @@ export async function runAudit(deps = {}, options = {}) {
       .filter((entry) => !costStateBySession.has(entry.sessionId))
       .map((entry) => entry.sessionId);
     if (needsCursor.length > 0) {
-      coverage = await fetchCoverage(needsCursor, token, { fetchImpl });
+      coverage = await fetchCoverage(needsCursor, session, { fetchImpl });
       result.coverageKnown = coverage != null;
     } else {
       // Nothing needed a cursor, so the resume basis is trivially sound. Reporting this as
@@ -633,6 +635,7 @@ export async function runAudit(deps = {}, options = {}) {
     const fastPath = costStateBySession.get(entry.sessionId);
     if (fastPath != null) {
       processed += 1;
+      if (fastPath.unchanged) { result.empty += 1; continue; }
       result.costStateSessions += 1;
       pending.push(fastPath);
       pendingBytes += Buffer.byteLength(JSON.stringify(fastPath.costState), 'utf-8');
@@ -650,8 +653,9 @@ export async function runAudit(deps = {}, options = {}) {
           transcript_path: entry.transcriptPath,
           cwd: recordedCwd(entry.transcriptPath),
         },
-        { getAccessToken: async () => token, fetchImpl },
+        { fetchImpl },
         {
+          sessions: [session],
           sink: (payload) => reports.push(payload),
           skipFlush: true,
           collectSessionErrors: true,
@@ -709,7 +713,7 @@ export async function runAudit(deps = {}, options = {}) {
   // A run can hit unreadable transcripts and dispatch nothing at all, so this cannot ride on the
   // per-dispatch save — without it the retry marker is lost and the next run blocks again.
   if (unreadableDirty) {
-    try { saveLedger(ledger); } catch { /* best-effort */ }
+    try { saveLedger(key, ledger); } catch { /* best-effort */ }
   }
 
   result.ok = true;

@@ -2,6 +2,8 @@ import { readHookInput } from '../lib/hook-input.mjs';
 import { recordPermissionMode } from '../lib/permission-mode-store.mjs';
 import { runHook, importHookModule } from '../lib/hook-runner.mjs';
 import { DIAGNOSTIC_SOURCES } from '../lib/telemetry-codes.mjs';
+import { maybeSpawnCostStateSync } from '../lib/cost-state-trigger.mjs';
+import { maybeSpawnCoworkLive } from '../lib/cowork-live.mjs';
 
 const input = readHookInput();
 if (!input) process.exit(0);
@@ -12,7 +14,10 @@ if (!input) process.exit(0);
 recordPermissionMode(input.session_id, input.permission_mode);
 runHook(DIAGNOSTIC_SOURCES.SESSION_START, async () => {
   const mod = await importHookModule('./session-start.mjs');
-  return mod == null ? null : mod.runSessionStart(input);
+  const result = mod == null ? null : await mod.runSessionStart(input);
+  maybeSpawnCostStateSync();
+  maybeSpawnCoworkLive();
+  return result;
 }, {
   onResult: (msg) => { if (msg) process.stdout.write(JSON.stringify({ systemMessage: msg })); },
 });

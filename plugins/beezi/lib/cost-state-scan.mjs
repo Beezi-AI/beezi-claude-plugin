@@ -3,10 +3,11 @@ import { postJson } from './http.mjs';
 import { readResponseBody } from './audit-flush.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
+import { linkedSessions } from './sessions.mjs';
 import { listAllTranscripts } from './transcript-index.mjs';
 import { readLastCostState, toCostStateItem } from './cost-state.mjs';
 import { readSyncState, scanFloorMs, markSuccess, markAttempt } from './cost-state-sync-state.mjs';
-import { markTrackingDisabled as _markTrackingDisabled } from './tracking.mjs';
+import { markTrackingDisabled as _markTrackingDisabled, readTrackingState, isTrackingDisabled } from './tracking.mjs';
 
 // The product decision is 30 per batch. Deliberately below audit-flush.mjs's MAX_CHUNK_ITEMS = 50
 // and mirrored by MAX_COST_STATE_SESSIONS on the API's DTO — both ends must agree or a legal chunk
@@ -32,7 +33,20 @@ export function planCostStateChunks(items, maxItems = MAX_COST_STATE_ITEMS) {
 // Scan every past transcript for its final cost-state block and upload what is new since the last
 // SUCCESSFUL scan. Runs only inside the detached child, which watches nothing and reports nothing,
 // so every failure here is a counter and a gate decision rather than an exception.
-export async function runCostStateScan(deps = {}) {
+export async function runCostStateScan(deps = {}, options = {}) {
+  if (options.session == null) {
+    const getSessions = deps.linkedSessions == null ? linkedSessions : deps.linkedSessions;
+    const sessions = await getSessions(deps);
+    const readTracking = deps.readTrackingState == null ? readTrackingState : deps.readTrackingState;
+    const results = [];
+    for (const session of sessions) {
+      if (isTrackingDisabled(readTracking(session.key))) continue;
+      results.push({ key: session.key, ...await runCostStateScan(deps, { session }) });
+    }
+    return { results };
+  }
+  let session = options.session;
+  const account = session.key;
   const getToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
   const listTranscripts = deps.listTranscripts == null ? listAllTranscripts : deps.listTranscripts;
   const readBlock = deps.readBlock == null ? readLastCostState : deps.readBlock;
@@ -50,13 +64,13 @@ export async function runCostStateScan(deps = {}) {
     stored: 0, skipped: 0, chunks: 0, halted: null, clean: true,
   };
 
-  let token = await getToken();
+  let token = session.token;
   if (token == null) {
     result.halted = 'not-linked';
     return result;
   }
 
-  const state = readState();
+  const state = readState({ account });
   const floor = scanFloorMs(state);
   const nowMs = now();
 
@@ -96,7 +110,7 @@ export async function runCostStateScan(deps = {}) {
   if (items.length === 0) {
     // A pass that found nothing to upload genuinely made progress: everything below the boundary
     // is done, so the floor may advance.
-    markSuccessImpl(progressMs);
+    markSuccessImpl(progressMs, { account });
     return result;
   }
 
@@ -122,7 +136,7 @@ export async function runCostStateScan(deps = {}) {
       const read = await readResponseBody(res);
       const code = read == null ? null : read.code;
       if (code === 'TRACKING_DISABLED') {
-        try { markDisabled(read.message == null ? null : read.message); } catch { /* best-effort */ }
+        try { markDisabled(account, read.message == null ? null : read.message); } catch { /* best-effort */ }
         return { ok: false, trackingDisabled: true };
       }
       return { ok: false, forbidden: true };
@@ -131,7 +145,7 @@ export async function runCostStateScan(deps = {}) {
   };
 
   const send = async (chunk) => {
-    const res = await post(url, token, { sessions: chunk }, {
+    const res = await post(url, session, { sessions: chunk }, {
       fetchImpl: fetchImpl,
       timeoutMs: UPLOAD_TIMEOUT_MS,
     });
@@ -139,11 +153,12 @@ export async function runCostStateScan(deps = {}) {
     if (res.status === 401) {
       // getAccessToken hands back a token that merely LOOKS fresh; the server is the authority.
       // One forced refresh, one retry — mirrors audit-flush.mjs's renewToken path.
-      token = await getToken({}, { forceRefresh: true });
+      token = await getToken({}, { account, forceRefresh: true });
       // Revoked or unlinked mid-run. Every remaining chunk would fail identically, so stop rather
       // than posting the rest behind a null Authorization header.
       if (token == null) return { ok: false, unlinked: true };
-      const retry = await post(url, token, { sessions: chunk }, {
+      session = { ...session, token };
+      const retry = await post(url, session, { sessions: chunk }, {
         fetchImpl: fetchImpl,
         timeoutMs: UPLOAD_TIMEOUT_MS,
       });
@@ -202,9 +217,9 @@ export async function runCostStateScan(deps = {}) {
   // chunk landed and the server rejected nothing. attemptedAt holds the hourly gate either way,
   // which is what makes a wrong-order deploy recoverable instead of permanently lossy.
   if (result.clean) {
-    markSuccessImpl(progressMs);
+    markSuccessImpl(progressMs, { account });
   } else {
-    markAttemptImpl(nowMs);
+    markAttemptImpl(nowMs, { account });
   }
   return result;
 }
