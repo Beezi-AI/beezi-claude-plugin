@@ -56,9 +56,11 @@ const wireBytes = (reports, timelines = [], costStates = []) =>
 // small next to the 1MB headroom over the route's 5mb limit, so the split path does not re-run
 // its byte math over them; the normal path counts them.
 //
-// A group's optional `costState` is the OTHER kind of session: one taking the backfill's
-// cost-state fast path carries that block INSTEAD of reports, so it never splits and never takes
-// the over-budget branch — it is one small item that packs like any other.
+// A group's optional `costState` is Claude Code's own cost record for the session. It rides in the
+// same chunk as the session's reports (the FIRST part of a split session — the server applies cost
+// states after segments within a chunk, so the session row already exists), counted as one item
+// against the caps. A group with a cost state and no reports is one small item that packs like any
+// other.
 export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes = MAX_BODY_BYTES } = {}) {
   const chunks = [];
   let current = null;
@@ -93,8 +95,10 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
       continue;
     }
 
-    if (reports.length > maxItems || wireBytes(reports) > maxBytes) {
-      // Over-budget session: emit it alone, split by whichever cap binds first.
+    const extra = costState == null ? [] : [costState];
+    if (reports.length + extra.length > maxItems || wireBytes(reports, [], extra) > maxBytes) {
+      // Over-budget session: emit it alone, split by whichever cap binds first. The first part
+      // reserves room for the cost state it carries.
       flushCurrent();
       let part = [];
       let first = true;
@@ -104,14 +108,18 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
           sessionIds: [group.sessionId],
           partialOf: group.sessionId,
           timelines: first && group.timeline ? [group.timeline] : [],
-          costStates: [],
+          costStates: first ? extra : [],
         });
         first = false;
       };
       for (const report of reports) {
         // A single report over the byte budget is still sent alone — it will be refused with a
         // definite status rather than looping forever trying to make it fit.
-        if (part.length > 0 && (part.length >= maxItems || wireBytes([...part, report]) > maxBytes)) {
+        const reserved = first ? extra : [];
+        if (
+          part.length > 0 &&
+          (part.length + reserved.length >= maxItems || wireBytes([...part, report], [], reserved) > maxBytes)
+        ) {
           emitPart(part);
           part = [];
         }
@@ -123,11 +131,11 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
 
     if (
       current &&
-      (current.reports.length + current.costStates.length + reports.length > maxItems ||
+      (current.reports.length + current.costStates.length + reports.length + extra.length > maxItems ||
         wireBytes(
           [...current.reports, ...reports],
           group.timeline ? [...current.timelines, group.timeline] : current.timelines,
-          current.costStates,
+          [...current.costStates, ...extra],
         ) > maxBytes)
     ) {
       flushCurrent();
@@ -136,6 +144,7 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
     chunk.reports.push(...reports);
     chunk.sessionIds.push(group.sessionId);
     if (group.timeline) chunk.timelines.push(group.timeline);
+    if (costState != null) chunk.costStates.push(costState);
   }
   flushCurrent();
   return chunks;
@@ -295,8 +304,8 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
     }
 
     for (const sessionId of new Set(chunk.sessionIds)) {
-      // Segments win when a session has both: they are the richer record, and in the fast path a
-      // session is only ever one kind or the other.
+      // Segments win when a session has both: they are the richer record, and the cost state only
+      // supersedes their cost — a rejected block leaves the session's segments fully stored.
       const sentAsSegments = sentBySession.get(sessionId);
       if (costStateIds.has(sessionId) && (sentAsSegments == null || sentAsSegments === 0)) {
         if (costStateBody == null) {
@@ -424,24 +433,28 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
     if (res.status === 400 && chunk.costStates != null && chunk.costStates.length && raw.includes('costStates')) {
       // A server predating the in-band cost states 400s the whole chunk on the unknown field
       // (forbidNonWhitelisted). Retry without them so the chunk's SEGMENT sessions still land —
-      // but unlike a dropped timeline, a dropped cost state is the session's entire usage, so its
-      // sessions are marked FAILED rather than quietly abandoned: they stay unledgered, the pull
-      // stays open, and the next login retries them against the deployed API.
+      // including those that also carried a cost state, whose segments are a full record on their
+      // own. For a cost-state-only session, though, the dropped block is its entire usage, so those
+      // are marked FAILED rather than quietly abandoned: they stay unledgered, the pull stays
+      // open, and the next login retries them against the deployed API.
       result.costStatesUnsupported = true;
       result.lastError = 'coststates-unsupported';
-      const costStateIds = new Set(chunk.costStates.map((item) => item.sessionId));
+      const withReports = new Set(chunk.reports.map((report) => report.sessionId));
+      const costOnlyIds = new Set(
+        chunk.costStates.map((item) => item.sessionId).filter((id) => !withReports.has(id)),
+      );
       let goOn = true;
       if (chunk.reports.length > 0) {
         goOn = await sendChunk(
           {
             ...chunk,
             costStates: [],
-            sessionIds: chunk.sessionIds.filter((id) => !costStateIds.has(id)),
+            sessionIds: chunk.sessionIds.filter((id) => !costOnlyIds.has(id)),
           },
           depth,
         );
       }
-      for (const sessionId of costStateIds) {
+      for (const sessionId of costOnlyIds) {
         setSession(sessionId, BackfillSessionStatus.FAILED, 'coststates-unsupported');
       }
       result.retryableFailures += 1;

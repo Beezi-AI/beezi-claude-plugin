@@ -211,9 +211,12 @@ async function runAuditUnlocked(deps, options) {
     // both modes so "stored" has something to be compared against: without it a server that
     // quietly stores fewer than it was sent is undetectable.
     plannedReports: 0,
-    // Sessions the cost-state fast path claimed: Claude Code's own whole-session accounting was
-    // read off the transcript's tail and the segment parse was skipped entirely.
+    // Sessions sent with Claude Code's own whole-session cost record (read off the transcript's
+    // tail) — alongside their segments where the segment path produced any.
     costStateSessions: 0,
+    // Of those, the ones whose cost record is ALL Beezi gets: no segments sent this run, and none the
+    // server is known to hold. They carry no repository split, operations, timeline or billing.
+    costStateOnlySessions: 0,
     costStatesStored: 0,
     costStatesSkipped: 0,
     // Cost-state sessions the server never judged. They contribute nothing to reportsFailed (they
@@ -439,9 +442,10 @@ async function runAuditUnlocked(deps, options) {
       }
       if (status === BackfillSessionStatus.FAILED) {
         result.reportsFailed += group.reports.length;
-        // A cost-state group carries no reports, so the line above counts zero for it. Without
-        // this the seal would land on top of a session whose entire usage never arrived.
-        if (group.costState != null) result.costStatesFailed += 1;
+        // A cost-record-only group carries no reports, so the line above counts zero for it.
+        // Without this the seal would land on top of a session whose entire usage never arrived.
+        // A group with reports is already counted there — counting it again would double-report.
+        if (group.costState != null && group.reports.length === 0) result.costStatesFailed += 1;
       }
       // Anything the server judged is ledgered, including a rejection: an unconnected repository
       // will reject on every future run too. Failures and unattributed chunks stay eligible.
@@ -530,17 +534,19 @@ async function runAuditUnlocked(deps, options) {
   };
 
   // Claude Code writes its OWN whole-session cost accounting into the last records of a
-  // transcript. It is both more accurate than anything we can tally (advisor iterations and
-  // retried API attempts never reach the transcript at all) and reachable with a 256KB tail read
-  // instead of a full parse — so when a past session has one, that block IS the session's usage
-  // and the segment path is skipped outright.
+  // transcript. It is more accurate than anything we can tally (advisor iterations and retried API
+  // attempts never reach the transcript at all), so when a past session has one it rides along
+  // with that session's segments: the server stores both, lets the block supersede only the
+  // segment-derived cost and tokens, and keeps everything the block cannot speak for — billing
+  // and plan, repository and branch split, subagents, operations (tools, MCP, skills, plugins),
+  // effort and mode breakdowns, and the timeline — from the segments.
   //
-  // BOTH modes take it — the one-time pull and /beezi:sync alike. The trade is deliberate: a
-  // cost-state block carries no repository, branch, operations, timeline or line coverage. Only its
-  // cost and token counts survive, plus the shell read off the transcript's two ends. For a session
-  // that already has segment rows on the server (live-tracked, or uploaded by an earlier run) this
-  // is pure gain — the block supersedes only the cost, and the stored segments keep everything
-  // else. For a session Beezi has never seen, cost is all it will ever get from either command.
+  // The block goes up ALONE only when the segment path has nothing to give: every line is already
+  // on the server (it then overlays the stored segments), or the transcript could not be segmented
+  // (no working directory, unreadable, emit failure). For a session Beezi has never seen, that
+  // last case is the one where cost is all it gets.
+  //
+  // Cowork sessions have no transcript to segment, so for them the block is always the whole record.
   //
   // The repo map is loaded ONCE for the run: matchKnownRoot walks its roots per lookup, and this
   // resolves one remote per candidate.
@@ -597,24 +603,25 @@ async function runAuditUnlocked(deps, options) {
     return { sessionId: entry.sessionId, reports: [], timeline: null, costState: costState, cowork, unchanged };
   };
 
-  // Resolved for EVERY candidate up front, before the coverage question below. Two bounded reads
-  // per transcript (a 256KB tail, a 64KB head), so this is cheap next to the parse it replaces —
-  // and doing it first is what lets /beezi:sync ask about the segment-path sessions ALONE.
-  // fetchCoverage batches 200 ids to a request, sequentially, with a 60s budget each; a run where
-  // every session has a block would otherwise pay every one of those round trips for answers that
-  // nothing goes on to read.
-  //
-  // Holds one small wire item per fast-path session for the length of the run. That is a few
-  // hundred bytes each against the megabytes a single transcript parse costs.
+  // Resolved for every candidate up front: two bounded reads per transcript (a 256KB tail, a 64KB
+  // head). Holds one small wire item per session for the length of the run — a few hundred bytes
+  // each against the megabytes a single transcript parse costs.
   const costStateBySession = new Map();
   for (const entry of candidates) {
     const group = costStateGroupFor(entry);
     if (group != null) costStateBySession.set(entry.sessionId, group);
   }
 
+  // Every session that goes through the segment path needs its resume point, block or not. A
+  // session the server holds only as a cost record has no line coverage, so it resumes from line
+  // 0 — which is exactly what backfills its billing, operations and timeline. Cowork sessions are
+  // never segmented and so never asked about.
   if (syncMode) {
     const needsCursor = candidates
-      .filter((entry) => !costStateBySession.has(entry.sessionId))
+      .filter((entry) => {
+        const group = costStateBySession.get(entry.sessionId);
+        return group == null || !group.cowork;
+      })
       .map((entry) => entry.sessionId);
     if (needsCursor.length > 0) {
       coverage = await fetchCoverage(needsCursor, session, { fetchImpl });
@@ -627,20 +634,47 @@ async function runAuditUnlocked(deps, options) {
     }
   }
 
+  // The block as it should travel with this session, or null when it must stay home.
+  //
+  // - repo_urls is dropped whenever the session has segments, here or on the server: the server
+  //   UNIONS repo_urls, and the offline-resolved remote can be spelled differently from the
+  //   segments' own, which would file one session under two repositories.
+  // - A block with unknown-model cost does not supersede the segment tally server-side, so next to
+  //   segments both would count in every cost sum. Such a block only goes up for a session that has
+  //   no segments anywhere.
+  const blockFor = (group, reports) => {
+    if (group == null) return null;
+    const covered = coverage == null ? null : coverage.get(group.sessionId);
+    const hasSegments = reports.length > 0 || (covered != null && covered > 0);
+    if (!hasSegments) return { costState: group.costState, only: true };
+    if (group.costState.has_unknown_model_cost === true) return null;
+    const costState = { ...group.costState };
+    delete costState.repo_urls;
+    return { costState, only: false };
+  };
+
+  const queueBlockOnly = async (group) => {
+    const block = blockFor(group, []);
+    if (block == null) return false;
+    result.costStateSessions += 1;
+    if (block.only) result.costStateOnlySessions += 1;
+    pending.push({ sessionId: group.sessionId, reports: [], timeline: null, costState: block.costState, cowork: group.cowork });
+    pendingBytes += Buffer.byteLength(JSON.stringify(block.costState), 'utf-8');
+    pendingItems += 1;
+    if (pendingBytes >= MAX_BODY_BYTES || pendingItems >= MAX_CHUNK_ITEMS) await dispatch();
+    return true;
+  };
+
   // Parsing itself stays strictly sequential. computeDelta reads and JSON.parses the whole
   // transcript, so parsing sessions in parallel multiplies peak memory with no gain on a
   // single thread.
   for (const entry of candidates) {
     if (halted) break;
-    const fastPath = costStateBySession.get(entry.sessionId);
-    if (fastPath != null) {
+    const costGroup = costStateBySession.get(entry.sessionId);
+    if (costGroup != null && costGroup.cowork) {
       processed += 1;
-      if (fastPath.unchanged) { result.empty += 1; continue; }
-      result.costStateSessions += 1;
-      pending.push(fastPath);
-      pendingBytes += Buffer.byteLength(JSON.stringify(fastPath.costState), 'utf-8');
-      pendingItems += 1;
-      if (pendingBytes >= MAX_BODY_BYTES || pendingItems >= MAX_CHUNK_ITEMS) await dispatch();
+      if (costGroup.unchanged) { result.empty += 1; continue; }
+      await queueBlockOnly(costGroup);
       continue;
     }
     const reports = [];
@@ -667,14 +701,20 @@ async function runAuditUnlocked(deps, options) {
       sessionErrors = checkpoint == null || checkpoint.sessionErrors == null ? [] : checkpoint.sessionErrors;
       skipped = checkpoint == null || checkpoint.skipped == null ? null : checkpoint.skipped;
     } catch {
+      processed += 1;
+      // The cost record was read off the tail on its own, so the session still lands with it.
+      if (await queueBlockOnly(costGroup)) continue;
       // One unreadable transcript must not end the run — but it is no longer silent.
       result.unreadable += 1;
       noteUnreadable(entry.sessionId);
-      processed += 1;
       continue;
     }
     processed += 1;
     if (reports.length === 0) {
+      // Nothing new to segment — every line is already on the server, or the transcript could not
+      // be segmented. The block still goes up: as an overlay in the first case, as the session's
+      // only record in the second.
+      if (await queueBlockOnly(costGroup)) continue;
       // Classify rather than drop on the floor. `empty` is the only benign outcome, so it is the
       // fallback ONLY once every reason worth reporting has been ruled out — telling a user that
       // a session we failed to upload "held no usage data" is the silent loss this exists to end.
@@ -701,10 +741,14 @@ async function runAuditUnlocked(deps, options) {
       }
     } catch { /* best-effort */ }
 
+    const block = blockFor(costGroup, reports);
+    const costState = block == null ? null : block.costState;
+    if (costState != null) result.costStateSessions += 1;
+
     followups.set(entry.sessionId, { sessionErrors });
-    pending.push({ sessionId: entry.sessionId, reports, timeline });
-    pendingBytes += Buffer.byteLength(JSON.stringify({ reports, timeline }), 'utf-8');
-    pendingItems += reports.length;
+    pending.push({ sessionId: entry.sessionId, reports, timeline, costState });
+    pendingBytes += Buffer.byteLength(JSON.stringify({ reports, timeline, costState }), 'utf-8');
+    pendingItems += reports.length + (costState == null ? 0 : 1);
     if (pendingBytes >= MAX_BODY_BYTES || pendingItems >= MAX_CHUNK_ITEMS) await dispatch();
   }
   await dispatch();

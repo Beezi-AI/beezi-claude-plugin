@@ -131,9 +131,12 @@ async function main() {
   if (result.alreadyImported > 0) parts.push(`${result.alreadyImported} were already uploaded.`);
   if (result.liveTracked > 0) parts.push(`${result.liveTracked} were already tracked live.`);
   if (result.costStateSessions > 0) {
+    parts.push(`${plural(result.costStateSessions, 'session')} used Claude's own cost record for their totals.`);
+  }
+  if (result.costStateOnlySessions > 0) {
     parts.push(
-      `${plural(result.costStateSessions, 'session')} used Claude's own cost record ` +
-        '(no repository or timeline detail for those).',
+      `${plural(result.costStateOnlySessions, 'session')} had only that record ` +
+        '(no repository, billing or timeline detail for those).',
     );
   }
   // Server-side skips already include the errored items; report the errors, not both numbers.
@@ -150,11 +153,13 @@ async function main() {
   // Its own line, not folded into the retry stanza below: this one is a server-version problem the
   // user cannot fix by re-running, and reportsFailed stays 0 for these sessions (they carry no
   // reports), so nothing else in this summary would mention them.
-  if (result.costStatesUnsupported) {
+  if (result.costStatesUnsupported && result.costStatesFailed > 0) {
     parts.push(
       `${plural(result.costStatesFailed, 'session')} could not be uploaded — this Beezi server ` +
         'does not accept Claude cost records yet. They are kept for the next run.',
     );
+  } else if (result.costStatesUnsupported) {
+    parts.push("This Beezi server does not accept Claude cost records yet, so totals use Beezi's own tally.");
   } else if (result.costStatesFailed > 0) {
     parts.push(
       `${plural(result.costStatesFailed, 'session')} could not be delivered — re-run /beezi:login to retry them.`,

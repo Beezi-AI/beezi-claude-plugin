@@ -89,12 +89,17 @@ async function syncOne(account, options, label) {
         `${plural(result.candidates, 'session')} in ${plural(result.plannedChunks, 'request')} ` +
         '(dry run — nothing sent).',
     );
-    // Counted apart from `plannedReports`, which a fast-path session contributes nothing to: it
-    // sends one cost record and no reports, so the two numbers above would otherwise show a run
-    // uploading "0 reports across 300 sessions".
+    // Counted apart from `plannedReports`, which a cost-record-only session contributes nothing
+    // to: it sends one cost record and no reports.
     if (result.costStateSessions > 0) {
       console.log(
-        `  ${plural(result.costStateSessions, 'session')} of those would go up as Claude's own cost record.`,
+        `  ${plural(result.costStateSessions, 'session')} of those would carry Claude's own cost record.`,
+      );
+    }
+    if (result.costStateOnlySessions > 0) {
+      console.log(
+        `  ${plural(result.costStateOnlySessions, 'session')} would have only that record ` +
+          '(no repository, billing or timeline detail for those).',
       );
     }
     return;
@@ -125,20 +130,26 @@ async function syncOne(account, options, label) {
     parts.push(`${plural(result.itemErrors, 'report')} skipped — their repository is not connected to Beezi.`);
   }
   if (result.costStateSessions > 0) {
+    parts.push(`${plural(result.costStateSessions, 'session')} used Claude's own cost record for their totals.`);
+  }
+  if (result.costStateOnlySessions > 0) {
     parts.push(
-      `${plural(result.costStateSessions, 'session')} used Claude's own cost record ` +
-        '(no repository or timeline detail added for those).',
+      `${plural(result.costStateOnlySessions, 'session')} had only that record ` +
+        '(no repository, billing or timeline detail added for those).',
     );
   }
   if (result.sessionsRejected > 0) {
     parts.push(`${plural(result.sessionsRejected, 'session')} were rejected by the server.`);
   }
-  // Its own line: reportsFailed stays 0 for these sessions, so nothing else here would mention them.
-  if (result.costStatesUnsupported) {
+  // Its own line: reportsFailed stays 0 for cost-record-only sessions, so nothing else here would
+  // mention them. Sessions that also had segments landed through those.
+  if (result.costStatesUnsupported && result.costStatesFailed > 0) {
     parts.push(
       `${plural(result.costStatesFailed, 'session')} could not be uploaded — this Beezi server ` +
         'does not accept Claude cost records yet.',
     );
+  } else if (result.costStatesUnsupported) {
+    parts.push("This Beezi server does not accept Claude cost records yet, so totals use Beezi's own tally.");
   } else if (result.costStatesFailed > 0) {
     parts.push(
       `${plural(result.costStatesFailed, 'session')} could not be delivered — run /beezi:sync again to retry.`,
