@@ -45,6 +45,17 @@ export function markSuccess(nowMs, deps = {}) {
   write({ lastScanAt: new Date(nowMs).toISOString() }, deps);
 }
 
+// Stamped by the CHILD once the one-time segment repair (lib/segment-repair.mjs) has nothing left
+// it can fix for this account. Never cleared: sessions uploaded from 0.32.2 on always carry their
+// segments, so the population the repair exists for cannot grow back.
+export function markSegmentRepaired(nowMs, deps = {}) {
+  write({ segmentRepairAt: new Date(nowMs).toISOString() }, deps);
+}
+
+export function isSegmentRepaired(state) {
+  return state != null && stampMs(state.segmentRepairAt) != null;
+}
+
 function stampMs(value) {
   const at = Date.parse(value == null ? '' : value);
   return isNaN(at) ? null : at;

@@ -1,5 +1,6 @@
 import { runCostStateScan } from '../lib/cost-state-scan.mjs';
 import { runCoworkSync } from '../lib/cowork-sync.mjs';
+import { runSegmentRepair } from '../lib/segment-repair.mjs';
 import { acquireLock, releaseLock } from '../lib/single-instance-lock.mjs';
 import { exitClean } from '../lib/shutdown.mjs';
 
@@ -13,6 +14,12 @@ const LOCK_NAME = 'cost-state-sync';
 // A ref'd timer only guarantees a MINIMUM lifetime, though — clearing it in finish() is what
 // actually lets the process end, and finish() is the single exit funnel for exactly that reason.
 const WATCHDOG_MS = 5 * 60 * 1000;
+
+// The segment repair stops starting new uploads this long before the watchdog fires, so it halts
+// at a batch boundary instead of being killed mid-request with the session-audit lock still held.
+// One in-flight chunk can take its full 60s upload timeout plus a 401 retry, hence two minutes.
+const REPAIR_MARGIN_MS = 2 * 60 * 1000;
+const startedAt = Date.now();
 
 let finished = false;
 // Tracked separately from "did we call acquireLock": a REFUSED child must never release, or it
@@ -43,6 +50,8 @@ async function main() {
   if (!held) return;
   await runCostStateScan();
   await runCoworkSync();
+  // Last, so a long repair can never starve the hourly cost scan or the Cowork sync.
+  await runSegmentRepair({}, { deadlineMs: startedAt + WATCHDOG_MS - REPAIR_MARGIN_MS });
 }
 
 main().then(() => finish(0), () => finish(0));
