@@ -1,6 +1,6 @@
 ---
 description: Upload past Claude Code sessions to Beezi analytics, skipping ones already uploaded
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs:*)
 ---
 
 Run EXACTLY this one command — do not modify it apart from the `--account` flag

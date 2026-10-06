@@ -1,6 +1,6 @@
 ---
 description: List the Beezi accounts linked on this machine and pick which one /beezi:analytics reads from
-allowed-tools: Bash(node:*), AskUserQuestion
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/accounts.mjs:*), AskUserQuestion
 ---
 
 Do NOT read, open, or inspect any files. Never echo any token.

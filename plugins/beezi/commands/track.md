@@ -1,6 +1,6 @@
 ---
 description: Manually save Beezi analytics for this session
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/track.mjs:*)
 ---
 
 The Beezi plugin saves this session's analytics the moment /beezi:track is submitted — a

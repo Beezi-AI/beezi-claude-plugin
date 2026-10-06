@@ -1,6 +1,6 @@
 ---
 description: Link a Beezi account to this machine (browser sign-in); repeat to add more accounts
-allowed-tools: Bash(node:*), AskUserQuestion
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/accounts.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/backfill.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/key-resolve.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/login.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/login-preflight.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/statusline-install.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/telemetry.mjs:*), AskUserQuestion
 ---
 
 Do NOT read, open, or inspect any files yourself. Run only the given commands.

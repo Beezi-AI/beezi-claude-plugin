@@ -1,6 +1,6 @@
 ---
 description: Show the Beezi accounts linked on this machine and which one analytics reads from
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/me.mjs:*)
 ---
 
 Do NOT read, open, or inspect any files. Run only this command:

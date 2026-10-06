@@ -1,6 +1,6 @@
 ---
 description: Refresh this machine's Claude subscription/plan for Beezi analytics
-allowed-tools: Bash(node:*), AskUserQuestion
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/key-resolve.mjs:*), AskUserQuestion
 ---
 
 Two steps, in this order. Step 1 always runs and decides the rest: on a machine

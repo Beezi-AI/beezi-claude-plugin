@@ -1,6 +1,6 @@
 ---
 description: Turn Beezi plugin crash reporting on or off, with or without account correlation
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/telemetry.mjs:*)
 argument-hint: "on | off | correlate | anonymous"
 ---
 

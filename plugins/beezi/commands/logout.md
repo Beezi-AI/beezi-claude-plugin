@@ -1,6 +1,6 @@
 ---
 description: Log out one or all Beezi accounts on this machine
-allowed-tools: Bash(node:*), AskUserQuestion
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs:*), AskUserQuestion
 ---
 
 Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs --list` and show the accounts.
