@@ -46,6 +46,19 @@ function skillPlugin(skillId) {
   return i === -1 ? 'builtin' : skillId.slice(0, i);
 }
 
+// A typed `/name` skill writes no Skill tool_use, only a user echo that opens with
+// <command-message>; built-in commands (/clear, /model) open with <command-name>. Returns the id
+// without the slash, keyed like the Skill tool's `skill` input, or null.
+const TYPED_SKILL_RE = /^<command-message>[^<]*<\/command-message>\s*<command-name>\/([^<\s]+)<\/command-name>/;
+
+export function typedSkillOf(line) {
+  if (line == null || line.type !== 'user' || line.message == null) return null;
+  const content = line.message.content;
+  if (typeof content !== 'string') return null;
+  const m = TYPED_SKILL_RE.exec(content.trimStart());
+  return m === null ? null : m[1];
+}
+
 // Byte length of a tool_result's content, tolerating both the string and text-block-array forms.
 function resultBytes(content) {
   if (typeof content === 'string') return Buffer.byteLength(content, 'utf-8');
@@ -88,7 +101,23 @@ export function computeOperations(lines) {
     p.est_tokens += est;
   };
 
+  const addSkill = (skillId, est) => {
+    const bySkill = totals.skill.by_skill;
+    if (bySkill[skillId] == null) bySkill[skillId] = { count: 0, est_tokens: 0 };
+    const s = bySkill[skillId];
+    s.count += 1;
+    s.est_tokens += est;
+    addPlugin(skillPlugin(skillId), est);
+  };
+
   for (const line of lines) {
+    const typedSkill = typedSkillOf(line);
+    if (typedSkill !== null) {
+      // 0 est: like the Skill tool's stub result, the injected skill body is not priced.
+      totals.skill.count += 1;
+      addSkill(typedSkill, 0);
+      continue;
+    }
     const content = line == null || line.message == null ? undefined : line.message.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
@@ -107,12 +136,7 @@ export function computeOperations(lines) {
         s.est_tokens += est;
         addPlugin('unknown', est); // MCP server → plugin is not knowable from the transcript
       } else if (category === 'skill') {
-        const skillId = block.input != null && typeof block.input.skill === 'string' ? block.input.skill : 'unknown';
-        if (cat.by_skill[skillId] == null) cat.by_skill[skillId] = { count: 0, est_tokens: 0 };
-        const s = cat.by_skill[skillId];
-        s.count += 1;
-        s.est_tokens += est;
-        addPlugin(skillPlugin(skillId), est);
+        addSkill(block.input != null && typeof block.input.skill === 'string' ? block.input.skill : 'unknown', est);
       }
     }
   }

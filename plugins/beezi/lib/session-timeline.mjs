@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { listSubagentTranscripts } from './subagents.mjs';
 import { IDLE_GAP_SEC, isTimingAnchor } from './delta.mjs';
+import { typedSkillOf } from './operations.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
@@ -219,9 +220,11 @@ function isHousekeepingPath(filePath) {
   return normPath(filePath).toLowerCase().indexOf('/.claude/') !== -1;
 }
 
-// Does this line carry a Skill tool_use matching `match`? Skill tool_use lines are timestamped
-// assistant lines, so unlike the permission-mode change line no forward anchoring is needed.
+// Does this line carry a Skill tool_use, or a typed `/skill` echo, matching `match`? Both are
+// timestamped lines, so unlike the permission-mode change line no forward anchoring is needed.
 function hasSkillMatching(line, match) {
+  const typedSkill = typedSkillOf(line);
+  if (typedSkill !== null) return match(typedSkill);
   const message = line == null ? undefined : line.message;
   const content = message == null ? undefined : message.content;
   if (!Array.isArray(content)) return false;
