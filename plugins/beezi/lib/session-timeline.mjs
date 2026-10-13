@@ -220,7 +220,7 @@ function isHousekeepingPath(filePath) {
   return normPath(filePath).toLowerCase().indexOf('/.claude/') !== -1;
 }
 
-// Does this line carry a Skill tool_use, or a typed `/skill` echo, matching `match`? Both are
+// Does this line carry a Skill tool_use, or a typed `/skill` (typedSkillOf), matching `match`? Both are
 // timestamped lines, so unlike the permission-mode change line no forward anchoring is needed.
 function hasSkillMatching(line, match) {
   const typedSkill = typedSkillOf(line);

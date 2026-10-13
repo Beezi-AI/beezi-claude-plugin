@@ -46,13 +46,20 @@ function skillPlugin(skillId) {
   return i === -1 ? 'builtin' : skillId.slice(0, i);
 }
 
-// A typed `/name` skill writes no Skill tool_use, only a user echo that opens with
-// <command-message>; built-in commands (/clear, /model) open with <command-name>. Returns the id
-// without the slash, keyed like the Skill tool's `skill` input, or null.
+// A typed `/name` skill writes no Skill tool_use. An inline one leaves a user echo that opens with
+// <command-message> (built-in commands like /clear open with <command-name>); a forked one, like
+// /code-review, leaves a local_command line holding <forked-skill-launch>{"skillName":…}. Returns
+// the id without the slash, keyed like the Skill tool's `skill` input, or null.
 const TYPED_SKILL_RE = /^<command-message>[^<]*<\/command-message>\s*<command-name>\/([^<\s]+)<\/command-name>/;
+const FORKED_SKILL_RE = /<forked-skill-launch>[^<]*?"skillName":"([^"\\]+)"/;
 
 export function typedSkillOf(line) {
-  if (line == null || line.type !== 'user' || line.message == null) return null;
+  if (line == null) return null;
+  if (line.type === 'system' && line.subtype === 'local_command' && typeof line.content === 'string') {
+    const forked = FORKED_SKILL_RE.exec(line.content);
+    return forked === null ? null : forked[1];
+  }
+  if (line.type !== 'user' || line.message == null) return null;
   const content = line.message.content;
   if (typeof content !== 'string') return null;
   const m = TYPED_SKILL_RE.exec(content.trimStart());
