@@ -1,8 +1,11 @@
-import { parseArgs, runAudit, SYNC_MODE } from '../lib/session-audit.mjs';
+import { parseArgs, runAudit, planWorkspaceRuns, dontTrackSessionIds, createRunCache, SYNC_MODE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
-import { parseAccountFlag, listAccounts, describeAccount, AccountStatus } from '../lib/accounts.mjs';
+import { parseAccountFlag, listAccounts, getAccount, describeAccount, AccountStatus } from '../lib/accounts.mjs';
+import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf } from '../lib/workspace.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { maybeSpawnCoworkLive } from '../lib/cowork-live.mjs';
+import { usesRules } from '../lib/workspace-rules.mjs';
+import { startHistoryWorker } from '../lib/history-trigger.mjs';
 
 // /beezi:sync — uploads every past session this machine still has on disk, skipping whatever Beezi
 // already holds. Unlike the one-time import at the end of /beezi:login, this is repeatable: it asks
@@ -20,13 +23,14 @@ function fail(message) {
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 // One account's run. Per-account problems print and return so the accounts after it still run.
-async function syncOne(account, options, label) {
+async function syncOne(account, options, label, runCache = null) {
   options.account = account;
   options.mode = SYNC_MODE;
   const prefix = label == null ? 'Beezi' : `Beezi (${label})`;
 
   const result = await runAudit(
     {
+      runCache,
       onProgress: ({ processed, total }) => {
         console.log(`${prefix}: ${processed}/${total} sessions read…`);
       },
@@ -34,6 +38,11 @@ async function syncOne(account, options, label) {
     options,
   );
 
+  // The real count, after the live-session skip the audit already applies — not the pre-run plan,
+  // which also counts the live session and sessions still being written.
+  if (options.excludedLabel != null && result.excluded > 0) {
+    console.log(`Beezi (${options.excludedLabel}): ${plural(result.excluded, 'past session')} in repos or folders you don't track ${result.excluded === 1 ? 'is' : 'are'} skipped.`);
+  }
   if (result.coworkWarnings > 0) {
     console.log('Beezi: some Cowork cache data could not be read; this sync may be incomplete.');
   }
@@ -47,6 +56,10 @@ async function syncOne(account, options, label) {
   }
   if (result.reason === 'no-account') {
     console.error('✗ Beezi: that account is not linked or its link expired. Run /beezi:login and sign in as it.');
+    return;
+  }
+  if (result.reason === 'workspace-required') {
+    console.error('✗ Beezi: this account belongs to several workspaces and none was picked for this run. Check where analytics go with /beezi:settings, then run /beezi:sync again.');
     return;
   }
   if (result.halt === BackfillHalt.NOT_ALLOWED) {
@@ -192,9 +205,43 @@ async function syncOne(account, options, label) {
   );
 }
 
+function tenantLabel(row, tenantId) {
+  const t = tenantById(row, tenantId);
+  return t != null && t.name ? t.name : tenantId;
+}
+
+// Sessions a rule routes, then the rest by New folders; a zero clause is dropped and null means print nothing.
+function routeSummary(row, plan) {
+  const ruled = plan.counts.rule;
+  const rest = plan.counts['new-folders'] + plan.counts.none + plan.counts.pending;
+  const clauses = [];
+  if (ruled > 0) clauses.push(`${plural(ruled, 'past session')} ${ruled === 1 ? 'follows' : 'follow'} your rules`);
+  if (rest > 0) {
+    // The first printed clause names the sessions.
+    const lead = clauses.length === 0 ? plural(rest, 'past session') : String(rest);
+    const newFolders = newFoldersOf(row);
+    if (newFolders.mode === 'send') {
+      const names = newFolders.tenantIds.map((id) => tenantLabel(row, id)).join(', ');
+      clauses.push(`${lead} in new folders ${rest === 1 ? 'goes' : 'go'} to ${names}`);
+    } else if (newFolders.mode === 'none') {
+      clauses.push(`${lead} in new folders ${rest === 1 ? 'is' : 'are'} not sent`);
+    } else {
+      clauses.push(`${lead} in repos or folders with no rule ${rest === 1 ? 'is' : 'are'} not sent this time`);
+    }
+  }
+  return clauses.length === 0 ? null : `Beezi (${describeAccount(row)}): ${clauses.join('; ')}.`;
+}
+
 async function main() {
   const { account, rest } = await parseAccountFlag(process.argv.slice(2));
-  const options = parseArgs(rest);
+  const rows = account != null
+    ? [(await getAccount(account)) || { key: account }]
+    : (await listAccounts()).filter((a) => a.status === AccountStatus.LINKED);
+  if (rows.length === 0) fail('Beezi: this machine is not linked. Run /beezi:login first.');
+  if (rows.length > 1 && rest.indexOf('--tenant') !== -1) {
+    fail('Beezi: --tenant needs --account <key> when several accounts are linked.');
+  }
+  const options = parseArgs(rest.filter((arg, i) => arg !== '--tenant' && rest[i - 1] !== '--tenant'));
   if (options.sinceMs != null) {
     fail('Beezi: /beezi:sync does not take --since — it uploads exactly what Beezi is missing. Run it with no flags.');
   }
@@ -202,16 +249,44 @@ async function main() {
     fail('Beezi: /beezi:sync does not take --force — there is no one-time seal to force past.');
   }
 
-  if (account != null) {
-    await syncOne(account, { ...options }, null);
-    return;
+  // One run per account × routed workspace.
+  for (const row of rows) {
+    const override = parseTenantFlags(rest, row).tenantIds;
+    // One git cache for every workspace's run of this account, as in backfill.
+    const runCache = createRunCache();
+    if (!isMultiTenant(row)) {
+      if (rows.length > 1) console.log(`\n— ${describeAccount(row)} —`);
+      if (usesRules(row)) {
+        const plan = planWorkspaceRuns(row);
+        const excludedSessionIds = dontTrackSessionIds(plan);
+        await syncOne(row.key, { ...options, tenantId: null, excludedSessionIds, excludedLabel: describeAccount(row) }, null, runCache);
+      } else {
+        await syncOne(row.key, { ...options, tenantId: null }, null, runCache);
+      }
+      continue;
+    }
+    // --tenant is an override: those workspaces get every past session, unrouted.
+    if (override.length > 0) {
+      for (const tenantId of override) {
+        console.log(`\n— ${describeAccount(row)} · ${tenantLabel(row, tenantId)} —`);
+        await syncOne(row.key, { ...options, tenantId }, null, runCache);
+      }
+      continue;
+    }
+    const plan = planWorkspaceRuns(row);
+    if (plan.scanned === 0) {
+      console.log(`\n✓ Beezi (${describeAccount(row)}): no Claude Code sessions found on this machine.`);
+      continue;
+    }
+    const summary = routeSummary(row, plan);
+    if (summary != null) console.log(`\n${summary}`);
+    for (const tenantId of plan.tenantIds) {
+      console.log(`\n— ${describeAccount(row)} · ${tenantLabel(row, tenantId)} —`);
+      await syncOne(row.key, { ...options, tenantId, sessionRoutes: plan.routes }, null, runCache);
+    }
   }
-  const accounts = (await listAccounts()).filter((a) => a.status === AccountStatus.LINKED);
-  if (accounts.length === 0) fail('Beezi: this machine is not linked. Run /beezi:login first.');
-  for (const a of accounts) {
-    if (accounts.length > 1) console.log(`\n— ${describeAccount(a)} —`);
-    await syncOne(a.key, { ...options }, null);
-  }
+  // Pending history (rules gained a workspace) gets its own coverage-based pass once this sync let go of the lock.
+  if (!options.dryRun) for (const row of rows) await startHistoryWorker(row.key);
 }
 
 main().then(() => {

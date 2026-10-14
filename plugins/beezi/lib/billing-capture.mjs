@@ -18,6 +18,7 @@ import {
   keyFingerprint,
   sameKeyFingerprint,
   hasOauthTokenIdentity,
+  isKeyScoped,
 } from './oauth-identity.mjs';
 import {
   readClaudeAccountAnchor as _readClaudeAccountAnchor,
@@ -124,6 +125,21 @@ function resolveAccountEmail(account, anchor) {
   return null;
 }
 
+// WHICH subscription of the login the record describes. One Claude login can hold several (a
+// personal plan and a company org) under the same uuid and email; the organization is what tells
+// them apart, for the check-in and for switch detection. No anchor fallback — no anchor names an
+// org — and nothing under a setup token, where resolveClaudeSubscription states none.
+function resolveOrganization(account) {
+  if (account == null) return { organizationUuid: null, organizationName: null };
+  const orgUuid = typeof account.organizationUuid === 'string' && account.organizationUuid
+    ? account.organizationUuid
+    : null;
+  const orgName = typeof account.organizationName === 'string' && account.organizationName
+    ? account.organizationName
+    : null;
+  return { organizationUuid: orgUuid, organizationName: orgUuid == null ? null : orgName };
+}
+
 export function buildConfig(args, env = process.env, now = new Date(), account = null, anchor = null) {
   if (args.plan != null) {
     const plan = String(args.plan).trim().toLowerCase();
@@ -147,6 +163,7 @@ export function buildConfig(args, env = process.env, now = new Date(), account =
         accountAnchor: stampAnchor(anchor, now),
         accountUuid: resolveAccountUuid(account, anchor),
         accountEmail: resolveAccountEmail(account, anchor),
+        ...resolveOrganization(account),
         keyFingerprint: fingerprintOf(env),
         envKeyPresent: fingerprintOf(env) != null,
       };
@@ -182,6 +199,7 @@ export function buildConfig(args, env = process.env, now = new Date(), account =
       accountAnchor: stampAnchor(anchor, now),
       accountUuid: resolveAccountUuid(account, anchor),
       accountEmail: resolveAccountEmail(account, anchor),
+      ...resolveOrganization(account),
       keyFingerprint: fingerprintOf(env),
       envKeyPresent: fingerprintOf(env) != null,
     };
@@ -219,6 +237,7 @@ export function buildConfig(args, env = process.env, now = new Date(), account =
     accountAnchor: stampAnchor(anchor, now),
     accountUuid: resolveAccountUuid(account, anchor),
     accountEmail: resolveAccountEmail(account, anchor),
+    ...resolveOrganization(account),
     keyFingerprint: fingerprintOf(env),
     envKeyPresent: fingerprintOf(env) != null,
   };
@@ -236,17 +255,13 @@ export function losesMultiplier(freshPlan, existingPlan) {
   return existingPlan === 'max_5x' || existingPlan === 'max_20x';
 }
 
-// Does this record BELONG to a setup key? Both ways one can be recorded count, and they are not
-// interchangeable in practice: the portal writeback stamps a fingerprint, while a record whose key
-// was captured through the anchor alone (an env tier that exposed the token to the anchor read but
-// no fingerprintable value, a pre-fingerprint record grandfathered forward) carries only the
-// `oauth_key` anchor. Reading just the fingerprint left the second shape unprotected — its plan was
-// scoped to a key exactly the same way, and a capture that could not see one overwrote it.
-function isKeyScoped(config) {
-  if (config == null) return false;
-  if (config.keyFingerprint != null) return true;
-  return config.accountAnchor != null && config.accountAnchor.source === 'oauth_key';
-}
+// Does this record BELONG to a setup key? isKeyScoped (oauth-identity.mjs) reads both ways one can
+// be recorded, and they are not interchangeable in practice: the portal writeback stamps a
+// fingerprint, while a record whose key was captured through the anchor alone (an env tier that
+// exposed the token to the anchor read but no fingerprintable value, a pre-fingerprint record
+// grandfathered forward) carries only the `oauth_key` anchor. Reading just the fingerprint left the
+// second shape unprotected — its plan was scoped to a key exactly the same way, and a capture that
+// could not see one overwrote it. The identity stamp asks the same question, hence the shared home.
 
 // A self-reported plan must survive automatic re-capture: when the fresh account
 // fields still normalize to 'unknown', overwriting would destroy the only good
@@ -355,12 +370,29 @@ function sameIdentityValue(a, b) {
 // the email still matches and it names no uuid (keep the stored uuid). Neither is news, and
 // treating either as a switch would wipe a good record on every machine whose login surface fills
 // only half the pair.
+//
+// The organization is compared on the same terms. A personal plan and a company org under one login
+// share the uuid AND the email, so the org is the only field that moves when the user switches
+// between them — and the switch must re-capture the plan and force the check-in like any other.
+// A record written before the field existed stores none, which is "not stated": the reconcile fills
+// it (see orgUnrecorded) rather than wiping the record as a switch.
 export function identityChanged(stored, observed) {
   if (stored == null || observed == null) return false;
   if (sameIdentityValue(stored.accountUuid, observed.accountUuid) === false) return true;
   const observedEmail = observed.email == null ? observed.accountEmail : observed.email;
   if (sameIdentityValue(stored.accountEmail, observedEmail) === false) return true;
+  if (sameIdentityValue(stored.organizationUuid, observed.organizationUuid) === false) return true;
   return false;
+}
+
+// The record predates the organization field (or never saw one) while the live file names an org
+// for the SAME account. Without a trigger the steady state writes nothing, so such a record would
+// stay org-less — and the check-in org-less, and the next org switch invisible — until the weekly
+// heartbeat. One reconcile fills it; after that the stored org makes this false again.
+function orgUnrecorded(stored, observed) {
+  if (stored == null || observed == null) return false;
+  if (stored.organizationUuid != null || observed.organizationUuid == null) return false;
+  return sameIdentityValue(stored.accountUuid, observed.accountUuid) === true;
 }
 
 function sameAnchor(stored, current) {
@@ -562,6 +594,11 @@ export function describeBillingChanges(existing, next) {
   const who = (c) => (c.accountEmail != null ? c.accountEmail : c.accountUuid);
   if (moved(who(existing), who(next))) {
     out.push(`account ${who(existing)} → ${who(next)}`);
+  } else if (moved(existing.organizationUuid, next.organizationUuid)) {
+    // Same login, another of its subscriptions — the account line above cannot show it, since the
+    // email and uuid did not move. Named when the record knows the names.
+    const org = (c) => (c.organizationName != null ? c.organizationName : c.organizationUuid);
+    out.push(`organization ${org(existing)} → ${org(next)}`);
   }
 
   // The billing METHOD, a different question from the plan: a machine can move from a subscription
@@ -675,6 +712,7 @@ export function reconcileBillingConfig(deps = {}, options = {}) {
       && !isKeyScoped(existing)
       && !hasOauthTokenIdentity(env);
     const fileIdentitySwitch = identityComparable && identityChanged(existing, fileAccount);
+    const fileOrgUnrecorded = identityComparable && orgUnrecorded(existing, fileAccount);
 
     // The heartbeat bounds how long an account switch can stay invisible: an email anchor only
     // exists in the CLI's answer, and a self-reported plan never goes stale, so without a periodic
@@ -693,6 +731,8 @@ export function reconcileBillingConfig(deps = {}, options = {}) {
       // email than the record holds. Free, and unlike the anchor pair it does not need the two
       // sides to have come from the same source.
       || fileIdentitySwitch
+      // A record from before the organization field, on the same account. Fills, never switches.
+      || fileOrgUnrecorded
       // The login → setup-token transition, which no anchorChanged pair can express. Rate-limited
       // because a machine whose CLI cannot answer would otherwise re-ask on every session forever:
       // the predicate stays true until a confirming capture rewrites the anchor to oauth_key.
@@ -796,6 +836,12 @@ export function reconcileBillingConfig(deps = {}, options = {}) {
         if (written.accountEmail == null && existing != null && existing.accountEmail != null) {
           written.accountEmail = existing.accountEmail;
         }
+        // The organization on the same terms. A capture that named a DIFFERENT org was a switch and
+        // never reaches here; one that named none keeps the stored one, name included.
+        if (written.organizationUuid == null && existing != null && existing.organizationUuid != null) {
+          written.organizationUuid = existing.organizationUuid;
+          written.organizationName = existing.organizationName == null ? null : existing.organizationName;
+        }
         chosen = written;
         writeConfig(chosen);
         // `migrated` is a `captured` that also dropped the key scoping: fresh carries no
@@ -816,6 +862,7 @@ export function reconcileBillingConfig(deps = {}, options = {}) {
           : (sameAnchor(existing.accountAnchor, next) ? existing.accountAnchor : stampAnchor(next, now));
         const keptUuid = resolveAccountUuid(sub, currentAnchor);
         const keptEmail = resolveAccountEmail(sub, currentAnchor);
+        const keptOrg = resolveOrganization(sub);
         // A newly visible fingerprint is adopted on the same terms as the identity fields: it says
         // which key this machine runs, and a record that knows it can no longer be overwritten by a
         // capture that saw no key (see shouldKeepExisting). Never cleared here — an env that stopped
@@ -839,6 +886,12 @@ export function reconcileBillingConfig(deps = {}, options = {}) {
           accountEmail: keptEmail == null
             ? (existing.accountEmail == null ? null : existing.accountEmail)
             : keptEmail,
+          organizationUuid: keptOrg.organizationUuid == null
+            ? (existing.organizationUuid == null ? null : existing.organizationUuid)
+            : keptOrg.organizationUuid,
+          organizationName: keptOrg.organizationUuid == null
+            ? (existing.organizationName == null ? null : existing.organizationName)
+            : keptOrg.organizationName,
         };
         writeConfig(chosen);
         outcome = sub == null ? 'no-signal' : 'kept';

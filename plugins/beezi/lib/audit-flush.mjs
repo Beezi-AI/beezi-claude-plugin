@@ -224,6 +224,12 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
   let current = session;
   let renewed = false;
   const renewToken = async () => {
+    // deps.renewSession is the run's shared single-flight renewal, which bounds refreshes itself, so no per-call guard.
+    if (deps.renewSession != null) {
+      const renewedSession = await deps.renewSession(current).catch(() => null);
+      if (renewedSession != null && renewedSession.token !== current.token) { current = renewedSession; return current; }
+      return null;
+    }
     if (renewed) return null;
     renewed = true;
     const next = await getAccessToken({}, { account: session.key, forceRefresh: true }).catch(() => null);
@@ -231,13 +237,22 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
     return null;
   };
 
+  // Shared with the run's other flushes: a chunk goes out gzipped only while it is enabled.
+  const compression = deps.compression == null ? null : deps.compression;
+  // Set by sendChunk before each attempt; true sends plain JSON whatever the shared flag says.
+  let sendPlain = false;
+  // Whether the latest post went out gzipped; one flush posts strictly one request at a time.
+  let lastPostCompressed = false;
+
   // `timelines` and `costStates` are omitted when empty so a chunk without them stays
   // byte-identical to the wire shape that predates each.
   const post = async (chunk) => {
     const body = { sessions: chunk.reports };
     if (chunk.timelines != null && chunk.timelines.length) body.timelines = chunk.timelines;
     if (chunk.costStates != null && chunk.costStates.length) body.costStates = chunk.costStates;
-    return postJsonImpl(url, current, body, { fetchImpl, timeoutMs });
+    lastPostCompressed = !sendPlain && compression != null && compression.enabled === true;
+    const postDeps = lastPostCompressed ? { fetchImpl, timeoutMs, gzip: true } : { fetchImpl, timeoutMs };
+    return postJsonImpl(url, current, body, postDeps);
   };
 
   const setSession = (sessionId, status, reason) => {
@@ -330,12 +345,18 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
   };
 
   // One chunk, one verdict. Returns true to continue the run, false to halt it.
-  const sendChunk = async (chunk, depth = 0) => {
+  // `plain` sends this chunk, its retry and its resends/splits uncompressed; `fellBack` marks a stand-in for refused gzip.
+  const sendChunk = async (chunk, depth = 0, plain = false, fellBack = false) => {
+    // Under deps.renewSession a chunk renews and retries at most once, the 5xx/transport retry included.
+    let renewedHere = false;
     const attemptPost = async () => {
       let attempt = await post(chunk);
-      if (attempt.status === 401) {
+      if (attempt.status === 401 && !renewedHere) {
         const next = await renewToken();
-        if (next) attempt = await post(chunk);
+        if (next) {
+          renewedHere = Boolean(deps.renewSession);
+          attempt = await post(chunk);
+        }
       }
       return attempt;
     };
@@ -346,9 +367,12 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
     let transportError = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       transportError = null;
+      sendPlain = plain;
       try {
         res = await attemptPost();
       } catch (error) {
+        // A gzipped attempt that failed in transit is retried plain, standing in for gzip.
+        if (lastPostCompressed) { plain = true; fellBack = true; }
         // A timeout and a socket reset need different follow-up (a 60s stall points at the
         // server, a reset at the connection) — keep them apart in the ledger and summary.
         transportError = error != null && error.name === 'AbortError' ? 'timeout' : 'network';
@@ -356,6 +380,8 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
         continue;
       }
       if (res.status >= 500 && attempt === 0) {
+        // A gzipped attempt answered 5xx is retried plain, standing in for gzip.
+        if (lastPostCompressed) { plain = true; fellBack = true; }
         // Drain the body so the pooled socket is clean before the retry.
         try { await res.text(); } catch { /* best-effort */ }
         await sleep(RETRY_BACKOFF_MS);
@@ -371,6 +397,8 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
     }
 
     if (res.status >= 200 && res.status < 300) {
+      // A plain request standing in for a refused or failed gzip one landed: plain JSON for the rest of the run.
+      if (fellBack) compression.enabled = false;
       const { body } = await readResponseBody(res);
       if (!body || !Array.isArray(body.errors)) {
         // The server accepted the chunk but we cannot attribute it — never ledger an outcome
@@ -385,6 +413,13 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
     }
 
     const { code, message, raw } = await readResponseBody(res);
+
+    const apiCoded403 = res.status === 403
+      && (code === 'BACKFILL_ALREADY_COMPLETED' || code === 'BACKFILL_NOT_ALLOWED' || code === 'TRACKING_DISABLED');
+    if (lastPostCompressed && res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 429 && !apiCoded403) {
+      // Any other 4xx to a gzip body may be a proxy's doing: resend this chunk plain once and judge by that reply.
+      return sendChunk(chunk, depth, true, true);
+    }
 
     if (res.status === 401) {
       // Still unauthenticated after a renewal attempt — never judged, so retryable.
@@ -427,7 +462,7 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
       // usage, and the next login (post-deploy) delivers nothing new only because the ledger
       // already sealed these sessions; acceptable for a deploy-order violation.
       result.timelinesDropped += chunk.timelines.length;
-      return sendChunk({ ...chunk, timelines: [] }, depth);
+      return sendChunk({ ...chunk, timelines: [] }, depth, plain);
     }
 
     if (res.status === 400 && chunk.costStates != null && chunk.costStates.length && raw.includes('costStates')) {
@@ -452,6 +487,7 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
             sessionIds: chunk.sessionIds.filter((id) => !costOnlyIds.has(id)),
           },
           depth,
+          plain,
         );
       }
       for (const sessionId of costOnlyIds) {
@@ -480,9 +516,9 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
       }
       first.sessionIds = chunk.sessionIds.filter((id) => splitIds.has(id));
       second.sessionIds = chunk.sessionIds.filter((id) => !splitIds.has(id));
-      const goOn = await sendChunk(first, depth + 1);
+      const goOn = await sendChunk(first, depth + 1, plain);
       if (!goOn) return false;
-      return sendChunk(second, depth + 1);
+      return sendChunk(second, depth + 1, plain);
     }
 
     if (res.status < 500) {

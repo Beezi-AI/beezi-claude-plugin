@@ -9,6 +9,8 @@ import { recordIssue } from './telemetry.mjs';
 import { DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './telemetry-codes.mjs';
 import { recordMcpStartupFailure } from './telemetry-auth.mjs';
 import { maybeSpawnDiagnostics as _maybeSpawnDiagnostics } from './diagnostics-trigger.mjs';
+import { findSessionWorkspaceByCwd, isMultiTenant, readSessionWorkspace, resolveReadTenant, tenantById } from './workspace.mjs';
+import { resolveSessionId } from './permission-mode-store.mjs';
 
 // Stdio ⇄ Streamable-HTTP bridge for the Beezi MCP server. Claude Code runs the
 // bridge as a local stdio MCP server, so it never sees the portal's OAuth
@@ -27,7 +29,7 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const HANDSHAKE_TIMEOUT_MS = 20_000;
 const SESSION_HEADER = 'mcp-session-id';
 const NOT_LINKED_MESSAGE =
-  'This machine is not linked to Beezi. Run /beezi:login, or /beezi:accounts to choose another linked account, then retry.';
+  'This machine is not linked to Beezi. Run /beezi:login, or /beezi:settings account to choose another linked account, then retry.';
 const REJECTED_MESSAGE =
   "Beezi rejected this machine's credentials. Run /beezi:login to relink.";
 // Not linked at all versus temporarily without a token are different answers, and telling a
@@ -37,12 +39,14 @@ const RETRY_MESSAGE =
   'Beezi is renewing this machine\u2019s authorization. Your login is saved — retry in a moment.';
 const REAUTH_MESSAGE =
   'Beezi\u2019s login server no longer accepts this machine\u2019s saved authorization. '
-  + 'Run /beezi:login to authorize it again, or /beezi:accounts to choose another account.';
+  + 'Run /beezi:login to authorize it again, or /beezi:settings account to choose another account.';
 // While unlinked, poll for the credentials /beezi:login is about to store. A failed initialize
 // would mark this server "failed" for the whole session — stdio servers are never retried — so
 // the handshake must succeed even with no token, and this poll turns the eventual login into
 // live tools with no /mcp reconnect.
 const WATCH_INTERVAL_MS = 15_000;
+// Every message re-reads the session's read workspace; this bounds that to one read per burst.
+const WORKSPACE_MEMO_MS = 2_000;
 
 export function mcpUrl() {
   return process.env.BEEZI_MCP_URL == null ? `${apiBase()}/mcp` : process.env.BEEZI_MCP_URL;
@@ -94,6 +98,9 @@ export function createBridge(deps = {}) {
   const getDefaultKey = deps.getDefaultKey || _getDefaultKey;
   const getAccount = deps.getAccount || _getAccount;
   let sessionAccount;
+  let sessionTenant;
+  let toolsChanged = false; // a tenant switch re-initialized the session; the client must re-fetch tools
+  let workspaceMemo = null;
   let requestQueue = Promise.resolve();
   let sessionId = null;
   let initializeMsg = null;
@@ -105,6 +112,48 @@ export function createBridge(deps = {}) {
   const watchIntervalMs = deps.watchIntervalMs == null ? WATCH_INTERVAL_MS : deps.watchIntervalMs;
 
   const isInitialize = (msg) => !Array.isArray(msg) && msg.method === 'initialize';
+
+  // The MCP process has no hook input: the session comes from the env, else the newest one recorded in this directory.
+  // One or unknown workspaces go headerless; several always read from one (before SessionStart: New folders' default or the first).
+  function computeBridgeWorkspace(row) {
+    if (!isMultiTenant(row)) return { tenantId: null, name: null };
+    const sessionId = resolveSessionId();
+    let state = sessionId ? readSessionWorkspace(sessionId) : null;
+    if (state == null) {
+      const found = findSessionWorkspaceByCwd(process.cwd());
+      state = found == null ? null : found.state;
+    }
+    const tenantId = resolveReadTenant(row, state).tenantId;
+    const t = tenantById(row, tenantId);
+    return { tenantId, name: t != null && t.name ? t.name : tenantId };
+  }
+
+  // `fresh` skips the memo: a tools/call must see a `read` switch made a moment ago.
+  function resolveBridgeWorkspace(row, fresh = false) {
+    const key = row == null ? null : row.key;
+    const now = Date.now();
+    if (!fresh && workspaceMemo != null && workspaceMemo.key === key && now - workspaceMemo.at < WORKSPACE_MEMO_MS) {
+      return workspaceMemo.value;
+    }
+    const value = computeBridgeWorkspace(row);
+    workspaceMemo = { key, at: now, value };
+    return value;
+  }
+
+  // Ids of the tools/call requests in the message; their results name the workspace read from.
+  function toolCallIds(msg) {
+    return (Array.isArray(msg) ? msg : [msg])
+      .filter((m) => m && m.id !== undefined && m.method === 'tools/call')
+      .map((m) => m.id);
+  }
+
+  // Appends the note to a tools/call result (single or batch); anything else passes through.
+  function annotate(obj, note) {
+    if (note == null) return obj;
+    if (Array.isArray(obj)) return obj.map((o) => annotate(o, note));
+    if (obj == null || note.ids.indexOf(obj.id) === -1 || obj.result == null || !Array.isArray(obj.result.content)) return obj;
+    return { ...obj, result: { ...obj.result, content: obj.result.content.concat([{ type: 'text', text: note.text }]) } };
+  }
 
   // Ids of the requests in the message (single or legacy batch); responses and
   // notifications carry none and get no synthesized error.
@@ -158,20 +207,20 @@ export function createBridge(deps = {}) {
 
   // Streams every JSON-RPC message of a response to stdout, re-serialized so
   // each lands as one line. `silent` drains instead — used for the transparent
-  // re-initialize, whose response the client must not see twice.
-  async function emit(res, { silent = false, deadline } = {}) {
+  // re-initialize, whose response the client must not see twice. `note` annotates tools/call results.
+  async function emit(res, { silent = false, deadline, note = null } = {}) {
     const newSession = res.headers.get(SESSION_HEADER);
     if (newSession) sessionId = newSession;
     if (res.status === 202 || res.status === 204) return;
     const contentType = res.headers.get('content-type');
     if ((contentType == null ? '' : contentType).includes('text/event-stream')) {
       for await (const data of sseEvents(res.body, deadline == null ? undefined : deadline.touch)) {
-        if (!silent) writeMessage(JSON.parse(data));
+        if (!silent) writeMessage(annotate(JSON.parse(data), note));
       }
       return;
     }
     const text = await res.text();
-    if (text && !silent) writeMessage(JSON.parse(text));
+    if (text && !silent) writeMessage(annotate(JSON.parse(text), note));
   }
 
   // The portal's MCP sessions are in-memory; an API restart between turns loses
@@ -215,12 +264,14 @@ export function createBridge(deps = {}) {
       const accessToken = await getToken({}, { account }).catch(() => null);
       if (!accessToken) return;
       const row = account ? await getAccount(account) : null;
-      selectAccount(account);
-      const token = { key: account, token: accessToken, clientId: (row && row.clientId) };
+      const tenantId = resolveBridgeWorkspace(row).tenantId;
+      selectScope(account, tenantId);
+      const token = { key: account, token: accessToken, clientId: (row && row.clientId), tenantId };
       try {
         await reinitialize(token);
         // The client accepted an empty tool list during the synthetic handshake; this makes
         // it re-fetch, so the Beezi tools appear the moment the login lands.
+        toolsChanged = false;
         writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
       } catch { /* portal unreachable — keep watching */ }
       }).catch(() => {});
@@ -289,9 +340,12 @@ export function createBridge(deps = {}) {
     return `Beezi MCP request failed (HTTP ${res.status}).`;
   }
 
-  function selectAccount(account) {
-    if (sessionAccount !== account) {
+  // The portal keys the MCP session by account and by the X-Beezi-Tenant header, so either change starts a new one.
+  function selectScope(account, tenantId) {
+    if (sessionAccount !== account || sessionTenant !== tenantId) {
+      if (sessionTenant !== undefined && sessionTenant !== tenantId) toolsChanged = true;
       sessionAccount = account;
+      sessionTenant = tenantId;
       sessionId = null;
       realInitDone = false;
       reinit = null;
@@ -309,12 +363,14 @@ export function createBridge(deps = {}) {
     if (isInitialize(msg)) {
       initializeMsg = msg;
       sessionId = null;
+      toolsChanged = false;
     }
-    let account, row;
+    let account, row, scope;
     try {
       account = await getDefaultKey();
       row = account ? await getAccount(account) : null;
-      selectAccount(account);
+      scope = resolveBridgeWorkspace(row, toolCallIds(msg).length > 0);
+      selectScope(account, scope.tenantId);
     } catch (_) {
       handleUnlinked(msg, ids, AUTH_STATES.UNAVAILABLE);
       return;
@@ -322,7 +378,9 @@ export function createBridge(deps = {}) {
     const auth = await Promise.resolve()
       .then(() => getAuthentication({}, { account }))
       .catch(() => ({ authState: AUTH_STATES.UNAVAILABLE, accessToken: null }));
-    let token = auth.authState === AUTH_STATES.READY ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId) } : null;
+    let token = auth.authState === AUTH_STATES.READY
+      ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId), tenantId: scope.tenantId }
+      : null;
     if (!token) {
       // The bridge cannot start with real tools. Recorded with the reason the accessor gave, and
       // delivered without a token — this is exactly the failure a token could not report.
@@ -342,8 +400,14 @@ export function createBridge(deps = {}) {
         ids.forEach((id) => errorResponse(id, 'Beezi MCP request failed: the Beezi server is unreachable.'));
         return;
       }
+      if (toolsChanged) {
+        toolsChanged = false;
+        writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+      }
     }
     const deadline = createDeadline(isInitialize(msg) ? handshakeMs : timeoutMs);
+    const callIds = scope.tenantId == null ? [] : toolCallIds(msg);
+    const note = callIds.length === 0 ? null : { ids: callIds, text: `Beezi: reading from ${scope.name}.` };
     try {
       let res = await post(msg, token, deadline);
       if (res.status === 404 && initializeMsg && !isInitialize(msg)) {
@@ -366,7 +430,7 @@ export function createBridge(deps = {}) {
           realInitDone = true;
           stopWatcher();
         }
-        await emit(res, { deadline });
+        await emit(res, { deadline, note });
         return;
       }
       if (res.status === 401) {

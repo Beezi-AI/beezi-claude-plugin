@@ -8,8 +8,8 @@ import { DIAGNOSTIC_SOURCES } from '../lib/telemetry-codes.mjs';
 //
 // Silent by design: it prints nothing and always exits 0, so it can never annotate a turn or
 // block one. The common case is a single stat() of ~/.claude.json and an immediate exit.
-readHookInput();
+const input = readHookInput();
 runHook(DIAGNOSTIC_SOURCES.USAGE_PING, async () => {
   const mod = await importHookModule('./usage-ping.mjs');
-  if (mod != null) await mod.pingUsageSnapshot();
+  if (mod != null) await mod.pingUsageSnapshot({ sessionId: input == null ? null : input.session_id });
 });

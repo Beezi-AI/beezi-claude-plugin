@@ -8,7 +8,7 @@ leaving the conversation.
 | `beezi` | Claude Code (terminal) | Automatic session analytics per Beezi task branch |
 
 The plugin signs in with your own Beezi account — you must already be a Beezi user, and
-everything happens as you, on your tenant.
+everything happens as you, in your Beezi workspace.
 
 ## Claude Code — `beezi`
 
@@ -33,10 +33,9 @@ is tracked automatically; you don't need to run anything else.
 | Command | Purpose |
 | --- | --- |
 | `/beezi:login` | Link this machine via browser sign-in; the token is kept in your OS secret store. |
-| `/beezi:me` | Show whether this machine is linked, and as whom. |
+| `/beezi:settings` | See and change where analytics go (a rule per repo or folder, and a default for new ones), your default account, your Claude plan, crash reports and the status line. |
+| `/beezi:sync` | Upload past Claude Code sessions that Beezi does not have yet. |
 | `/beezi:logout` | Unlink this machine — revokes its access and removes the stored credentials. |
-| `/beezi:track` | Force-save this session's analytics mid-session. |
-| `/beezi:refresh` | Re-capture your Claude subscription plan for accurate cost reporting. |
 
 ### Personal analytics summary
 

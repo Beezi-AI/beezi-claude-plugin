@@ -143,7 +143,18 @@ export function readClaudeAccount(deps = {}) {
       billingType: account.billingType == null ? null : account.billingType,
       seatTier: account.seatTier == null ? null : account.seatTier,
       organizationType: account.organizationType == null ? null : account.organizationType,
+      // WHICH subscription of this login is in force. One Claude login can belong to several orgs
+      // (a personal plan and a company one) under the SAME accountUuid and email — the org is the
+      // only field that moves when the user switches between them. Non-secret.
+      organizationUuid: trimmedString(account.organizationUuid),
+      organizationName: trimmedString(account.organizationName),
     };
   }
   return null;
+}
+
+function trimmedString(value) {
+  if (typeof value !== 'string') return null;
+  const s = value.trim();
+  return s ? s : null;
 }

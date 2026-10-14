@@ -32,7 +32,7 @@ async function logoutAccounts(deps, options) {
   if (options.list && !index.accounts.length) return ['Beezi: this machine is not linked. Nothing to do.'];
   if (options.list) return index.accounts.map((a, i) => `${i + 1}. ${describeAccount(a)} [${a.key}]${a.key === index.default ? ' (default)' : ''}`);
   if (!index.accounts.length) return ['Beezi: this machine is not linked. Nothing to do.'];
-  if (!options.all && !options.account && index.accounts.length > 1) throw new UserError('Choose --account <key|email|number> or --all. Run /beezi:accounts to list accounts.');
+  if (!options.all && !options.account && index.accounts.length > 1) throw new UserError('Choose --account <key|email|number> or --all. Run /beezi:settings account to list accounts.');
   const keys = options.all ? index.accounts.map(a => a.key) : [options.account ? await resolveAccountRef(options.account, deps) : index.accounts[0].key];
   const remaining = index.accounts.filter(a => !keys.includes(a.key));
   let next = null;

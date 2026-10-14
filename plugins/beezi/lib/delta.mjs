@@ -146,22 +146,13 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   const repoRootOf = resolvers.repoRootOf == null ? ((dir) => dir) : resolvers.repoRootOf;
   const branchAt = resolvers.branchAt == null ? null : resolvers.branchAt;
 
-  const content = fs.readFileSync(transcriptPath, 'utf-8');
-  // Strip trailing newline(s): a JSONL file at rest ends with '\n', and the trailing empty
-  // split element would otherwise advance the cursor past the last real line, skipping the
-  // next window's first record.
-  const trimmed = content.replace(/\n+$/, '');
-  const raw = trimmed === '' ? [] : trimmed.split('\n');
-
   // Parse the new window (lines after the cursor) once; skip blank/malformed lines and keep
   // each surviving record with its 1-based line number. Both passes below reuse this.
-  const parsed = [];
-  for (let i = fromLine; i < raw.length; i++) {
-    if (!raw[i].trim()) continue;
-    let line;
-    try { line = JSON.parse(raw[i]); } catch { continue; }
-    parsed.push({ lineNo: i + 1, line });
-  }
+  // A memo's whole-file records are windowed by line number; any other cursor reads the file as before.
+  const view = resolvers.readRecords != null && Number.isInteger(fromLine) && fromLine >= 0
+    ? recordsAfter(resolvers.readRecords(transcriptPath), fromLine)
+    : parseTranscriptLines(fs.readFileSync(transcriptPath, 'utf-8'), fromLine);
+  const parsed = view.records;
 
   // Pre-pass: message id -> last tool-path signal across all of the message's block-lines.
   const messageDir = new Map();
@@ -329,7 +320,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     }
   }
   closeRun();
-  const nextCursor = Math.max(fromLine, raw.length);
+  const nextCursor = Math.max(fromLine, view.lineCount);
   // Widen the outer ranges over blank/malformed head and tail lines the cursor consumes anyway.
   if (segments.length > 0) {
     segments[0].fromLine = Math.min(segments[0].fromLine, fromLine + 1);
@@ -337,6 +328,28 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     last.toLine = Math.max(last.toLine, nextCursor);
   }
   return { nextCursor, segments, apiErrorEvents };
+}
+
+// computeDelta's line rules over a whole JSONL text: the line count, and the records from `fromLine` on with 1-based lineNo.
+export function parseTranscriptLines(content, fromLine) {
+  // Strip trailing newline(s): a JSONL file at rest ends with '\n', and the trailing empty
+  // split element would otherwise advance the cursor past the last real line, skipping the
+  // next window's first record.
+  const trimmed = content.replace(/\n+$/, '');
+  const raw = trimmed === '' ? [] : trimmed.split('\n');
+  const records = [];
+  for (let i = fromLine; i < raw.length; i++) {
+    if (!raw[i].trim()) continue;
+    let line;
+    try { line = JSON.parse(raw[i]); } catch { continue; }
+    records.push({ lineNo: i + 1, line });
+  }
+  return { lineCount: raw.length, records };
+}
+
+// A whole-file parse cut to the cursor's window: lineNo is index + 1, so `lineNo > fromLine` is the loop above started at `fromLine`.
+function recordsAfter(whole, fromLine) {
+  return { lineCount: whole.lineCount, records: whole.records.filter((r) => r.lineNo > fromLine) };
 }
 
 // Add one billed API call to a model bucket and to its effort sub-bucket, creating either on

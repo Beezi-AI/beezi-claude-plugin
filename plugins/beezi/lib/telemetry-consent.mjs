@@ -93,6 +93,6 @@ export function correlationPrompt() {
   markCorrelationAsked();
   return 'Beezi diagnostics are on. Optionally, a random installation ID can associate a failure '
     + 'with the last Beezi account linked on this machine, so support can find your report. It is '
-    + 'off unless you turn it on: run /beezi:telemetry correlate to allow it, or ignore this — '
+    + 'off unless you turn it on: run /beezi:settings telemetry correlate to allow it, or ignore this — '
     + 'anonymous reporting continues either way.';
 }

@@ -28,8 +28,15 @@ function readAgentMeta(dir, agentId) {
 // gives a subagent, e.g. "Explore analytics plugin"). Scans the MAIN transcript once; a subagent's
 // meta.json.toolUseId joins back to these to resolve its display name. Empty Map on any read/parse
 // failure — names just go unresolved, never throw.
-export function buildTaskDescriptionMap(transcriptPath) {
+// `deps.transcriptMemo` supplies the session's parsed records: the ones this split parses, as only '' and unparseable lines are skipped differently.
+export function buildTaskDescriptionMap(transcriptPath, deps = {}) {
   const map = new Map();
+  if (deps.transcriptMemo != null) {
+    let view;
+    try { view = deps.transcriptMemo.main(transcriptPath); } catch { return map; }
+    for (const { line } of view.records) addTaskDescriptions(map, line);
+    return map;
+  }
   let raw;
   try {
     raw = fs.readFileSync(transcriptPath, 'utf-8');
@@ -44,16 +51,21 @@ export function buildTaskDescriptionMap(transcriptPath) {
     } catch {
       continue;
     }
-    const message = rec == null ? undefined : rec.message;
-    const content = message == null ? undefined : message.content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (block == null || block.type !== 'tool_use' || block.name !== 'Task' || !block.id) continue;
-      const desc = block.input == null ? undefined : block.input.description;
-      if (typeof desc === 'string' && desc.trim()) map.set(block.id, desc.trim());
-    }
+    addTaskDescriptions(map, rec);
   }
   return map;
+}
+
+// Task tool_use id → trimmed description, for each Task block on one transcript record.
+function addTaskDescriptions(map, rec) {
+  const message = rec == null ? undefined : rec.message;
+  const content = message == null ? undefined : message.content;
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block == null || block.type !== 'tool_use' || block.name !== 'Task' || !block.id) continue;
+    const desc = block.input == null ? undefined : block.input.description;
+    if (typeof desc === 'string' && desc.trim()) map.set(block.id, desc.trim());
+  }
 }
 
 // A workflow run records its own agents in <transcriptDir>/<sessionId>/workflows/<wf_id>.json:

@@ -11,7 +11,7 @@ const CORRELATION_OFF = 'Reports are anonymous — no installation ID is attache
 export function setTelemetry(mode) {
   if (mode === 'on') {
     grantConsent();
-    return `Beezi diagnostics are ON. Crash reports about the plugin will be sent — never your code or prompts. ${isCorrelationGranted() ? CORRELATION_ON : CORRELATION_OFF} Recommended: /beezi:telemetry correlate attaches one so support can find your report.`;
+    return `Beezi diagnostics are ON. Crash reports about the plugin will be sent — never your code or prompts. ${isCorrelationGranted() ? CORRELATION_ON : CORRELATION_OFF} Recommended: /beezi:settings telemetry correlate attaches one so support can find your report.`;
   }
   if (mode === 'off') {
     denyConsent();
@@ -21,7 +21,7 @@ export function setTelemetry(mode) {
   }
   if (mode === 'correlate') {
     grantCorrelation();
-    return `Beezi diagnostics are ON with account correlation. ${CORRELATION_ON} Use /beezi:telemetry anonymous to turn correlation off again.`;
+    return `Beezi diagnostics are ON with account correlation. ${CORRELATION_ON} Use /beezi:settings telemetry anonymous to turn correlation off again.`;
   }
   if (mode === 'anonymous') {
     denyCorrelation();
@@ -30,9 +30,9 @@ export function setTelemetry(mode) {
     return `Beezi diagnostics stay ON, without account correlation. ${CORRELATION_OFF} Pending correlated reports were deleted.`;
   }
   if (!isTelemetryGranted()) {
-    return 'Beezi diagnostics are OFF. Use /beezi:telemetry on|off|correlate|anonymous to change.';
+    return 'Beezi diagnostics are OFF. Use /beezi:settings telemetry on|off|correlate|anonymous to change.';
   }
-  return `Beezi diagnostics are ON. ${isCorrelationGranted() ? CORRELATION_ON : CORRELATION_OFF} Use /beezi:telemetry on|off|correlate|anonymous to change.`;
+  return `Beezi diagnostics are ON. ${isCorrelationGranted() ? CORRELATION_ON : CORRELATION_OFF} Use /beezi:settings telemetry on|off|correlate|anonymous to change.`;
 }
 
 if (process.argv[1] && process.argv[1].endsWith('telemetry.mjs')) {

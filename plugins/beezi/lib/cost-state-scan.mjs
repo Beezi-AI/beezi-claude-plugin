@@ -4,10 +4,12 @@ import { readResponseBody } from './audit-flush.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { linkedSessions } from './sessions.mjs';
-import { listAllTranscripts } from './transcript-index.mjs';
+import { listAllTranscripts, firstRecordedCwd } from './transcript-index.mjs';
 import { readLastCostState, toCostStateItem } from './cost-state.mjs';
 import { readSyncState, scanFloorMs, markSuccess, markAttempt } from './cost-state-sync-state.mjs';
-import { markTrackingDisabled as _markTrackingDisabled, readTrackingState, isTrackingDisabled } from './tracking.mjs';
+import { markTrackingDisabled as _markTrackingDisabled, markTenantDark as _markTenantDark, readTrackingState, isTrackingDisabled, isTenantDark } from './tracking.mjs';
+import { readSessionWorkspace, isMultiTenant, QUEUE_HOLD_MS } from './workspace.mjs';
+import { createRouteContext, routePastSession } from './workspace-rules.mjs';
 
 // The product decision is 30 per batch. Deliberately below audit-flush.mjs's MAX_CHUNK_ITEMS = 50
 // and mirrored by MAX_COST_STATE_SESSIONS on the API's DTO — both ends must agree or a legal chunk
@@ -40,7 +42,7 @@ export async function runCostStateScan(deps = {}, options = {}) {
     const readTracking = deps.readTrackingState == null ? readTrackingState : deps.readTrackingState;
     const results = [];
     for (const session of sessions) {
-      if (isTrackingDisabled(readTracking(session.key))) continue;
+      if (!isMultiTenant(session) && isTrackingDisabled(readTracking(session.key))) continue;
       results.push({ key: session.key, ...await runCostStateScan(deps, { session }) });
     }
     return { results };
@@ -55,7 +57,12 @@ export async function runCostStateScan(deps = {}, options = {}) {
   const markAttemptImpl = deps.markAttemptImpl == null ? markAttempt : deps.markAttemptImpl;
   const post = deps.postJsonImpl == null ? postJson : deps.postJsonImpl;
   const markDisabled = deps.markTrackingDisabledImpl == null ? _markTrackingDisabled : deps.markTrackingDisabledImpl;
+  const markDark = deps.markTenantDarkImpl == null ? _markTenantDark : deps.markTenantDarkImpl;
+  const readTracking = deps.readTrackingState == null ? readTrackingState : deps.readTrackingState;
   const now = deps.now == null ? (() => Date.now()) : deps.now;
+  // Only reached for a multi-workspace account with rules, so single-workspace runs read no transcript head or repo map.
+  const readCwd = deps.firstRecordedCwd == null ? firstRecordedCwd : deps.firstRecordedCwd;
+  const routeCtx = createRouteContext(deps.loadRepoMap == null ? {} : { loadRepoMapImpl: deps.loadRepoMap });
 
   // `clean` is a gate, not a statistic: it is what decides between markSuccess (which advances the
   // mtime floor) and markAttempt (which only holds the hourly gate).
@@ -85,8 +92,13 @@ export async function runCostStateScan(deps = {}, options = {}) {
 
   const all = listTranscripts();
   result.scanned = all.length;
+  let tracking = null;
+  try { tracking = readTracking(account); } catch { tracking = null; }
 
-  const items = [];
+  // One header per request, so items are grouped by each target workspace of their session. A
+  // session with no rule under New folders: Ask me, while recent, keeps the floor from advancing.
+  const groups = new Map();
+  let itemCount = 0;
   for (const entry of all) {
     // Incremental: a transcript untouched since the last SUCCESSFUL scan already uploaded its
     // block. The overlap in scanFloorMs covers clock skew; a re-upload is free anyway because the
@@ -103,14 +115,28 @@ export async function runCostStateScan(deps = {}, options = {}) {
     const item = toCostStateItem(entry.sessionId, block, new Date(entry.mtimeMs).toISOString());
     // A block with no priced model usage carries no cost to record.
     if (item == null) continue;
-    items.push(item);
+    let workspaceState = null;
+    try { workspaceState = readSessionWorkspace(entry.sessionId); } catch { workspaceState = null; }
+    // Same routing as /beezi:sync: the rule for its directory now, else New folders.
+    const route = routePastSession(session, { sessionId: entry.sessionId, state: workspaceState, readCwd: () => readCwd(entry.transcriptPath) }, routeCtx);
+    // Only a recent session may still get a rule; the next pass re-sends and the server upserts per tenant.
+    if (route.pending && nowMs - entry.mtimeMs <= QUEUE_HOLD_MS) result.clean = false;
+    // A dark workspace is skipped, never retried: it does not hold the floor back.
+    const targets = route.tenantIds.filter((t) => !isTenantDark(tracking, t));
+    if (targets.length === 0) continue;
+    for (const tenantId of targets) {
+      if (!groups.has(tenantId)) groups.set(tenantId, []);
+      groups.get(tenantId).push(item);
+    }
+    itemCount += 1;
   }
 
-  result.sent = items.length;
-  if (items.length === 0) {
+  result.sent = itemCount;
+  if (itemCount === 0) {
     // A pass that found nothing to upload genuinely made progress: everything below the boundary
-    // is done, so the floor may advance.
-    markSuccessImpl(progressMs, { account });
+    // is done, so the floor may advance — unless a session is still waiting for its workspace.
+    if (result.clean) markSuccessImpl(progressMs, { account });
+    else markAttemptImpl(nowMs, { account });
     return result;
   }
 
@@ -136,6 +162,8 @@ export async function runCostStateScan(deps = {}, options = {}) {
       const read = await readResponseBody(res);
       const code = read == null ? null : read.code;
       if (code === 'TRACKING_DISABLED') {
+        // With several workspaces one dark tenant must not darken the account or halt the others.
+        if (isMultiTenant(session)) return { ok: false, tenantDark: true };
         try { markDisabled(account, read.message == null ? null : read.message); } catch { /* best-effort */ }
         return { ok: false, trackingDisabled: true };
       }
@@ -144,8 +172,8 @@ export async function runCostStateScan(deps = {}, options = {}) {
     return readOutcome(res);
   };
 
-  const send = async (chunk) => {
-    const res = await post(url, session, { sessions: chunk }, {
+  const send = async (chunk, tenantId) => {
+    const res = await post(url, { ...session, tenantId }, { sessions: chunk }, {
       fetchImpl: fetchImpl,
       timeoutMs: UPLOAD_TIMEOUT_MS,
     });
@@ -158,7 +186,7 @@ export async function runCostStateScan(deps = {}, options = {}) {
       // than posting the rest behind a null Authorization header.
       if (token == null) return { ok: false, unlinked: true };
       session = { ...session, token };
-      const retry = await post(url, session, { sessions: chunk }, {
+      const retry = await post(url, { ...session, tenantId }, { sessions: chunk }, {
         fetchImpl: fetchImpl,
         timeoutMs: UPLOAD_TIMEOUT_MS,
       });
@@ -168,11 +196,18 @@ export async function runCostStateScan(deps = {}, options = {}) {
     return outcomeFor(res);
   };
 
-  for (const chunk of planCostStateChunks(items, MAX_COST_STATE_ITEMS)) {
+  const chunks = [];
+  for (const [tenantId, items] of groups) {
+    for (const chunk of planCostStateChunks(items, MAX_COST_STATE_ITEMS)) chunks.push({ chunk, tenantId });
+  }
+  // Workspaces that refused this run; their remaining chunks are not sent.
+  const skipped = new Set();
+  for (const { chunk, tenantId } of chunks) {
+    if (skipped.has(tenantId)) continue;
     result.chunks += 1;
     let outcome;
     try {
-      outcome = await send(chunk);
+      outcome = await send(chunk, tenantId);
     } catch {
       // Transport failure (dead pooled socket, timeout). That chunk's problem alone — the rest of
       // the run still goes out, it just cannot count as progress.
@@ -195,12 +230,19 @@ export async function runCostStateScan(deps = {}, options = {}) {
       result.clean = false;
       break;
     }
+    if (outcome.tenantDark === true) {
+      // That workspace alone went dark: recorded, and done for this and every later pass.
+      try { markDark(account, tenantId); } catch { /* best-effort */ }
+      skipped.add(tenantId);
+      continue;
+    }
     if (outcome.forbidden === true) {
-      // Reversible (a revoked seat, a deactivated user) — halt the run, but leave tracking.json
+      // Reversible (a revoked seat, a deactivated user) — halt that workspace, but leave tracking.json
       // alone so the hourly gate keeps trying and recovers on its own once access returns.
       result.halted = 'forbidden';
       result.clean = false;
-      break;
+      skipped.add(tenantId);
+      continue;
     }
     if (outcome.ok !== true) {
       result.clean = false;

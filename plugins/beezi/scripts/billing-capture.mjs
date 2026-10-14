@@ -3,7 +3,8 @@ import { writeBillingConfig } from '../lib/billing-config.mjs';
 import { readClaudeAccount, readClaudeAccountAnchor } from '../lib/claude-account.mjs';
 import { hasCustomGateway } from '../lib/billing.mjs';
 import { defaultSession, sessionFor } from '../lib/sessions.mjs';
-import { parseAccountFlag } from '../lib/accounts.mjs';
+import { parseAccountFlag, getAccount, getDefaultKey } from '../lib/accounts.mjs';
+import { parseCommandTargets, parseTenantFlags } from '../lib/workspace.mjs';
 import { syncAccountIfNeeded } from '../lib/account-sync.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { oauthTokenEnvWithOsProbe } from '../lib/claude-settings-env.mjs';
@@ -12,25 +13,42 @@ import { oauthTokenEnvWithOsProbe } from '../lib/claude-settings-env.mjs';
 // and an account switch is exactly what must not wait for the hash to drift. Silent throughout: an
 // unlinked machine has no token and this script must keep working offline, so nothing here can
 // change the command's output or its exit code.
-async function reportAccount(account) {
+async function reportAccount(account, tenantIds) {
   let token = null;
   try { token = account ? await sessionFor(account) : await defaultSession(); } catch { token = null; }
   if (!token) return;
-  // Interactive command, so the token resolution runs the full chain — process.env → user
-  // settings file → persistent OS environment. Claude Code deletes CLAUDE_CODE_OAUTH_TOKEN from
-  // every child environment it builds, so nothing cheaper can see a setup token from here.
+  // One check-in per target workspace, in turn: each writes its own marker in the same file.
+  for (const tenantId of tenantIds) {
+    // Interactive command, so the token resolution runs the full chain — process.env → user
+    // settings file → persistent OS environment. Claude Code deletes CLAUDE_CODE_OAUTH_TOKEN from
+    // every child environment it builds, so nothing cheaper can see a setup token from here.
+    try {
+      await syncAccountIfNeeded(
+        { ...token, tenantId },
+        { force: true, via: 'billing-capture' },
+        { env: oauthTokenEnvWithOsProbe(process.env) },
+      );
+    } catch { /* best-effort */ }
+  }
+}
+
+// The session's target workspaces; none while its ask is unanswered, so only the local capture runs.
+function captureTargets(rest, row) {
   try {
-    await syncAccountIfNeeded(
-      token,
-      { force: true, via: 'billing-capture' },
-      { env: oauthTokenEnvWithOsProbe(process.env) },
-    );
-  } catch { /* best-effort */ }
+    return parseCommandTargets(rest, row);
+  } catch (error) {
+    if (error == null || error.workspaceRequired !== true) throw error;
+    return { argv: parseTenantFlags(rest, row).argv, tenantIds: [] };
+  }
 }
 
 async function run() {
   const { account: beeziAccount, rest } = await parseAccountFlag(process.argv.slice(2));
-  const parsed = parseArgs(rest);
+  // Offline or unlinked still works: no row means no tenant, and --tenant then says why.
+  let row = null;
+  try { row = await getAccount(beeziAccount || await getDefaultKey()); } catch { row = null; }
+  const { argv, tenantIds } = captureTargets(rest, row);
+  const parsed = parseArgs(argv);
   // A custom endpoint is reported as a fact, not a conclusion: whether it bills this machine's
   // subscription or its own credits is the one thing only the user can say, and /beezi:login reads
   // this flag to know it has to ask.
@@ -66,7 +84,7 @@ async function run() {
       console.log(`✓ Beezi billing captured: source=${config.source} plan=${config.plan == null ? 'n/a' : config.plan}${via}${switched}${gateway}.`);
     }
     // After the reconcile, so the check-in carries the account this run just resolved.
-    await reportAccount(beeziAccount);
+    await reportAccount(beeziAccount, tenantIds);
   } else {
     // Self-report (--plan) or raw-field capture: the user's answer always writes. The cheap file
     // anchor rides along so a later account switch can invalidate this testimony; the CLI is not
@@ -86,7 +104,7 @@ async function run() {
     console.log(`✓ Beezi billing captured: source=${config.source} plan=${config.plan == null ? 'n/a' : config.plan}${gateway}.`);
     // The user just declared how this machine pays — that answer is exactly what the check-in
     // exists to carry, so it must not wait for the next session start's hash drift.
-    await reportAccount(beeziAccount);
+    await reportAccount(beeziAccount, tenantIds);
   }
 }
 

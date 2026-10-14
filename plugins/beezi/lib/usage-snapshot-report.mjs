@@ -7,7 +7,7 @@ import { readUsageUtilization as _readUsageUtilization } from './usage-utilizati
 import { readClaudeAccount as _readClaudeAccount } from './claude-account.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
 import { normalizePlan } from './billing.mjs';
-import { buildIdentityStamp } from './identity-stamp.mjs';
+import { buildIdentityStamp, recordOwnsIdentity } from './identity-stamp.mjs';
 import {
   readPendingStatuslineUsage as _readPendingStatuslineUsage,
   clearPendingStatuslineUsage as _clearPendingStatuslineUsage,
@@ -88,10 +88,25 @@ export function buildSnapshotPayload(utilization, account, stamp = {}, billing =
     ? billing.accountUuid
     : (account == null ? null : account.accountUuid);
   const mismatched = !keyInForce && accountsDiffer(utilization.accountUuid, planUuid);
+  // The organization qualifies the stamp's uuid, the live login. When the cache names a different
+  // account, the live org belongs to none of these numbers, and pairing it with the cache's uuid
+  // would describe an account that does not exist. The cache itself carries no org, so a same-uuid
+  // cache is taken to be the live subscription's — the best this file can say.
+  // An org next to no uuid at all qualifies nothing, so it stays off the wire too.
+  const wireUuid = keyInForce ? null : utilization.accountUuid;
+  const orgFromOtherAccount = wireUuid == null
+    || accountsDiffer(utilization.accountUuid, stamp == null ? null : stamp.account_uuid);
+  const { account_org_uuid, account_org_name, ...identity } = stamp == null ? {} : stamp;
   return {
-    ...stamp,
+    ...identity,
+    ...(orgFromOtherAccount
+      ? {}
+      : {
+          ...(account_org_uuid == null ? {} : { account_org_uuid }),
+          ...(account_org_name == null ? {} : { account_org_name }),
+        }),
     fetched_at: new Date(utilization.fetchedAtMs).toISOString(),
-    account_uuid: keyInForce ? null : utilization.accountUuid,
+    account_uuid: wireUuid,
     ...(mismatched
       ? { subscription_type: null, rate_limit_tier: null, subscription_plan: null }
       : resolvePlanFields(billing, account)),
@@ -102,6 +117,38 @@ export function buildSnapshotPayload(utilization, account, stamp = {}, billing =
     limits: utilization.limits ? utilization.limits.map(sanitizeLimit) : null,
     raw: utilization.raw,
   };
+}
+
+// The identity one drained row ships under. A row recorded its own account (statusline-usage.mjs)
+// because it may be drained after a switch — of account, or of subscription within one login — and
+// the identity in force at drain time would put its limits on the wrong one. Rows recorded before
+// that field existed carry none and take the current identity, the best there is for them.
+//
+// A recorded identity replaces the current one wholesale, never field by field: the current email
+// and org describe whoever is logged in NOW. And when the row names a different account or org than
+// the plan does, the plan fields go null — the same guard buildSnapshotPayload applies, for the same
+// reason: never one subscription's limits stamped with another's plan.
+function rowIdentity(identity, recorded, keyInForce, planUuid, planOrg) {
+  if (keyInForce || recorded == null) return identity;
+  const recordedUuid = recorded.uuid == null ? null : recorded.uuid;
+  const recordedOrg = recorded.organizationUuid == null ? null : recorded.organizationUuid;
+  const out = { ...identity, account_uuid: recordedUuid };
+  delete out.account_email;
+  delete out.account_org_uuid;
+  delete out.account_org_name;
+  // The same account as now: the current email is billing.json's (the CLI's, fresher than the
+  // oauthAccount copy the row holds), so it still answers first.
+  const sameAccount = recordedUuid != null && recordedUuid === identity.account_uuid;
+  const email = sameAccount && identity.account_email != null ? identity.account_email : recorded.email;
+  if (email != null) out.account_email = email;
+  if (recordedOrg != null) out.account_org_uuid = recordedOrg;
+  if (recordedOrg != null && recorded.organizationName != null) out.account_org_name = recorded.organizationName;
+  if (accountsDiffer(recordedUuid, planUuid) || accountsDiffer(recordedOrg, planOrg)) {
+    out.subscription_type = null;
+    out.rate_limit_tier = null;
+    out.subscription_plan = null;
+  }
+  return out;
 }
 
 // Ships the rate-limit observations the status line recorded locally to EVERY linked account.
@@ -130,8 +177,9 @@ export async function drainStatuslineSnapshots(sessions, deps = {}) {
   let billing = null;
   try { billing = readBilling(); } catch { billing = null; }
 
-  // Read for the no-billing-record case ONLY — a first session before the reconcile has ever
-  // written one. Everywhere else billing.json answers, nulls included; see resolvePlanFields.
+  // The live login: the identity stamp's first source (see identity-stamp.mjs), and the plan's only
+  // when no billing record exists yet — for the plan, billing.json answers, nulls included; see
+  // resolvePlanFields.
   let account = null;
   try { account = readAccount(); } catch { account = null; }
 
@@ -143,20 +191,32 @@ export async function drainStatuslineSnapshots(sessions, deps = {}) {
     // Explicit nulls, not omissions — this payload has always stated its plan fields either way,
     // and the spread above only ever ADDS keys the stamp knows about.
     //
-    // account_uuid now comes FROM the stamp, so it is billing.json's uuid and is suppressed
-    // entirely under a setup token. It is half the server's dedupe key
-    // (tenant, user, account_uuid, fetched_at) and the analytics reads group by it, so the move is
-    // deliberate: billing.json's uuid is a copy of the same vendor uuid on every machine that has
-    // one, and on the machines where it is not — a setup token, where ~/.claude.json names whoever
-    // logged in last — the honest answer is no uuid at all rather than someone else's. Those
-    // machines move to the account_uuid = '' series and are reached through their credential row.
+    // account_uuid comes FROM the stamp, so it is the live login's uuid (billing.json's when the
+    // login names none) and is suppressed entirely under a setup token. It is half the server's
+    // dedupe key (tenant, user, account_uuid, fetched_at) and the analytics reads group by it: on a
+    // setup-token machine, where ~/.claude.json names whoever logged in last, the honest answer is
+    // no uuid at all rather than someone else's. Those machines move to the account_uuid = ''
+    // series and are reached through their credential row. A row that recorded its own account
+    // overrides this per row — see rowIdentity.
     account_uuid: stamp.account_uuid == null ? null : stamp.account_uuid,
     ...resolvePlanFields(billing, account),
   };
 
+  // A setup token suppresses every recorded identity too: like the current one, it was read from the
+  // ~/.claude.json that names whoever logged in interactively last. Both shapes count — a token the
+  // env can see, and a record that belongs to a key the env cannot (the stamp's own guard).
+  const keyInForce = stamp.oauth_key_prefix != null || recordOwnsIdentity(billing);
+  const planUuid = billing != null
+    ? billing.accountUuid
+    : (account == null ? null : account.accountUuid);
+  const planOrg = billing != null
+    ? billing.organizationUuid
+    : (account == null ? null : account.organizationUuid);
+
   let posted = 0;
-  for (const row of pending) {
-    const body = { ...identity, ...row, limits: null, raw: null };
+  for (const pendingRow of pending) {
+    const { account: recorded, ...row } = pendingRow;
+    const body = { ...rowIdentity(identity, recorded, keyInForce, planUuid, planOrg), ...row, limits: null, raw: null };
     // Settled = stored (2xx) or refused for good (any 4xx, a dark or unauthorized tenant included);
     // only a 5xx or a transport failure is retryable, so one refusing account cannot pin the queue.
     const settled = await Promise.all(live.map(async (session) => {
@@ -193,7 +253,11 @@ export async function maybePostUsageSnapshot(session, deps = {}) {
   const stateFile = usageSnapshotStateFile(session.key);
   const storedState = readJson(stateFile);
   const state = storedState == null ? {} : storedState;
-  const sent = state.lastSent == null ? {} : state.lastSent;
+  // A workspace-scoped report keeps its own marker under lastSentByTenant.
+  const tenantId = session.tenantId == null ? null : session.tenantId;
+  const byTenant = state.lastSentByTenant == null ? {} : state.lastSentByTenant;
+  const marker = tenantId == null ? state.lastSent : byTenant[tenantId];
+  const sent = marker == null ? {} : marker;
   if (sent.accountUuid === utilization.accountUuid && sent.fetchedAtMs === utilization.fetchedAtMs) {
     return { reported: false, reason: 'already-sent' };
   }
@@ -212,10 +276,16 @@ export async function maybePostUsageSnapshot(session, deps = {}) {
   try {
     const res = await postJson(`${apiBase()}${ENDPOINTS.usageSnapshot}`, session, payload, { fetchImpl });
     if (res.status >= 200 && res.status < 300) {
-      writeJsonSecure(stateFile, {
-        version: 1,
-        lastSent: { accountUuid: utilization.accountUuid, fetchedAtMs: utilization.fetchedAtMs },
-      });
+      const lastSent = { accountUuid: utilization.accountUuid, fetchedAtMs: utilization.fetchedAtMs };
+      const latest = readJson(stateFile);
+      const current = latest == null ? {} : latest;
+      const next = { version: 1 };
+      if (tenantId == null) next.lastSent = lastSent;
+      else if (current.lastSent != null) next.lastSent = current.lastSent;
+      const tenants = { ...(current.lastSentByTenant == null ? {} : current.lastSentByTenant) };
+      if (tenantId != null) tenants[tenantId] = lastSent;
+      if (Object.keys(tenants).length > 0) next.lastSentByTenant = tenants;
+      writeJsonSecure(stateFile, next);
       return { reported: true, status: res.status };
     }
     return { reported: false, status: res.status };

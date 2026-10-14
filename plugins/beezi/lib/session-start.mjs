@@ -27,7 +27,7 @@ import { authHeaders } from './http.mjs';
 import {
   recordWhoami,
   readTrackingState,
-  isLiveTrackingAllowed,
+  allowsLiveFor,
   shouldBackfill,
   TrackingMode,
 } from './tracking.mjs';
@@ -50,6 +50,7 @@ import {
 import { oauthTokenEnvWithOsProbe } from './claude-settings-env.mjs';
 import { hasBeenAsked, markAsked, markCorrelationAsked, correlationPrompt } from './telemetry-consent.mjs';
 import { checkForUpdate as _checkForUpdate } from './update-check.mjs';
+import { readSessionWorkspace, resolveReadTenant, expandTargets, isMultiTenant, tenantById } from './workspace.mjs';
 
 // Tests (and only tests) inject a bare `getAccessToken`. Map its two answers onto the typed
 // shape so the hook has exactly one code path: a token is ready, no token is unlinked, and a
@@ -82,14 +83,14 @@ export function consentPrompt() {
   markCorrelationAsked();
   return 'Beezi can send crash reports about the plugin itself — versions, OS, which plugin file '
     + 'failed, and whether it was signed in. Never your code, prompts, or file paths. It helps us '
-    + 'fix bugs we would otherwise never see. Recommended: /beezi:telemetry correlate — the same '
+    + 'fix bugs we would otherwise never see. Recommended: /beezi:settings telemetry correlate — the same '
     + 'reports plus a random installation ID, so support can find yours and tell you when it is '
-    + 'fixed. Prefer to stay anonymous? /beezi:telemetry on sends the reports without that ID. '
-    + '/beezi:telemetry off declines everything.';
+    + 'fixed. Prefer to stay anonymous? /beezi:settings telemetry on sends the reports without that ID. '
+    + '/beezi:settings telemetry off declines everything.';
 }
 
 // Resume guard: create cursor=0 ONLY if absent; never reset an existing session's cursor.
-// Also records where the session lives (cwd + transcript path) so /beezi:track can find
+// Also records where the session lives (cwd + transcript path) so later commands can find
 // the transcript after the session cd's away from its launch directory — the mapping is
 // refreshed on every start (resume may happen from a different directory).
 export function initSessionState(sessionId, { cwd = null, transcriptPath = null } = {}) {
@@ -222,14 +223,24 @@ export async function runSessionStart(input, deps = {}) {
   if (entries.length === 0) {
     return append(stop(authNotice({ authState: AUTH_STATES.UNLINKED, reason: AUTH_REASONS.NO_CREDENTIALS })), await updatePromise);
   }
-  const label = (session) => entries.length > 1 ? `Beezi (${session.tenantName || session.email || session.key})` : 'Beezi';
+  // Only this session's own choice scopes requests; the row's web-side tenantId never does.
+  const workspaceState = readSessionWorkspace(input.session_id);
+  // A multi-workspace account's tenantName is the web-side workspace, so it is named by email.
+  const label = (session) => entries.length > 1 ? `Beezi (${(isMultiTenant(session) ? null : session.tenantName) || session.email || session.key})` : 'Beezi';
+  // A target clone of a multi-workspace account names its workspace, and its email when several accounts are linked.
+  const targetLabel = (s) => {
+    if (!isMultiTenant(s) || s.tenantId == null) return label(s);
+    const t = tenantById(s, s.tenantId);
+    const workspace = (t && t.name) || s.tenantId;
+    return entries.length > 1 ? `Beezi (${s.email || s.key} · ${workspace})` : `Beezi (${workspace})`;
+  };
   const warnings = [];
   const sessions = (await Promise.all(entries.map(async (row) => {
     const warn = (line) => { if (line) warnings.push(line.replace('Beezi:', `${label(row)}:`)); };
     let auth = row.token ? { authState: AUTH_STATES.READY, accessToken: row.token }
       : await getAuthentication(deps, { account: row.key }).catch(() => ({ authState: AUTH_STATES.UNAVAILABLE, reason: AUTH_REASONS.STORAGE_UNAVAILABLE }));
     if (auth.authState !== AUTH_STATES.READY) { warn(authNotice(auth)); return null; }
-    let session = { ...row, token: auth.accessToken, clientId: auth.clientId == null ? row.clientId : auth.clientId };
+    let session = { ...row, tenantId: null, token: auth.accessToken, clientId: auth.clientId == null ? row.clientId : auth.clientId };
     let probe = await probeToken(session, fetchImpl);
     if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
       const retry = await getAuthentication(deps, { account: row.key, forceRefresh: true }).catch(() => null);
@@ -255,13 +266,13 @@ export async function runSessionStart(input, deps = {}) {
     try { recordWhoamiImpl(session.key, probe.who, session.clientId); } catch { /* best-effort */ }
     if (probe.who != null) {
       const patch = {};
-      for (const field of ['email', 'name', 'tenantId', 'tenantName']) {
+      for (const field of ['email', 'name', 'tenantId', 'tenantName', 'tenants']) {
         if (probe.who[field] != null) patch[field] = probe.who[field];
       }
       try { await updateAccount(session.key, patch); } catch { /* best-effort */ }
       session = { ...session, ...patch };
     }
-    return session;
+    return { ...session, tenantId: null };
   }))).filter(Boolean);
   if (sessions.length === 0) return append(stop(warnings.join('\n')), await updatePromise);
 
@@ -281,14 +292,24 @@ export async function runSessionStart(input, deps = {}) {
     : deps.env;
 
   const trackingByKey = new Map(sessions.map((s) => [s.key, readTrackingState(s.key)]));
-  const liveSessions = sessions.filter((s) => isLiveTrackingAllowed(trackingByKey.get(s.key)));
+  const liveSessions = sessions.filter((s) => allowsLiveFor(s, trackingByKey.get(s.key)));
+  // One clone per target workspace; a pending session has none until a rule answers.
+  const targetSessions = expandTargets(liveSessions, workspaceState).filter((s) => allowsLiveFor(s, trackingByKey.get(s.key)));
+  // Key status is asked once per account: of the clone for the read workspace, else the first clone.
+  const keyStatusSessions = liveSessions.map((s) => {
+    const clones = targetSessions.filter((t) => t.key === s.key);
+    if (clones.length === 0) return null;
+    const read = resolveReadTenant(s, workspaceState);
+    return clones.find((t) => t.tenantId === read.tenantId) || clones[0];
+  }).filter(Boolean);
+  const targetKey = (s) => `${s.key}:${s.tenantId == null ? '' : s.tenantId}`;
   const liveAllowed = liveSessions.length > 0;
   initSessionState(input.session_id, { cwd: input.cwd == null ? null : input.cwd, transcriptPath: input.transcript_path == null ? null : input.transcript_path });
   const [, announcements] = await Promise.all([
     Promise.all(sessions.map((s) => flushQueue(s, { fetchImpl }))),
-    Promise.all(liveSessions.map(async (s) => {
+    Promise.all(targetSessions.map(async (s) => {
       const line = await announceRepo(input.cwd, s, fetchImpl, gitImpl);
-      return line == null ? null : line.replace('Beezi:', `${label(s)}:`);
+      return line == null ? null : line.replace('Beezi:', `${targetLabel(s)}:`);
     })),
   ]);
   const systemMessage = [...warnings, ...announcements.filter(Boolean), restartNotice].filter(Boolean).join('\n') || null;
@@ -350,7 +371,7 @@ export async function runSessionStart(input, deps = {}) {
   // path that does await it is the unknown-key branch below: that check-in is what registers this
   // key with the portal, so asking again before it lands would just re-read "unknown".
   const forced = ['switched', 'captured', 'migrated'].includes(billingOutcome);
-  const syncPromises = new Map(liveSessions.map((session) => [session.key,
+  const syncPromises = new Map(targetSessions.map((session) => [targetKey(session),
     Promise.resolve().then(() => syncAccount(session, { force: forced, via: 'session-start' }, syncDeps)).catch(() => null),
   ]));
 
@@ -366,7 +387,7 @@ export async function runSessionStart(input, deps = {}) {
     // matters. An empty diff, and a first capture on a machine that had no record, say nothing.
     //
     // A STATEMENT, not a nudge, and it names no command. The nudges below already own "what you
-    // must do": pointing at /beezi:refresh here would fire alongside the unknown-source nudge that
+    // must do": pointing at /beezi:settings refresh here would fire alongside the unknown-source nudge that
     // deliberately routes to /beezi:login, and hand the user two different instructions for one
     // situation. The single exception is the setup-token → login migration, which the machine
     // infers from evidence that cannot fully distinguish it from a token it merely cannot see —
@@ -374,13 +395,13 @@ export async function runSessionStart(input, deps = {}) {
     if (billingChanges.length > 0) {
       const inferred = billingChanges.indexOf('setup token → Claude login') !== -1;
       const tail = inferred
-        ? ' Run /beezi:refresh if this machine still uses a setup token.'
+        ? ' Run /beezi:settings refresh if this machine still uses a setup token.'
         : '';
       const notice = `Beezi: billing change detected — ${billingChanges.join('; ')}. Data updated.${tail}`;
       message = message ? `${message}\n${notice}` : notice;
     }
     if (billingSource === BillingSource.SUBSCRIPTION && isStale(billingConfig)) {
-      const nudge = 'Beezi: subscription plan info is missing or stale — run /beezi:refresh to update it.';
+      const nudge = 'Beezi: subscription plan info is missing or stale — run /beezi:settings refresh to update it.';
       message = message ? `${message}\n${nudge}` : nudge;
     } else if (billingSource === BillingSource.UNKNOWN) {
       // Reported honestly as `unknown` rather than guessed. Only the user can resolve it, and
@@ -407,8 +428,8 @@ export async function runSessionStart(input, deps = {}) {
     const defaultKey = await (deps.getDefaultKey == null ? getDefaultKey : deps.getDefaultKey)(deps).catch(() => null);
     // Billing is machine-wide: tenant-specific key answers must not race to rewrite it.
     const billingAccountKey = defaultKey;
-    await Promise.all(liveSessions.map(async (session) => {
-      const syncPromise = syncPromises.get(session.key);
+    await Promise.all(keyStatusSessions.map(async (session) => {
+      const syncPromise = syncPromises.get(targetKey(session));
     const fetchKeyStatus = deps.fetchOauthKeyStatus == null
       ? _fetchOauthKeyStatus
       : deps.fetchOauthKeyStatus;
@@ -447,18 +468,18 @@ export async function runSessionStart(input, deps = {}) {
       ? _recordResolvedKeyData
       : deps.recordResolvedKeyData;
     if (keyStatus != null && keyStatus.needsAttention) {
-      // Points at /beezi:refresh, not at the portal: that command IS this flow — it reads the same
+      // Points at /beezi:settings refresh, not at the portal: that command IS this flow — it reads the same
       // resolution, offers the same plans and subscriptions, and writes the answer back here.
       // Sending the user to a web page to do what the prompt they are standing at can do is one
       // context switch for nothing.
-      const nudge = 'Beezi: this machine signs in with a Claude setup token, and Beezi does not know which subscription it bills — its usage is reported without a plan. Run /beezi:refresh to set the plan or link this key to an existing subscription.';
+      const nudge = 'Beezi: this machine signs in with a Claude setup token, and Beezi does not know which subscription it bills — its usage is reported without a plan. Run /beezi:settings refresh to set the plan or link this key to an existing subscription.';
       message = message ? `${message}
 ${nudge}` : nudge;
     } else if (keyStatus != null && keyStatus.known && keyStatus.subscriptionPlan != null) {
       // The portal already knows what this key bills. Adopt the WHOLE answer into billing.json —
       // plan, subscription type, tier, account email, and the fingerprint it is all scoped to — so
       // the reports carry it from this session on, instead of waiting for the user to run
-      // /beezi:refresh and instead of shipping whatever a previous interactive login left behind.
+      // /beezi:settings refresh and instead of shipping whatever a previous interactive login left behind.
       // Best-effort and silent by contract: nothing changed for the user to read about.
       try { if (session.key === billingAccountKey) recordKeyData(keyStatus); } catch { /* best-effort */ }
 
@@ -491,7 +512,7 @@ ${nudge}` : nudge;
     let detached = false;
     try { detached = statuslineCaptureDetached(); } catch { /* best-effort */ }
     if (detached) {
-      const nudge = 'Beezi: your status line no longer runs Beezi’s wrapper, so live plan-usage capture is off. Run /beezi:login to wrap it again.';
+      const nudge = 'Beezi: your status line no longer runs Beezi’s wrapper, so live plan-usage capture is off. Turn it back on with /beezi:settings statusline on.';
       message = message ? `${message}\n${nudge}` : nudge;
     }
   }
@@ -500,6 +521,8 @@ ${nudge}` : nudge;
   // wherever the one-time history pull has not completed yet (paid tenants included) — the
   // backfill runs as the last step of /beezi:login.
   for (const session of sessions) {
+    // A multi-workspace account's cached mode describes the web-side workspace, not this session's.
+    if (isMultiTenant(session)) continue;
     const tracking = trackingByKey.get(session.key);
   const mode = tracking == null || tracking.trackingMode == null ? null : tracking.trackingMode;
   let policy = null;

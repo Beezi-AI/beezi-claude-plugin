@@ -629,15 +629,26 @@ function buildSkillPlanCycles(lines) {
   return { events, intervals };
 }
 
+// Every record's tsOf in file order, nulls dropped (NaN kept): the raw input of a subagent's span.
+export function timestampsOf(lines) {
+  return lines.map(tsOf).filter((t) => t != null);
+}
+
 // One active span per subagent transcript (first→last timestamp). Parallel subagents overlap in
 // time; the client packs them into lanes.
-function buildSubagents(transcriptPath, sessionId) {
+function buildSubagents(transcriptPath, sessionId, transcriptMemo = null) {
   const out = [];
-  for (const { agentId, path: agentPath, agentType } of listSubagentTranscripts(transcriptPath, sessionId)) {
-    let times;
-    try {
-      times = parseTranscript(agentPath).map(tsOf).filter((t) => t != null);
-    } catch { continue; }
+  const agents = transcriptMemo == null
+    ? listSubagentTranscripts(transcriptPath, sessionId)
+    : transcriptMemo.subagents(transcriptPath, sessionId);
+  for (const { agentId, path: agentPath, agentType } of agents) {
+    // The delta pass's timestamps for this file when it parsed it, else this file's own parse.
+    let times = transcriptMemo == null ? null : transcriptMemo.takeAgentTimes(agentPath);
+    if (times == null) {
+      try {
+        times = timestampsOf(parseTranscript(agentPath));
+      } catch { continue; }
+    }
     if (!times.length) continue;
     times.sort((a, b) => a - b);
     out.push({
@@ -667,8 +678,14 @@ function dropLeadIn(lines) {
 // `deps.readPermissionMarkers` is injectable so the tests never touch the developer's real
 // ~/.beezi/state — a stray marker file there would otherwise flip assertions on unrelated runs.
 export function computeSessionTimeline(transcriptPath, sessionId, deps = {}) {
+  // The audit run's per-session memo already holds parseTranscript's records for this file.
+  const transcriptMemo = deps.transcriptMemo == null ? null : deps.transcriptMemo;
   let lines;
-  try { lines = parseTranscript(transcriptPath); } catch { return null; }
+  try {
+    lines = transcriptMemo == null
+      ? parseTranscript(transcriptPath)
+      : transcriptMemo.main(transcriptPath).records.map((r) => r.line);
+  } catch { return null; }
   lines = dropLeadIn(lines);
   if (lines === null) return null;
 
@@ -681,7 +698,7 @@ export function computeSessionTimeline(transcriptPath, sessionId, deps = {}) {
   const plan_events = buildPlanEvents(lines)
     .concat(skillPlan.events)
     .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
-  const subagents = buildSubagents(transcriptPath, sessionId);
+  const subagents = buildSubagents(transcriptPath, sessionId, transcriptMemo);
 
   // Axis domain = earliest/latest timestamp across main + subagent activity. Single-pass min/max
   // rather than collecting and sorting every timestamp just to read the two extremes.

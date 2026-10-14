@@ -1,8 +1,9 @@
 import fs from 'fs';
 import { linkedSessions as _linkedSessions } from './sessions.mjs';
 import { postSessionError } from './session-error-report.mjs';
-import { isLiveTrackingAllowed, readTrackingState } from './tracking.mjs';
+import { allowsLiveFor, readTrackingState } from './tracking.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
+import { readSessionWorkspace, expandTargets, resolveTargets } from './workspace.mjs';
 
 // Best-effort: pull the last assistant message text, any API-error detail, and the error line's
 // own timestamp from the transcript tail. The StopFailure `error` code is the reliable signal;
@@ -81,7 +82,7 @@ export async function reportSessionError(input, deps = {}) {
   // /sessions/errors carries the same tracking gate as /sessions/report — this path posts
   // outside runCheckpoint, so each account needs its own check or a dark tenant 403s on every failure.
   const isAllowed = deps.isLiveTrackingAllowedImpl == null
-    ? ((s) => isLiveTrackingAllowed(readTrackingState(s.key)))
+    ? ((s) => allowsLiveFor(s, readTrackingState(s.key)))
     : deps.isLiveTrackingAllowedImpl;
 
   const sessionId = input == null ? undefined : input.session_id;
@@ -93,8 +94,17 @@ export async function reportSessionError(input, deps = {}) {
 
   // deps.sessions lets the hook script share one linkedSessions() result with runCheckpoint.
   const all = deps.sessions == null ? await getSessions(deps).catch(() => []) : deps.sessions;
-  const sessions = all.filter(isAllowed);
-  if (sessions.length === 0) return { reported: false, reason: all.length ? 'tracking-disabled' : 'no-token' };
+  let workspaceState = null;
+  try { workspaceState = readSessionWorkspace(sessionId); } catch { /* best-effort */ }
+  // One clone per target workspace; an account with none left is skipped.
+  const expanded = expandTargets(all, workspaceState);
+  if (all.length === 0) return { reported: false, reason: 'no-token' };
+  if (expanded.length === 0) {
+    const pending = all.some((s) => resolveTargets(s, workspaceState).pendingAsk);
+    return { reported: false, reason: pending ? 'workspace-pending' : 'no-targets' };
+  }
+  const sessions = expanded.filter(isAllowed);
+  if (sessions.length === 0) return { reported: false, reason: 'tracking-disabled' };
 
   const context = readErrorContext(input.transcript_path, deps);
   const payload = {

@@ -123,6 +123,18 @@ export function resolveKeyFingerprint(billingConfig, env = process.env) {
   return keyFingerprint(env == null ? null : env.CLAUDE_CODE_OAUTH_TOKEN);
 }
 
+// Does this billing record BELONG to a setup key? Both ways one can be recorded count: the portal
+// writeback stamps a fingerprint, while a record whose key was captured through the anchor alone
+// carries only the `oauth_key` anchor. Unlike hasKeyIdentity this reads the RECORD, which is what
+// still knows about a key the env cannot see (a token exported from a shell profile is invisible to
+// every env tier). Lives here, in the leaf, so the hot-path identity stamp can ask it without
+// importing the capture module.
+export function isKeyScoped(config) {
+  if (config == null) return false;
+  if (config.keyFingerprint != null) return true;
+  return config.accountAnchor != null && config.accountAnchor.source === 'oauth_key';
+}
+
 // Does this machine identify by a setup token rather than by an account? The shared form of
 // hasOauthTokenIdentity, which stays for the callers asking it of the env alone with no billing
 // record in hand (the reconcile's own precheck, key-resolve's guard).

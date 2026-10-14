@@ -33,7 +33,7 @@ import {
 import { claimIntervals, mergeIntervals, subtractIntervals, totalMs } from './active-time.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { claudeMdLines } from './claude-md.mjs';
-import { isLiveTrackingAllowed, markTrackingDisabled, readTrackingState } from './tracking.mjs';
+import { allowsLiveFor, isLiveTrackingAllowed, isTenantDark, markTenantDark, markTrackingDisabled, readTrackingState } from './tracking.mjs';
 import { readUsageUtilization as _readUsageUtilization } from './usage-utilization.mjs';
 import { readClaudeAccount as _readClaudeAccount } from './claude-account.mjs';
 import { buildIdentityStamp } from './identity-stamp.mjs';
@@ -42,6 +42,9 @@ import {
   maybePostUsageSnapshot as _maybePostUsageSnapshot,
   drainStatuslineSnapshots as _drainStatuslineSnapshots,
 } from './usage-snapshot-report.mjs';
+import { readSessionWorkspace, resolveTargets, tenantsOf, isMultiTenant, QUEUE_HOLD_MS } from './workspace.mjs';
+import { enqueue, enqueueHeld, unwrapQueueFile, releaseHeldFile } from './workspace-queue.mjs';
+import { bindSessionRoutes, usesRules } from './workspace-rules.mjs';
 
 function loadState(id) {
   return readJson(path.join(stateDir(), `${id}.json`), {
@@ -55,17 +58,75 @@ function saveState(id, state) {
   writeJsonSecure(path.join(stateDir(), `${id}.json`), state);
 }
 
-export function enqueue(key, payload) {
-  // 0600: these payloads carry session_name (prompt text), remote, and branch.
-  const filename = payload.segmentId.replace(/[:/\s]/g, '_') + '.json';
-  writeJsonSecure(path.join(queueDir(key), filename), payload);
+// The identity half of a stamp — which account a payload belongs to. Kept per session in its state
+// file so the session's later reports, and any backfill/sync of its transcript, name the
+// subscription it STARTED on rather than whichever login is current when they run.
+const IDENTITY_KEYS = [
+  'account_uuid', 'account_email', 'account_org_uuid', 'account_org_name',
+  'oauth_key_prefix', 'oauth_key_last4', 'oauth_key_length',
+];
+
+function pickIdentity(source, keys) {
+  const out = {};
+  if (source == null || typeof source !== 'object') return out;
+  for (const key of keys) {
+    if (source[key] != null) out[key] = source[key];
+  }
+  return out;
 }
 
-const FLUSH_COUNTERS = ['flushed', 'rejected', 'failed', 'expired', 'salvaged', 'quarantined'];
+function namesAccount(identity) {
+  return identity.account_uuid != null || identity.account_email != null || identity.oauth_key_prefix != null;
+}
+
+// Fills only what the recorded identity lacks, and only from the SAME account: a live stamp that
+// names a different uuid or email is a login switch, which must not move the session.
+function completeIdentity(recorded, live) {
+  const sameUuid = recorded.account_uuid == null || live.account_uuid == null
+    || recorded.account_uuid === live.account_uuid;
+  const sameEmail = recorded.account_email == null || live.account_email == null
+    || recorded.account_email === live.account_email;
+  if (!sameUuid || !sameEmail) return recorded;
+  // An org that changed under the same login is exactly the switch this guards against.
+  if (recorded.account_org_uuid != null && live.account_org_uuid != null
+    && recorded.account_org_uuid !== live.account_org_uuid) return recorded;
+  const merged = Object.assign({}, recorded);
+  for (const key of IDENTITY_KEYS) {
+    if (merged[key] == null && live[key] != null) merged[key] = live[key];
+  }
+  return merged;
+}
+
+// Which identity this checkpoint stamps for the session:
+//   - one recorded for it (a live run saved it) — always, live or audit; a live run may only
+//     complete it from the same account;
+//   - live, nothing recorded: the live login, which becomes the record;
+//   - audit (backfill/sync), nothing recorded: the identity the last live payload carried (the
+//     rename anchor, which pre-identity plugin versions left behind), else — a transcript the
+//     plugin never saw live — the CURRENT login, organization included: the account the user is
+//     backfilling or syncing from. The server links a session to its subscription once, so that
+//     first attribution is the one that stays.
+export function resolveSessionIdentity(state, liveStamp, audit) {
+  const live = pickIdentity(liveStamp, IDENTITY_KEYS);
+  const recorded = pickIdentity(state == null ? null : state.identity, IDENTITY_KEYS);
+  if (namesAccount(recorded)) {
+    const identity = audit ? recorded : completeIdentity(recorded, live);
+    const changed = IDENTITY_KEYS.some((key) => identity[key] !== recorded[key]);
+    return { identity, record: changed ? identity : null };
+  }
+  if (!audit) return { identity: live, record: namesAccount(live) ? live : null };
+  const anchored = pickIdentity(state == null ? null : state.anchor, IDENTITY_KEYS);
+  if (namesAccount(anchored)) return { identity: anchored, record: null };
+  return { identity: live, record: null };
+}
+
+export { enqueue, unwrapQueueFile };
+
+const FLUSH_COUNTERS = ['flushed', 'rejected', 'failed', 'expired', 'salvaged', 'quarantined', 'workspacePending'];
 
 // Sums one flush result per account into the single summary older call sites still read.
 export function mergeFlushResults(list) {
-  const merged = { flushed: 0, rejected: 0, failed: 0, expired: 0, salvaged: 0, quarantined: 0, trackingDisabled: false, lastError: null };
+  const merged = { flushed: 0, rejected: 0, failed: 0, expired: 0, salvaged: 0, quarantined: 0, workspacePending: 0, trackingDisabled: false, lastError: null };
   for (const r of list) {
     if (r == null) continue;
     for (const c of FLUSH_COUNTERS) merged[c] += r[c] == null ? 0 : r[c];
@@ -73,10 +134,6 @@ export function mergeFlushResults(list) {
     if (r.lastError) merged.lastError = r.lastError;
   }
   return merged;
-}
-
-function allowsLive(session) {
-  return isLiveTrackingAllowed(readTrackingState(session.key));
 }
 
 // Stand-in "remote" for work with no git origin behind it — a directory that isn't a repo, or a
@@ -124,8 +181,10 @@ function detectTimezone() {
 // own coverage — see the three reads it overrides below.
 export async function runCheckpoint(input, deps = {}, options = {}) {
   const { session_id, transcript_path, cwd } = input;
-  const gitImpl = deps.gitImpl == null ? git : deps.gitImpl;
+  const gitImpl = deps.runCache != null ? deps.runCache.git : (deps.gitImpl == null ? git : deps.gitImpl);
   const computeDelta = deps.computeDelta == null ? _computeDelta : deps.computeDelta;
+  // The audit run's per-session memo: one read and parse per file for the delta, the Task map and the timeline.
+  const transcriptMemo = deps.transcriptMemo == null ? null : deps.transcriptMemo;
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const collectedErrors = [];
   const empty = (extra) => ({ enqueued: 0, flush: null, flushes: [], sessionErrors: collectedErrors, ...(extra || {}) });
@@ -148,17 +207,58 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   if (recipients.length === 0) return empty();
 
   // Diagnostics use the machine-wide anonymous worker; only identity correlation is authenticated.
-  let defaultKey = null;
-  try { defaultKey = await getDefaultKey(); } catch { /* best-effort */ }
-  const diag = diagnosticsSession(sessions, defaultKey);
-  try { await bindInstallationIfNeeded(diag, { postJsonImpl: deps.postJsonImpl }); } catch { /* best-effort */ }
+  // The audit run binds once for all its checkpoints, so each of them skips it.
+  if (options.skipInstallationBinding !== true) {
+    let defaultKey = null;
+    try { defaultKey = await getDefaultKey(); } catch { /* best-effort */ }
+    const diag = diagnosticsSession(sessions, defaultKey);
+    try { await bindInstallationIfNeeded(diag, { postJsonImpl: deps.postJsonImpl }); } catch { /* best-effort */ }
+  }
   try { rememberClaudeCodeVersion(transcript_path); } catch { /* best-effort */ }
-  const targets = options.skipLiveTrackingGate === true ? recipients : recipients.filter(allowsLive);
-  if (targets.length === 0) return empty({ gated: true });
-  const liveTargets = targets.filter((session) => session.token);
-  // Fan each payload into the eligible accounts before recording a successful emission.
+  // One read per checkpoint; a tenant set on caller-supplied sessions (sync --tenant) wins. Account
+  // rows carry the web-side tenantId, which must never be followed.
+  let workspaceState = null;
+  try { workspaceState = readSessionWorkspace(session_id); } catch { /* best-effort */ }
+  // A live session whose SessionStart saw no multi-workspace account (a login mid-session) is bound from here, so a rule or flush can find it.
+  if (workspaceState == null && options.sessions == null && recipients.some(usesRules)) {
+    try { workspaceState = bindSessionRoutes(session_id, cwd || process.cwd(), recipients); } catch { /* best-effort */ }
+  }
+  const skipGate = options.skipLiveTrackingGate === true;
+  // Why accounts were left with nothing to send: a Don't track rule or New folders Don't send (policy), or tracking off (dark).
+  let policyGated = false;
+  let darkGated = false;
+  // Per account: live targets (dark ones dropped) plus every workspace held until a rule answers.
+  const plans = recipients.map((s) => {
+    const tracking = readTrackingState(s.key);
+    const multi = isMultiTenant(s);
+    if (options.sessions != null && typeof s.tenantId === 'string' && s.tenantId !== '') {
+      return { session: s, multi, targets: skipGate || allowsLiveFor(s, tracking) ? [s.tenantId] : [], hold: [] };
+    }
+    const r = resolveTargets(s, workspaceState);
+    const targets = skipGate ? r.targets : r.targets.filter((t) => allowsLiveFor({ ...s, tenantId: t }, tracking));
+    const hold = r.pendingAsk ? r.askTenants.filter((t) => !isTenantDark(tracking, t)) : [];
+    if (targets.length === 0 && hold.length === 0) {
+      if ((r.source === 'rule' || r.source === 'none') && r.targets.length === 0 && !r.pendingAsk) policyGated = true;
+      else darkGated = true;
+    }
+    return { session: s, multi, targets, hold };
+  }).filter((p) => p.targets.length > 0 || p.hold.length > 0);
+  if (plans.length === 0) {
+    if (policyGated && darkGated) return empty({ gated: true, reason: 'no-targets-or-dark' });
+    return empty(policyGated ? { gated: true, reason: 'no-targets' } : { gated: true });
+  }
+  // One clone per target; `senders` keeps tokenless ones so the snapshot drain waits for them.
+  const senders = [];
+  for (const p of plans) for (const t of p.targets) senders.push({ ...p.session, tenantId: t });
+  const liveSenders = senders.filter((s) => s.token);
+  // Fan each payload into every target file, plus one held copy while the session awaits a rule.
   const emit = options.sink == null
-    ? (payload) => { for (const session of targets) enqueue(session.key, payload); }
+    ? (payload) => {
+      for (const p of plans) {
+        for (const t of p.targets) enqueue(p.session.key, payload, t, { multi: p.multi });
+        if (p.hold.length > 0) enqueueHeld(p.session.key, payload, p.hold);
+      }
+    }
     : options.sink;
   const resolvedSessionName = resolveSessionName(session_id, transcript_path);
 
@@ -173,7 +273,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const map = loadRepoMap();
   let mapDirty = false;
 
-  const repoRootOf = (dir) => resolveRepoRoot(gitImpl, dir, rootCache, map);
+  const repoRootOf = (dir) => resolveRepoRoot(gitImpl, dir, rootCache, map, deps.runCache == null ? null : deps.runCache.gitRoots);
 
   const branchOf = (root, ms) => {
     if (!root) return '(unknown)';
@@ -233,7 +333,9 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     : null;
   let delta;
   try {
-    delta = computeDelta(transcript_path, cursor, { cwd, repoRootOf, branchAt: branchOf });
+    delta = computeDelta(transcript_path, cursor, transcriptMemo == null
+      ? { cwd, repoRootOf, branchAt: branchOf }
+      : { cwd, repoRootOf, branchAt: branchOf, readRecords: transcriptMemo.main });
   } catch {
     skipped.deltaFailed = true;
     return emptyResult;
@@ -311,17 +413,24 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   try { utilization = readUtilization(); } catch { utilization = null; }
   let claudeAccount = null;
   try { claudeAccount = readAccount(); } catch { claudeAccount = null; }
-  // Identity stamp: which vendor account this machine is logged into NOW, in every shape it can
-  // prove — the uuid, the email, and the setup-token fingerprint for CI machines that expose
-  // nothing else. The server's ingest links the session to its account with whichever arrives.
+  // Identity stamp: which vendor account this session runs under, in every shape it can prove —
+  // the uuid and its organization (one login can hold several subscriptions), the email, and the
+  // setup-token fingerprint for CI machines that expose nothing else. The live login outranks the
+  // machine-wide billing.json, so a session that outlives an account switch keeps stamping its own.
+  // The server's ingest links the session to its account with whichever arrives.
   //
   // Built by the shared builder, NOT inline, because the usage-snapshot report has to send the
   // identical stamp: it posts to a different route that resolves an account the same way, and two
   // builders reading the same sources in a different order would land this machine's sessions and
   // its limits data on two different accounts. See lib/identity-stamp.mjs.
   // `env` was resolved above the billing block so both readings share one answer — see there.
+  const sessionIdentity = resolveSessionIdentity(
+    state,
+    buildIdentityStamp(claudeAccount, billingConfig, env),
+    options.persistState === false,
+  );
   const usageStamp = {
-    ...buildIdentityStamp(claudeAccount, billingConfig, env),
+    ...sessionIdentity.identity,
     ...(utilization
       ? {
           usage_five_hour_pct: utilization.fiveHourPct,
@@ -431,13 +540,19 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   let agentCursorsDirty = false;
   // Each subagent's display name is the `description` of the Task block that spawned it; join via
   // the meta.json toolUseId. Built once here (single main-transcript scan) for all subagents.
-  const taskDescriptions = buildTaskDescriptionMap(transcript_path);
+  const taskDescriptions = buildTaskDescriptionMap(transcript_path, { transcriptMemo });
   const workflowNameOf = createWorkflowNameResolver(transcript_path, session_id);
-  for (const { agentId, path: agentPath, workflowId, agentType, spawnDepth, toolUseId } of listSubagentTranscripts(transcript_path, session_id)) {
+  const agentTranscripts = transcriptMemo == null
+    ? listSubagentTranscripts(transcript_path, session_id)
+    : transcriptMemo.subagents(transcript_path, session_id);
+  for (const { agentId, path: agentPath, workflowId, agentType, spawnDepth, toolUseId } of agentTranscripts) {
     const agentFrom = agentCursors[agentId] == null ? 0 : agentCursors[agentId];
     let agentDelta;
     try {
-      agentDelta = computeDelta(agentPath, agentFrom, { cwd, repoRootOf, branchAt: branchOf });
+      // The memo parses the whole agent file and keeps its timestamps for the timeline's span.
+      agentDelta = computeDelta(agentPath, agentFrom, transcriptMemo == null
+        ? { cwd, repoRootOf, branchAt: branchOf }
+        : { cwd, repoRootOf, branchAt: branchOf, readRecords: transcriptMemo.agent });
     } catch { continue; }
     const taskDescription = toolUseId ? taskDescriptions.get(toolUseId) : null;
     // A workflow agent has no spawning Task block, so its run's state file names it instead.
@@ -480,7 +595,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       collectedErrors.push(errorPayload);
       continue;
     }
-    await Promise.all(liveTargets.map((s) => postSessionError(errorPayload, s, { fetchImpl })));
+    await Promise.all(liveSenders.map((s) => postSessionError(errorPayload, s, { fetchImpl })));
   }
 
   let stateDirty = false;
@@ -494,13 +609,15 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     try {
       const timeline = computeSessionTimeline(transcript_path, session_id);
       if (timeline && (timeline.periods.length > 0 || timeline.subagents.length > 0 || timeline.plan_events.length > 0)) {
-        const sig = `${JSON.stringify(timeline.periods)}|${JSON.stringify(timeline.subagents)}|${JSON.stringify(timeline.plan_events)}`;
+        // The sender list is part of the signature so a newly answered workspace still gets the timeline.
+        const senderSig = senders.map((s) => `${s.key}:${s.tenantId}`).sort().join(',');
+        const sig = `${JSON.stringify(timeline.periods)}|${JSON.stringify(timeline.subagents)}|${JSON.stringify(timeline.plan_events)}|${senderSig}`;
         if (sig !== state.sentTimelineSig) {
           const results = await Promise.all(
-            liveTargets.map((s) => postSessionTimeline({ sessionId: session_id, ...timeline }, s, { fetchImpl })),
+            liveSenders.map((s) => postSessionTimeline({ sessionId: session_id, ...timeline }, s, { fetchImpl })),
           );
           // Only remember the signature once every account confirmed, so a failed post retries next turn.
-          const reported = results.length === targets.length && results.every((r) => r.reported);
+          const reported = results.length === senders.length && results.every((r) => r.reported);
           if (reported) {
             state.sentTimelineSig = sig;
             stateDirty = true;
@@ -517,11 +634,14 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // settings file or the OS environment, where a bare process.env cannot see it. Without this
     // the two would report different identities from the same machine, in the same second.
     const postSnapshot = deps.maybePostUsageSnapshot == null ? _maybePostUsageSnapshot : deps.maybePostUsageSnapshot;
-    try { await Promise.all(liveTargets.map((s) => postSnapshot(s, { fetchImpl, env }))); } catch { /* best-effort */ }
+    // One after another: the per-account snapshot state is read-modify-write.
+    for (const s of liveSenders) {
+      try { await postSnapshot(s, { fetchImpl, env }); } catch { /* best-effort */ }
+    }
     // Live rate-limit rows the status line recorded between hooks — the observations no
     // hook was running to see.
     const drainSnapshots = deps.drainStatuslineSnapshots == null ? _drainStatuslineSnapshots : deps.drainStatuslineSnapshots;
-    try { await drainSnapshots(targets, { fetchImpl, env }); } catch { /* best-effort */ }
+    try { await drainSnapshots(senders, { fetchImpl, env }); } catch { /* best-effort */ }
   }
 
   // Claude Code renames a session after the first prompt. The new name normally rides on the
@@ -546,6 +666,12 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     state.cursor = nextCursor;
     stateDirty = true;
   }
+  // Recorded only once the session has actually reported under it: a checkpoint that sent nothing
+  // has attributed nothing yet, so a login switch before the first report should still win.
+  if (sessionIdentity.record != null && enqueued > 0) {
+    state.identity = sessionIdentity.record;
+    stateDirty = true;
+  }
   if (agentCursorsDirty) {
     state.agentCursors = agentCursors;
     stateDirty = true;
@@ -555,8 +681,8 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     stateDirty = true;
   }
   // Remember where this session lives. The session's cwd drifts (cd, worktree switches)
-  // while Claude Code keys the transcript dir by the LAUNCH cwd, so /beezi:track can't
-  // rely on process.cwd() to find the transcript — it reads this mapping instead. Only
+  // while Claude Code keys the transcript dir by the LAUNCH cwd, so later commands can't
+  // rely on process.cwd() to find the transcript — they read this mapping instead. Only
   // recorded once the transcript has content, so an empty session writes no state.
   if (nextCursor > 0 && (state.cwd !== cwd || state.transcriptPath !== transcript_path)) {
     state.cwd = cwd == null ? null : cwd;
@@ -580,14 +706,14 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // that would add unrelated HTTP calls mid-import and muddy its summary.
   const flushes = options.skipFlush
     ? []
-    : await Promise.all(liveTargets.map(async (s) => ({ key: s.key, email: s.email, tenantName: s.tenantName, ...(await flushQueue(s, { fetchImpl })) })));
+    : await Promise.all(plans.filter((p) => p.session.token).map(async ({ session: s }) => ({ key: s.key, email: s.email, tenantName: s.tenantName, ...(await flushQueue(s, { fetchImpl })) })));
   const flush = options.skipFlush ? null : mergeFlushResults(flushes);
   return { enqueued, flush, flushes, sessionErrors: collectedErrors, skipped };
 }
 
 // Once tracking is off, queued reports are held for this long: a tenant that converts to paid
 // inside the window flushes them normally on its first live session; after it they expire.
-export const QUEUE_HOLD_MS = 3 * 24 * 60 * 60 * 1000;
+export { QUEUE_HOLD_MS };
 
 // Expire queue files older than the hold window. Only meaningful while tracking is off — a
 // live-mode queue drains through flushing, not expiry.
@@ -609,20 +735,34 @@ function sweepHeldQueue(dir, result, now = Date.now()) {
   }
 }
 
-// Returns { flushed, rejected, failed, expired, trackingDisabled, lastError } —
+// Returns { flushed, rejected, failed, expired, workspacePending, trackingDisabled, lastError } —
 // flushed = accepted (2xx), rejected = permanently declined by the server (4xx, e.g. branch not
 // linked), failed = transient or reversible (5xx/network/code-less 403, file kept for retry),
-// expired = held files past the 3-day window, trackingDisabled = the server said the workspace
-// is dark (audit mode) and the flush stopped.
+// expired = held files past the 3-day window, workspacePending = held until a rule or New folders
+// picks a workspace, trackingDisabled = the server said the workspace is dark (audit mode) and the flush stopped.
 export async function flushQueue(session, deps = {}) {
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
-  const result = { flushed: 0, rejected: 0, failed: 0, expired: 0, salvaged: 0, quarantined: 0, trackingDisabled: false, lastError: null };
+  const result = { flushed: 0, rejected: 0, failed: 0, expired: 0, salvaged: 0, quarantined: 0, workspacePending: 0, trackingDisabled: false, lastError: null };
   const dir = queueDir(session.key);
+  const tenants = tenantsOf(session);
+  const multiTenant = isMultiTenant(session);
+  const workspaceCache = new Map();
+  const workspaceOf = (sessionId) => {
+    if (!workspaceCache.has(sessionId)) {
+      let state = null;
+      try { state = readSessionWorkspace(sessionId); } catch { /* unreadable = unanswered */ }
+      workspaceCache.set(sessionId, state);
+    }
+    return workspaceCache.get(sessionId);
+  };
+  const isMember = (tenantId) => tenants != null && tenants.some((t) => t.id === tenantId);
 
   // Dark workspace: no readdir-and-post loop, just the hold-window sweep. Files stay for
-  // QUEUE_HOLD_MS in case the tenant converts to paid, then expire.
-  if (!allowsLive(session)) {
+  // QUEUE_HOLD_MS in case the tenant converts to paid, then expire. Several workspaces go dark per tenant below.
+  const trackingState = readTrackingState(session.key);
+  const darkThisFlush = new Set();
+  if (!multiTenant && !isLiveTrackingAllowed(trackingState)) {
     result.trackingDisabled = true;
     sweepHeldQueue(dir, result);
     return result;
@@ -655,7 +795,9 @@ export async function flushQueue(session, deps = {}) {
     // files quarantined below, neither of which is ever postable; pruneStale expires both.
     if (!file.endsWith('.json')) continue;
     const filePath = path.join(dir, file);
-    const { value: payload, salvaged } = readJsonSalvaged(filePath);
+    const { value, salvaged } = readJsonSalvaged(filePath);
+    const entry = unwrapQueueFile(value);
+    const payload = entry.payload;
     // Nothing recoverable, or what came back is not a postable payload. Quarantine rather than
     // `continue`: an unparseable file used to be re-read on every flush forever, invisibly, and
     // the session's analytics were lost without a signal. A cleanly parsed payload is posted
@@ -668,12 +810,64 @@ export async function flushQueue(session, deps = {}) {
     }
     if (salvaged) result.salvaged += 1;
 
+    let mtimeMs = null;
+    const ageMs = () => {
+      if (mtimeMs == null) {
+        try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch { mtimeMs = Date.now(); }
+      }
+      return Date.now() - mtimeMs;
+    };
+    // Past the hold window a multi-workspace retry expires instead of failing forever.
+    const failOrExpire = () => {
+      if (multiTenant && ageMs() > QUEUE_HOLD_MS) {
+        try { fs.unlinkSync(filePath); result.expired += 1; return; } catch { /* counted failed */ }
+      }
+      result.failed += 1;
+    };
+
+    // A held or unstamped file is expanded into per-tenant copies, which this same pass posts.
+    if (multiTenant && (entry.hold != null || entry.tenantId == null)) {
+      let released;
+      // A corrupt held file must not break the whole flush.
+      try { released = releaseHeldFile(filePath, session, workspaceOf(payload.sessionId)); } catch { result.failed += 1; continue; }
+      files.push(...released.written);
+      if (released.expired) result.expired += 1;
+      else if (!released.deleted) result.workspacePending += 1;
+      continue;
+    }
+    // A held file on a now single-workspace account waits out the hold window.
+    if (entry.hold != null) {
+      if (ageMs() <= QUEUE_HOLD_MS) {
+        result.workspacePending += 1;
+      } else {
+        try { fs.unlinkSync(filePath); result.expired += 1; } catch { /* best-effort */ }
+      }
+      continue;
+    }
+
+    // A stamp for a workspace the account has left is held for it, never re-routed; old servers send no header.
+    if (entry.tenantId != null && tenants != null && !isMember(entry.tenantId)) {
+      if (ageMs() <= QUEUE_HOLD_MS) {
+        result.workspacePending += 1;
+      } else {
+        try { fs.unlinkSync(filePath); result.expired += 1; } catch { /* best-effort */ }
+      }
+      continue;
+    }
+    // One or unknown workspaces post headerless, whatever the file was stamped with.
+    const tenantId = multiTenant ? entry.tenantId : null;
+    // A dark tenant's reports are dropped, not retried.
+    if (multiTenant && (darkThisFlush.has(tenantId) || isTenantDark(trackingState, tenantId))) {
+      try { fs.unlinkSync(filePath); result.rejected += 1; } catch { /* best-effort */ }
+      continue;
+    }
+
     try {
-      let res = await postJson(reportUrl, current, payload, { fetchImpl });
+      let res = await postJson(reportUrl, { ...current, tenantId }, payload, { fetchImpl });
       // 401 only: a 403 is authenticated-but-not-permitted, which no new token resolves.
       if (res.status === 401) {
         const next = await renewToken();
-        if (next) res = await postJson(reportUrl, next, payload, { fetchImpl });
+        if (next) res = await postJson(reportUrl, { ...next, tenantId }, payload, { fetchImpl });
       }
       if (res.status >= 200 && res.status < 300) {
         result.flushed += 1;
@@ -681,15 +875,24 @@ export async function flushQueue(session, deps = {}) {
       } else if (res.status === 401) {
         // Still unauthenticated after a renewal attempt — keep the file; the payload was
         // never judged, and re-linking should let it through later.
-        result.failed += 1;
+        failOrExpire();
         result.lastError = `HTTP ${res.status}`;
       } else if (res.status === 403) {
         // Branch on the machine-readable code, never the message. TRACKING_DISABLED = the
         // workspace is in audit mode: record it, stop the storm, and HOLD the files — they
         // flush if the tenant converts within the window, and expire after it. A code-less 403
-        // (seat revoked, deactivated user) is reversible: keep the file, count it failed.
+        // (seat revoked, deactivated user) is reversible: keep the file, count it failed. With several
+        // workspaces only that tenant goes dark: its files are dropped and the account keeps flushing.
         let body = null;
         try { body = await res.json(); } catch { /* non-JSON body */ }
+        if (body != null && body.code === 'TRACKING_DISABLED' && multiTenant) {
+          try { markTenantDark(session.key, tenantId); } catch { /* best-effort */ }
+          darkThisFlush.add(tenantId);
+          result.rejected += 1;
+          result.lastError = body.message == null ? 'HTTP 403' : body.message;
+          try { fs.unlinkSync(filePath); } catch { /* best-effort */ }
+          continue;
+        }
         if (body != null && body.code === 'TRACKING_DISABLED') {
           try { markTrackingDisabled(session.key, body.message == null ? null : body.message); } catch { /* best-effort */ }
           result.trackingDisabled = true;
@@ -697,7 +900,7 @@ export async function flushQueue(session, deps = {}) {
           sweepHeldQueue(dir, result);
           break;
         }
-        result.failed += 1;
+        failOrExpire();
         result.lastError = body == null || body.message == null ? `HTTP ${res.status}` : body.message;
       } else if (res.status < 500) {
         // Permanent rejection — drop the file, but remember why.
@@ -710,11 +913,11 @@ export async function flushQueue(session, deps = {}) {
         }
         fs.unlinkSync(filePath);
       } else {
-        result.failed += 1; // keep for retry
+        failOrExpire(); // keep for retry
         recordIssue({ code: DIAGNOSTIC_CODES.QUEUE_FLUSH_HTTP_ERROR, source: DIAGNOSTIC_SOURCES.CHECKPOINT, httpStatus: res.status });
       }
     } catch {
-      result.failed += 1; // keep file for retry on network error / throw
+      failOrExpire(); // keep file for retry on network error / throw
     }
   }
 

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { readSyncState, isDue, markAttempt } from './cost-state-sync-state.mjs';
 import { spawnDetached } from './background-spawn.mjs';
 import { readTrackingState, isTrackingDisabled } from './tracking.mjs';
+import { isMultiTenant } from './workspace.mjs';
 import { accountsIndexFile, credentialsFile, beeziHome } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
 
@@ -33,7 +34,7 @@ export function maybeSpawnCostStateSync(deps = {}) {
     let eligible = false;
     if (index && Array.isArray(index.accounts)) {
       eligible = index.accounts.some((row) => row && row.status === 'linked'
-        && /^[0-9a-f]{8}$/.test(row.key) && !isTrackingDisabled(readTracking(row.key)));
+        && /^[0-9a-f]{8}$/.test(row.key) && (isMultiTenant(row) || !isTrackingDisabled(readTracking(row.key))));
     } else {
       // A pre-upgrade install still needs a child to perform the account migration.
       const tracking = readJson(path.join(beeziHome(), 'tracking.json'), null);

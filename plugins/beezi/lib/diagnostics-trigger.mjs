@@ -23,6 +23,9 @@ function hasPending() {
 // within milliseconds of each other, and without the claim every hook in a turn would spawn its
 // own worker. A lost race costs one duplicate delivery, which the route dedups on eventId.
 export function maybeSpawnDiagnostics(deps = {}) {
+  const env = deps.env == null ? process.env : deps.env;
+  // Starts nothing under the terminal setup wizard; the next hook delivers pending reports.
+  if (env.BEEZI_SETUP === '1') return false;
   try {
     if (!isTelemetryGranted()) return false;
     if (!hasPending()) return false;

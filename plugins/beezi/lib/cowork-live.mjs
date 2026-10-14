@@ -58,6 +58,9 @@ export function desktopRunning(deps = {}) {
 }
 
 export function maybeSpawnCoworkLive(deps = {}) {
+  const env = deps.env == null ? process.env : deps.env;
+  // Starts nothing under the terminal setup wizard; the next session start spawns the worker.
+  if (env.BEEZI_SETUP === '1') return false;
   const eligible = deps.eligible == null ? eligibleCoworkAccounts : deps.eligible;
   const read = deps.readState == null ? () => readJson(liveStateFile(), null) : deps.readState;
   const write = deps.writeState == null ? (value) => writeJsonSecure(liveStateFile(), value) : deps.writeState;

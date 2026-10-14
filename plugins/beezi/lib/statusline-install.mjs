@@ -242,6 +242,15 @@ export function statuslineCaptureDetached(deps = {}) {
   return beeziShimPath(command) == null;
 }
 
+// True when settings.json → statusLine runs our shim or any Beezi variant's.
+export function statuslineInstalled(deps = {}) {
+  const platform = deps.platform == null ? process.platform : deps.platform;
+  const { settings, error } = readSettings();
+  if (error) return false;
+  const command = commandOf(settings.statusLine);
+  return commandUsesShim(command, statuslineShimFile(platform)) || beeziShimPath(command) != null;
+}
+
 // Puts back whatever /beezi:login replaced, but only while settings still point at our shim —
 // a status line the user changed since is theirs, not ours to touch.
 export function uninstallStatusline(deps = {}) {

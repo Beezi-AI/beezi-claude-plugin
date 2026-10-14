@@ -88,7 +88,8 @@ async function fetchRemote(pluginName, nowIso, deps) {
   // Neither is an observation about the installed version.
   if (typeof url !== 'string' || url.slice(0, 8) !== 'https://') return null;
   try {
-    const body = await getJson(url, { fetchImpl: deps.fetchImpl, timeoutMs: FETCH_TIMEOUT_MS });
+    const timeoutMs = deps.timeoutMs == null ? FETCH_TIMEOUT_MS : deps.timeoutMs;
+    const body = await getJson(url, { fetchImpl: deps.fetchImpl, timeoutMs: timeoutMs });
     const found = findEntry(body, pluginName);
     if (found == null) return null;
     const record = {
@@ -109,12 +110,42 @@ async function fetchRemote(pluginName, nowIso, deps) {
 // menu is offered rather than printing `beezi-dev@undefined`.
 export function composeNudge(local, record) {
   const head = `Beezi: a newer ${local.name} is published — ${local.version} → ${record.latestVersion}.`;
-  if (!record.marketplaceName) {
+  const commands = updateCommands(local.name, record.marketplaceName);
+  if (commands == null) {
     return `${head} Run /plugin to update it, then restart Claude Code to apply it.`;
   }
-  return `${head} Run: claude plugin marketplace update ${record.marketplaceName}`
-    + `, then claude plugin update ${local.name}@${record.marketplaceName}`
-    + ' — then restart Claude Code to apply it.';
+  return `${head} Run: ${commands[0]}, then ${commands[1]} — then restart Claude Code to apply it.`;
+}
+
+// The two terminal commands that update this plugin, in order — shared by the SessionStart nudge
+// and /beezi:about so both always name the same steps. null when there is no marketplace to name.
+export function updateCommands(pluginName, marketplaceName) {
+  if (!marketplaceName) return null;
+  return [
+    `claude plugin marketplace update ${marketplaceName}`,
+    `claude plugin update ${pluginName}@${marketplaceName}`,
+  ];
+}
+
+// The newest published reading, asked for on demand (/beezi:about) rather than at session start:
+// always fetched fresh, because the user is asking right now. When the fetch fails, the last cached
+// reading for this plugin name stands in, flagged `stale` so the caller can say how old it is.
+// { local, record, stale } — `record` is null when there is neither. Never throws.
+export async function fetchLatest(deps = {}) {
+  try {
+    const local = readLocalPlugin(deps);
+    if (local == null) return { local: null, record: null, stale: false };
+    const now = deps.now == null ? new Date() : deps.now;
+    const fresh = await fetchRemote(local.name, now.toISOString(), deps);
+    if (fresh != null) return { local: local, record: fresh, stale: false };
+    const cached = readUpdateCheck(deps);
+    if (cached != null && cached.pluginName === local.name && typeof cached.latestVersion === 'string') {
+      return { local: local, record: cached, stale: true };
+    }
+    return { local: local, record: null, stale: false };
+  } catch {
+    return { local: null, record: null, stale: false };
+  }
 }
 
 // The one-line nudge, or null when there is nothing to say. Best-effort by contract: never throws.

@@ -66,6 +66,16 @@ export function matchKnownRoot(dir, map) {
 }
 
 // Insert/refresh a root with its origin. Mutates and returns `map`.
+// Whether dir is root or lies under it, on segment boundaries, case-folded like matchKnownRoot.
+export function pathHasPrefix(dir, root) {
+  const d = normPath(dir);
+  const r = normPath(root);
+  if (!d || !r) return false;
+  const fd = fold(d);
+  const fr = fold(r);
+  return fd === fr || fd.startsWith(fr + '/');
+}
+
 export function upsertRoot(map, root, origin, nowIso = new Date().toISOString()) {
   const nr = normPath(root);
   if (!nr) return map;
@@ -197,4 +207,26 @@ export function resolveRemoteOffline(dir, map) {
   // the `local:` prefix keeps it from ever canonicalizing onto a real remote server-side.
   const base = path.basename(root == null ? dir : root);
   return base ? `local:${base}` : null;
+}
+
+// Root and origin for routing: known root, walk, then the longest stored root even if its checkout is gone.
+export function resolveRepoForRouting(dir, map) {
+  const d = normPath(dir);
+  if (!d) return { root: null, remote: null };
+  let root = matchKnownRoot(d, map);
+  if (root == null) root = findRepoRootByWalk(d);
+  if (root == null && map != null && map.roots) {
+    let bestLen = -1;
+    for (const stored of Object.keys(map.roots)) {
+      const nr = normPath(stored);
+      if (nr && nr.length > bestLen && pathHasPrefix(d, nr)) {
+        root = stored;
+        bestLen = nr.length;
+      }
+    }
+  }
+  if (root == null) return { root: null, remote: null };
+  let remote = knownOrigin(root, map);
+  if (remote == null || /^local:/i.test(remote)) remote = originFromGitConfig(root);
+  return { root, remote: remote == null || /^local:/i.test(remote) ? null : remote };
 }

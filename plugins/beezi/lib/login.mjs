@@ -19,6 +19,7 @@ import { oauthTokenEnvWithOsProbe } from './claude-settings-env.mjs';
 import { DIAGNOSTIC_SOURCES } from './telemetry-codes.mjs';
 import { recordAuthResult as _recordAuthResult } from './telemetry-auth.mjs';
 import { UserError } from './friendly-error.mjs';
+import { resolveTargets, currentSessionWorkspace } from './workspace.mjs';
 
 export function openBrowser(url) {
   // The URL comes from the server response — never pass it through a shell. Require a
@@ -110,7 +111,8 @@ export async function runLogin(deps = {}) {
     lifecycle = await acquireCredentialLock({ ...lockOptions, lifecycle: true }, deps);
     if (!lifecycle) throw new UserError('Another Beezi account change is in progress. Retry /beezi:login in a moment.');
     const who = { valid: true, ...verified.identity };
-    const identity = { email: who.email.toLowerCase(), name: who.name, tenantId: who.tenantId, tenantName: who.tenantName };
+    const identity = { email: who.email.toLowerCase(), name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
+      tenants: Array.isArray(who.tenants) ? who.tenants : null };
     async function checkStored(a) {
       let auth = await getAuthentication(deps, { account: a.key, waitMs: INTERACTIVE_REFRESH_WAIT_MS });
       if (auth.authState !== AUTH_STATES.READY) return { auth, probe: null };
@@ -139,6 +141,8 @@ export async function runLogin(deps = {}) {
       const check = await checkStored(existing);
       if ((check.probe && check.probe.outcome) === PROBE_OUTCOMES.AUTHENTICATED) {
         await discardFresh(); fresh = null;
+        // Stores the probe's workspace list so a join made since session start reaches joined and the upload.
+        try { await updateAccount(existing.key, check.probe.identity, deps); } catch { /* best-effort */ }
         log(`\n✓ This machine is already linked as ${describeAccount(existing)}.`);
         log(hint);
         const index = await readIndex(deps);
@@ -153,9 +157,6 @@ export async function runLogin(deps = {}) {
         || (check.probe && check.probe.outcome) === PROBE_OUTCOMES.UNAUTHORIZED;
       if (!dead) throw new UserError('Your existing account could not be verified right now. Its saved authorization is untouched; retry later.');
     }
-    const clash = (await listAccounts(deps)).find(a => a.key !== (existing && existing.key) && a.status === 'linked'
-      && who.tenantId != null && a.tenantId === who.tenantId);
-    if (clash) throw new UserError(`Workspace ${who.tenantName || clash.tenantName || who.tenantId} is already linked as ${clash.email}. Log that account out first to link ${identity.email}.`);
     const key = (existing && existing.key) || provisional;
     if (key !== provisional) {
       const targetLock = await acquireCredentialLock({ ...lockOptions, account: key }, deps);
@@ -200,7 +201,14 @@ export async function runLogin(deps = {}) {
     log(`\n✓ Beezi analytics linked as ${describeAccount(identity)}. Credentials stored in ${commit.where}.`);
     const index = await readIndex(deps);
     if (index.default !== key) log(`  /beezi:analytics still reads from ${describeAccount(index.accounts.find(a => a.key === index.default))}.`);
-    await sync({ ...fresh, key }, { force: true, via: 'login' }, { env: oauthTokenEnvWithOsProbe(process.env) }).catch(() => {});
+    // One check-in per current target; the existing row supplies rules and New folders, and a pending session checks in once a rule or New folders answers it.
+    // A whoami without tenants keeps the stored list, so a multi-workspace account never checks in headerless.
+    const merged = { ...(existing || {}), ...identity, key, tenants: identity.tenants != null ? identity.tenants : (existing ? existing.tenants : null) };
+    const resolved = resolveTargets(merged, currentSessionWorkspace());
+    for (const tenantId of resolved.targets) {
+      const session = resolved.multi ? { ...fresh, key, tenantId } : { ...fresh, key };
+      await sync(session, { force: true, via: 'login' }, { env: oauthTokenEnvWithOsProbe(process.env) }).catch(() => {});
+    }
     log(`account=${key}`);
     return { status: 'linked', account: key, where: commit.where, clientId };
   } catch (error) {

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { trackingStateFile } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
+import { isMultiTenant } from './workspace.mjs';
 
 const STATE_VERSION = 1;
 
@@ -49,6 +50,18 @@ export function isLiveTrackingAllowed(state) {
 export function isTrackingDisabled(state) {
   const mode = state == null || state.trackingMode == null ? null : state.trackingMode;
   return mode === TrackingMode.DISABLED;
+}
+
+// A workspace that answered 403 TRACKING_DISABLED for a multi-workspace account; cleared by the next whoami.
+export function isTenantDark(state, tenantId) {
+  if (state == null || tenantId == null || state.darkTenants == null || typeof state.darkTenants !== 'object') return false;
+  return state.darkTenants[tenantId] != null;
+}
+
+// The account-wide mode describes the web-side workspace, so a multi-workspace account is gated per chosen tenant only.
+export function allowsLiveFor(session, state) {
+  if (isMultiTenant(session)) return !isTenantDark(state, session.tenantId);
+  return isLiveTrackingAllowed(state);
 }
 
 // Mirrors the server's derivation: every mode except `disabled` is offered the one-time pull
@@ -107,6 +120,7 @@ export function recordWhoami(key, who, identity, deps = {}) {
       identity: identity == null ? null : identity,
       fetchedAt: new Date().toISOString(),
       reason: null,
+      darkTenants: {},
     },
     deps,
   );
@@ -127,6 +141,12 @@ export function markTrackingDisabled(key, reason, deps = {}) {
 }
 
 // The pull sealed (locally observed or server-confirmed) — the audit fast path keys off this.
+export function markTenantDark(key, tenantId, deps = {}) {
+  const current = readTrackingState(key, deps);
+  const dark = current != null && current.darkTenants != null && typeof current.darkTenants === 'object' ? current.darkTenants : {};
+  patchTrackingState(key, { darkTenants: { ...dark, [tenantId]: new Date().toISOString() } }, deps);
+}
+
 export function markBackfillCompleted(key, deps = {}) {
   patchTrackingState(key, { backfillCompleted: true, fetchedAt: new Date().toISOString() }, deps);
 }

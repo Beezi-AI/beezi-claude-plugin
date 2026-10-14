@@ -64,7 +64,8 @@ export async function pingUsageSnapshot(deps = {}) {
   const { linkedSessions } = await import('./sessions.mjs');
   const { maybePostUsageSnapshot } = await import('./usage-snapshot-report.mjs');
   const { oauthTokenEnvWithOsProbe } = await import('./claude-settings-env.mjs');
-  const { isLiveTrackingAllowed, readTrackingState } = await import('./tracking.mjs');
+  const { allowsLiveFor, readTrackingState } = await import('./tracking.mjs');
+  const { readSessionWorkspace, expandTargets, resolveTargets } = await import('./workspace.mjs');
 
   let sessions = [];
   try {
@@ -74,8 +75,21 @@ export async function pingUsageSnapshot(deps = {}) {
   }
   if (sessions.length === 0) return { reported: false, reason: 'no-token' };
 
+  // Stamped from the hook's session; the env id covers a caller that does not pass one.
+  const sessionId = deps.sessionId == null ? env.CLAUDE_CODE_SESSION_ID : deps.sessionId;
+  let workspaceState = null;
+  try { workspaceState = sessionId == null ? null : readSessionWorkspace(sessionId); } catch { workspaceState = null; }
+  // One clone per target workspace; an account with none left is skipped.
+  const accounts = sessions;
+  sessions = expandTargets(accounts, workspaceState);
+  if (sessions.length === 0) {
+    // Pending only while the session awaits a rule; otherwise a Don't track rule or New folders Don't send.
+    const pending = accounts.some((s) => resolveTargets(s, workspaceState).pendingAsk);
+    return { reported: false, reason: pending ? 'workspace-pending' : 'no-targets' };
+  }
+
   // Each account answers for itself: a dark tenant is dropped before the fan-out, not at the server.
-  sessions = sessions.filter((s) => isLiveTrackingAllowed(readTrackingState(s.key)));
+  sessions = sessions.filter((s) => allowsLiveFor(s, readTrackingState(s.key)));
   if (sessions.length === 0) return { reported: false, reason: 'tracking-disabled' };
 
   // The SAME env resolution runCheckpoint performs, so the snapshot this path posts carries the
@@ -94,7 +108,10 @@ export async function pingUsageSnapshot(deps = {}) {
     : deps.env;
 
   const postDeps = { ...deps, env: probedEnv };
-  const results = await Promise.all(sessions.map((s) => maybePostUsageSnapshot(s, postDeps)
-    .catch(() => ({ reported: false, reason: 'network' }))));
+  // Sequential: clones of one account share a marker file.
+  const results = [];
+  for (const s of sessions) {
+    results.push(await maybePostUsageSnapshot(s, postDeps).catch(() => ({ reported: false, reason: 'network' })));
+  }
   return { reported: results.some((r) => r.reported), results };
 }

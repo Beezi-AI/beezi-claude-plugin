@@ -16,8 +16,9 @@ import { oauthTokenEnv } from './claude-settings-env.mjs';
 // no version gate and the reconcile's kept path restamps the version — the same mechanism that
 // grandfathered v1 → v2. v4 adds keyFingerprint: WHICH setup token this record describes, so a plan
 // the server resolved for one key is never served under another, and a local capture that could not
-// see a key cannot overwrite a record that belongs to one.
-export const BILLING_CONFIG_VERSION = 4;
+// see a key cannot overwrite a record that belongs to one. v5 adds organizationUuid/organizationName:
+// WHICH subscription of a multi-org login the record describes (same uuid and email, different org).
+export const BILLING_CONFIG_VERSION = 5;
 
 const STALE_MS = 7 * 24 * 60 * 60 * 1000; // refresh plan info at least weekly
 

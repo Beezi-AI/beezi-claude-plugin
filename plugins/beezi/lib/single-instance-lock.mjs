@@ -52,3 +52,38 @@ export function releaseLock(name, deps = {}) {
     rmdirSync(lockDir(name));
   } catch { /* best-effort: a leaked lock self-heals after LOCK_STALE_MS */ }
 }
+
+function ownerFile(name) {
+  return path.join(beeziHome(), name + '.lock-owner');
+}
+
+// acquireLock plus an owner token and a heartbeat; → { refresh, release } or null when held.
+export function acquireOwnedLock(name, deps = {}) {
+  const writeFileSync = deps.writeFileSync == null ? fs.writeFileSync : deps.writeFileSync;
+  const readFileSync = deps.readFileSync == null ? fs.readFileSync : deps.readFileSync;
+  const utimesSync = deps.utimesSync == null ? fs.utimesSync : deps.utimesSync;
+  const unlinkSync = deps.unlinkSync == null ? fs.unlinkSync : deps.unlinkSync;
+  const rmdirSync = deps.rmdirSync == null ? fs.rmdirSync : deps.rmdirSync;
+  if (!acquireLock(name, deps)) return null;
+  const token = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  try { writeFileSync(ownerFile(name), token); } catch { /* an ownerless lock still expires by age */ }
+  const owns = () => {
+    try { return String(readFileSync(ownerFile(name), 'utf8')) === token; } catch { return false; }
+  };
+  return {
+    // Touching the dir keeps a long run from reading as abandoned.
+    refresh() {
+      if (!owns()) return false;
+      try {
+        const now = new Date();
+        utimesSync(lockDir(name), now, now);
+        return true;
+      } catch { return false; }
+    },
+    release() {
+      if (!owns()) return;
+      try { unlinkSync(ownerFile(name)); } catch { /* best-effort */ }
+      try { rmdirSync(lockDir(name)); } catch { /* best-effort: a leaked lock self-heals after LOCK_STALE_MS */ }
+    },
+  };
+}

@@ -38,7 +38,7 @@ export function authStatusLines(auth) {
     case AUTH_STATES.REFRESHING:
       return [
         'Beezi: this machine is linked; its authorization is being renewed right now.',
-        '  Try /beezi:me again in a moment.',
+        '  Try again in a moment.',
       ];
     case AUTH_STATES.REAUTH_REQUIRED:
       return [

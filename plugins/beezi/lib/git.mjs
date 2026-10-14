@@ -35,6 +35,42 @@ export function sanitizeRemote(url) {
   return url.replace(/\/\/[^@/]+@/, '//').replace(/[?#].*$/, '');
 }
 
+// One key per repository across ssh/https/scp forms: host/path, lowercased; null for local: or empty.
+export function canonicalRemote(url) {
+  const value = typeof url === 'string' ? url.trim() : '';
+  if (value === '' || /^local:/i.test(value)) return null;
+  const clean = sanitizeRemote(value);
+  let host;
+  let rest;
+  const scheme = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/:]*)(?::\d*)?(\/.*)?$/i.exec(clean);
+  const scp = /^[a-z]:[\\/]/i.test(clean) || clean.indexOf('://') !== -1 ? null : /^(?:[^@/:]+@)?([^/:]+):(.*)$/.exec(clean);
+  if (scheme && scheme[1] !== '') {
+    host = scheme[1];
+    rest = scheme[2] == null ? '' : scheme[2];
+  } else if (scp) {
+    host = scp[1];
+    rest = scp[2];
+  } else {
+    return clean.toLowerCase();
+  }
+  host = host.toLowerCase().replace(/^www\./, '');
+  // SSH-over-443 hosts serve the same repos as the main host.
+  if (host === 'ssh.github.com') host = 'github.com';
+  else if (host === 'altssh.gitlab.com') host = 'gitlab.com';
+  rest = rest.replace(/^\/+/, '');
+  if (host === 'ssh.dev.azure.com' || host === 'vs-ssh.visualstudio.com') {
+    host = 'dev.azure.com';
+    rest = rest.replace(/^v3\//i, '');
+  } else if (/^[^.]+\.visualstudio\.com$/.test(host)) {
+    rest = `${host.slice(0, host.indexOf('.'))}/${rest.replace(/^DefaultCollection\//i, '')}`;
+    host = 'dev.azure.com';
+  }
+  // Azure's short form `<org>/_git/<repo>` names a repo in the project of the same name.
+  if (host === 'dev.azure.com') rest = rest.replace(/^([^/]+)\/_git\/([^/]+?)(?:\.git)?\/*$/i, '$1/$2/$2');
+  const joined = `${host}/${rest}`.replace(/\/_git\//g, '/');
+  return joined.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '').replace(/\/+$/, '').toLowerCase();
+}
+
 // Resolve a repo's origin remote with embedded credentials stripped, or null on any
 // failure (not a repo, no origin, git error). Never throws.
 export function resolveOriginRemote(gitImpl, dir) {

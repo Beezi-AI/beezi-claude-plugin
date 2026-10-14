@@ -146,6 +146,12 @@ export function stateDir() {
   return path.join(beeziHome(), 'state');
 }
 
+// Per-session workspace choice. Extension-less so transcript.mjs's `*.json` scan and checkpoint's
+// load-mutate-save of <id>.json never touch it; pruneStale sweeps it with the rest of state/.
+export function sessionWorkspaceFile(sessionId) {
+  return path.join(stateDir(), `${sessionId}.workspace`);
+}
+
 // Persisted known-repo-root map (dir→root resolution cache/seed). One JSON for the machine.
 export function repoMapFile() {
   return path.join(beeziHome(), 'repo-map.json');
@@ -154,8 +160,13 @@ export function repoMapFile() {
 // Durable "already imported" ledger for /beezi:import. Deliberately at the account dir ROOT and
 // not under state/ or queue/: pruneStale() deletes 14-day-old files in both of those, so a marker
 // living there would expire and make every old session look importable again on the next run.
-export function auditLedgerFile(key) {
-  return path.join(accountDir(key), 'audit-ledger.json');
+export function auditLedgerFile(key, tenantId = null) {
+  return path.join(accountDir(key), tenantId == null ? 'audit-ledger.json' : `audit-ledger.${tenantTag(tenantId)}.json`);
+}
+
+// File-name-safe form of a tenant id, shared by per-tenant ledgers and queue copies.
+export function tenantTag(tenantId) {
+  return String(tenantId).replace(/[^A-Za-z0-9_-]/g, '_');
 }
 
 // Cached tenant tracking state (whoami's trackingMode/tier/backfillCompleted). At the account dir

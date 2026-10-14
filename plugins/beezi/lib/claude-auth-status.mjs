@@ -110,6 +110,24 @@ function contradictsProduct(account, cliType) {
   return true;
 }
 
+// The organization half of the merge: the PROFILE's, like accountUuid beside it, and the CLI's orgId
+// only when the profile names none. One field, read the same way everywhere, is the point — the
+// session stamp (identity-stamp.mjs) and the reconcile's switch precheck (identityChanged against
+// readClaudeAccount) both read oauthAccount.organizationUuid, so a record stored from a different
+// field would split one subscription across two server-side keys if the two ever disagreed in
+// form, and would read as a switch on every session start. The CLI's orgName is not read: its
+// labels are whitespace-free by contract (pickLabel), and an org name is prose.
+function resolveOrganization(status, account) {
+  const profileUuid = account == null || account.organizationUuid == null ? null : account.organizationUuid;
+  if (profileUuid != null) {
+    return {
+      organizationUuid: profileUuid,
+      organizationName: account.organizationName == null ? null : account.organizationName,
+    };
+  }
+  return { organizationUuid: status.orgId == null ? null : status.orgId, organizationName: null };
+}
+
 // Layered subscription resolution, shaped like readClaudeAccount()'s result so every existing
 // consumer works unmodified. subscriptionType comes from the CLI when it answers (fresh by
 // construction); the Max multiplier lives only in oauthAccount's rateLimitTier.
@@ -187,6 +205,8 @@ export function resolveClaudeSubscription(deps = {}) {
       billingType: null,
       seatTier: null,
       organizationType: null,
+      organizationUuid: null,
+      organizationName: null,
       // Distinct from "not captured yet": we asked, and the answer was that nothing local can
       // name this credential's plan. Only the server, from the key row, can.
       planSource: 'unresolved',
@@ -220,6 +240,9 @@ export function resolveClaudeSubscription(deps = {}) {
     billingType: trustProfile ? account.billingType : null,
     seatTier: trustProfile ? account.seatTier : null,
     organizationType: trustProfile ? account.organizationType : null,
+    // Which subscription of the login is in force. See resolveOrganization for why the profile
+    // answers first here, unlike the email.
+    ...resolveOrganization(status, account),
     detectedVia: trustProfile ? 'merged' : 'cli_status',
     anchor: buildAnchor(status, fileAnchor, tokenAnchor),
   };

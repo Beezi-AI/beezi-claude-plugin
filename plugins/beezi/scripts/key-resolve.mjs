@@ -19,10 +19,12 @@ import { reconcileBillingConfig } from '../lib/billing-capture.mjs';
 import { syncAccountIfNeeded } from '../lib/account-sync.mjs';
 import { clearOauthKeyStatus } from '../lib/oauth-key-status.mjs';
 import { UserError, friendlyMessage } from '../lib/friendly-error.mjs';
+import { parseCommandTargets, parseCommandReadTenant, parseTenantFlags, tenantById, isMultiTenant, resolveTargets, currentSessionWorkspace } from '../lib/workspace.mjs';
 
-// Thin entrypoint for the interactive key-resolution flow in /beezi:refresh.
+// Thin entrypoint for the interactive key-resolution flow in /beezi:settings refresh.
 //
-// `status` prints exactly ONE JSON object on stdout — on every path, including the failures. The
+// `status` prints exactly ONE JSON object on stdout — on every path, including the failures (a
+// malformed flag such as a bad or repeated --tenant is a usage error and prints ✗ on stderr). The
 // model parses it and turns selectablePlans / subscriptions into AskUserQuestion options, so a
 // human sentence printed to stdout instead would break the parse; the sentence rides inside the
 // object's `message` instead. The two write subcommands are for a human to read and print one
@@ -65,10 +67,6 @@ export function parseArgs(argv) {
   return out;
 }
 
-function emit(object) {
-  console.log(JSON.stringify(object));
-}
-
 // The env every call in this file is judged by, in the three places a setup token can live:
 //
 //   1. process.env — where it is in a session Claude Code did not scrub it out of.
@@ -88,7 +86,10 @@ function emit(object) {
 // re-derives the fingerprint from the env it is given, so a recovery that reached only `status`
 // would strand the user's answer on the very next invocation.
 
-async function runStatus(token, env, auth) {
+// `checkIn` is false when the status workspace is not one this session sends to: no recovery write there.
+// `workspace` (multi-workspace accounts only) names the workspace read from on every answer.
+async function runStatus(token, env, auth, checkIn, workspace) {
+  const emit = (object) => console.log(JSON.stringify(workspace == null ? object : { ...object, workspace }));
   if (!token) {
     // `not_linked` is a verdict about the machine and the model turns it into "run /beezi:login".
     // It may only be said when the store actually answered "there is nothing here". A store that
@@ -107,7 +108,7 @@ async function runStatus(token, env, auth) {
         authState: auth.authState,
         authReason: auth.reason,
         message: 'Beezi: this machine is linked, but its saved login could not be read just now. '
-          + 'Nothing was removed — try /beezi:refresh again in a moment.',
+          + 'Nothing was removed — try /beezi:settings refresh again in a moment.',
       });
     return;
   }
@@ -152,7 +153,7 @@ async function runStatus(token, env, auth) {
   // ask again rather than telling the user to come back next session — the whole point of them
   // typing this command is that they want it settled now. `force` skips the unchanged-payload gate,
   // which would otherwise send nothing at all on a machine whose payload has not moved.
-  if (payload != null && payload.status === 'unknown_key') {
+  if (payload != null && payload.status === 'unknown_key' && checkIn) {
     try {
       await syncAccountIfNeeded(token, { force: true, via: 'refresh' }, { env });
       const reprobed = await fetchKeyResolution(token, { env });
@@ -183,42 +184,85 @@ async function runStatus(token, env, auth) {
   if (resolved != null) recordResolvedKeyData(resolved);
 }
 
+// This session's send targets; [null] for one or unknown workspaces.
+function sessionTargets(row) {
+  return isMultiTenant(row) ? resolveTargets(row, currentSessionWorkspace()).targets : [null];
+}
+
+function tenantLabel(row, tenantId) {
+  const t = tenantById(row, tenantId);
+  return t != null && t.name ? t.name : tenantId;
+}
+
 async function main() {
   const { account: selected, rest } = await parseAccountFlag(process.argv.slice(2));
   const account = selected || await getDefaultKey();
   const row = account ? await getAccount(account) : null;
-  const parsed = parseArgs(rest);
+  const parsed = parseArgs(parseTenantFlags(rest, row).argv);
+  let tenantIds;
+  if (parsed.mode === 'status') {
+    // `status` reads one workspace: the session's read workspace, never a guess among several targets.
+    tenantIds = [parseCommandReadTenant(rest, row).tenantId];
+  } else {
+    // Key resolution is account-level, so a session that sends nowhere still finishes it in the read workspace.
+    try {
+      tenantIds = parseCommandTargets(rest, row).tenantIds;
+    } catch (error) {
+      if (error == null || error.workspaceRequired !== true) throw error;
+      tenantIds = [parseCommandReadTenant(rest, row).tenantId];
+    }
+  }
   const auth = await getAuthentication({}, { account, waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
-  const token = auth != null && auth.authState === AUTH_STATES.READY ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId) } : null;
+  const tokenFor = (tenantId) => (auth != null && auth.authState === AUTH_STATES.READY ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId), tenantId } : null);
   const env = oauthTokenEnvWithOsProbe(process.env);
 
   if (parsed.mode === 'status') {
-    await runStatus(token, env, auth);
+    const workspace = isMultiTenant(row) ? tenantLabel(row, tenantIds[0]) : null;
+    await runStatus(tokenFor(tenantIds[0]), env, auth, sessionTargets(row).indexOf(tenantIds[0]) !== -1, workspace);
     return;
   }
+
+  // Submitted to every target workspace; local state is recorded on the first acceptance and refusals are reported after.
+  const several = tenantIds.length > 1;
+  const named = (tenantId, line) => (several ? `${tenantLabel(row, tenantId)}: ${line}` : line);
+  const failures = [];
 
   if (parsed.mode === 'plan') {
-    const result = await submitKeyPlan(token, parsed.plan, { env });
-    // The server's own wording where it gave one — the user is about to act on it.
-    if (!result.ok) throw new UserError(result.message);
-    recordResolvedKeyPlan(submittedPlanFrom(result));
-    // The cached verdict predates this answer and still says the key needs attention. Left in
-    // place it would nudge the user, for up to six hours, to do what they just did.
-    clearOauthKeyStatus(account);
-    console.log(`✓ Beezi: this key’s subscription is now recorded as ${result.subscriptionPlan}.`);
+    let accepted = null;
+    for (const tenantId of tenantIds) {
+      const result = await submitKeyPlan(tokenFor(tenantId), parsed.plan, { env });
+      // The server's own wording where it gave one — the user is about to act on it.
+      if (!result.ok) { failures.push(named(tenantId, result.message)); continue; }
+      if (accepted == null) {
+        accepted = result;
+        recordResolvedKeyPlan(submittedPlanFrom(result));
+        // The cached verdict predates this answer and still says the key needs attention. Left in
+        // place it would nudge the user, for up to six hours, to do what they just did.
+        clearOauthKeyStatus(account);
+      }
+    }
+    if (accepted != null) console.log(`✓ Beezi: this key’s subscription is now recorded as ${accepted.subscriptionPlan}.`);
+    if (failures.length > 0) throw new UserError(failures.join('\n'));
     return;
   }
 
-  const result = await submitKeyLink(token, parsed.target, { env });
-  if (!result.ok) throw new UserError(result.message);
-  // Only when the server named the plan of the subscription this key joined. A server that does not
-  // send one leaves submittedPlanFrom null and nothing is written — a link is not a plan, and
-  // inventing one would put a tier nobody stated into every report. The next session's adoption
-  // fills it from the resolution instead.
-  recordResolvedKeyPlan(submittedPlanFrom(result));
-  // Same reason as the plan path: the cached verdict is about the world before this link.
-  clearOauthKeyStatus(account);
-  console.log(formatLinkOutcome(result));
+  let linked = false;
+  for (const tenantId of tenantIds) {
+    const result = await submitKeyLink(tokenFor(tenantId), parsed.target, { env });
+    if (!result.ok) { failures.push(named(tenantId, result.message)); continue; }
+    if (!linked) {
+      linked = true;
+      // Only when the server named the plan of the subscription this key joined. A server that does not
+      // send one leaves submittedPlanFrom null and nothing is written — a link is not a plan, and
+      // inventing one would put a tier nobody stated into every report. The next session's adoption
+      // fills it from the resolution instead.
+      recordResolvedKeyPlan(submittedPlanFrom(result));
+      // Same reason as the plan path: the cached verdict is about the world before this link.
+      clearOauthKeyStatus(account);
+    }
+    console.log(named(tenantId, formatLinkOutcome(result)));
+  }
+  if (failures.length > 0) throw new UserError(failures.join('\n'));
 }
 
 main().catch((error) => {

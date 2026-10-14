@@ -91,10 +91,13 @@ function sendOnce(url, method, headers, body, signal) {
     // Transfer-Encoding: chunked, which some proxies/gateways reject or mishandle.
     // Built fresh per hop (not stored on the caller's `headers`) so a 303's dropped
     // body doesn't leave a stale Content-Length on the follow-up GET.
-    const payload = body !== undefined ? String(body) : undefined;
+    // A Buffer or Uint8Array body (gzip) goes out as raw bytes; anything else as its string form.
+    let payload;
+    if (body instanceof Uint8Array) payload = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    else if (body !== undefined) payload = String(body);
     const requestHeaders = { ...headers };
     if (payload !== undefined && !hasHeader(requestHeaders, 'content-length')) {
-      requestHeaders['Content-Length'] = String(Buffer.byteLength(payload));
+      requestHeaders['Content-Length'] = String(typeof payload === 'string' ? Buffer.byteLength(payload) : payload.length);
     }
 
     const transport = transportFor(url);

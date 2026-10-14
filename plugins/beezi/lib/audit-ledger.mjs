@@ -15,8 +15,8 @@ const LEDGER_VERSION = 1;
 // binds to the login that wrote it: a ledger recorded under another identity is discarded, or a
 // logout→login into a different workspace would replay it, find zero candidates, and seal the
 // new tenant's pull EMPTY (there is no reopen).
-export function loadLedger(key, identity = null) {
-  const raw = readJson(auditLedgerFile(key), null);
+export function loadLedger(key, identity = null, tenantId = null) {
+  const raw = readJson(auditLedgerFile(key, tenantId), null);
   // A ledger from a future/foreign shape is discarded rather than merged: re-sending is
   // idempotent server-side, whereas trusting an unknown shape is not.
   if (!raw || raw.version !== LEDGER_VERSION || typeof raw.sessions !== 'object' || raw.sessions === null) {
@@ -88,6 +88,6 @@ export function wasUnreadable(ledger, sessionId) {
 
 // 0600 — the ledger records which projects the user worked on, by session id only, but the file
 // lives alongside the account's credential store and follows the same rule.
-export function saveLedger(key, ledger) {
-  writeJsonSecure(auditLedgerFile(key), ledger);
+export function saveLedger(key, ledger, tenantId = null) {
+  writeJsonSecure(auditLedgerFile(key, tenantId), ledger);
 }

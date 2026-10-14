@@ -7,6 +7,10 @@ function toSession(row, token) {
     email: row.email == null ? null : row.email,
     name: row.name == null ? null : row.name,
     tenantName: row.tenantName == null ? null : row.tenantName,
+    tenants: Array.isArray(row.tenants) ? row.tenants : null,
+    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+    tenantId: null,
     token,
     clientId: row.clientId == null ? null : row.clientId,
   };

@@ -209,7 +209,7 @@ export async function flushDiagnostics(deps = {}) {
 
   while (pending.length > 0 && result.requests < MAX_REQUESTS_PER_RUN) {
     // Immediately before transmission, not once per worker: a run makes up to MAX_REQUESTS_PER_RUN
-    // requests, and a user who types /beezi:telemetry off between two of them must not have the
+    // requests, and a user who types /beezi:settings telemetry off between two of them must not have the
     // rest sent anyway.
     if (!isTelemetryGranted()) {
       purgeAllDiagnostics();

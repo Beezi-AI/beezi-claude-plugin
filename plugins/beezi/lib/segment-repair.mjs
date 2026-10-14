@@ -7,6 +7,7 @@ import { BackfillHalt, BackfillSessionStatus } from './audit-flush.mjs';
 import { readSyncState, isSegmentRepaired, markSegmentRepaired } from './cost-state-sync-state.mjs';
 import { readTrackingState, isTrackingDisabled } from './tracking.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
+import { isMultiTenant } from './workspace.mjs';
 
 // Retrying these cannot help: the workspace refuses uploads for good, so the repair stops asking.
 const FINAL_HALTS = [BackfillHalt.NOT_ALLOWED, BackfillHalt.ALREADY_COMPLETED];
@@ -63,6 +64,9 @@ async function repairAccount(session, deps, options) {
 
   // No identity to bind the ledger to means no way to tell this login's sessions from another's.
   if (session.token == null || session.clientId == null) return { repaired: false, reason: 'not-linked' };
+
+  // runAudit refuses a multi-workspace account without a workspace, so this repair could never progress; /beezi:sync repairs per workspace.
+  if (isMultiTenant(session)) { done(); return { repaired: true, candidates: 0, reason: 'multi-workspace' }; }
 
   const ledger = loadLedger(session.key, session.clientId);
   const suspects = new Set();

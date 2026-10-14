@@ -78,8 +78,30 @@ export async function probeIdentity(session, deps = {}) {
       tenantTier: body.tenantTier == null ? null : body.tenantTier,
       trackingMode: body.trackingMode == null ? null : body.trackingMode,
       backfillCompleted: body.backfillCompleted === true,
+      tenants: parseTenants(body.tenants),
     },
   };
+}
+
+// Server-supplied names reach model-read lines, so control characters and line breaks collapse to one space.
+function oneLine(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+  return text === '' ? null : text;
+}
+
+// Absent list → null (unknown, old server), never []; entries without a string id are dropped.
+function parseTenants(raw) {
+  if (!Array.isArray(raw)) return null;
+  return raw
+    .filter((t) => t != null && typeof t.id === 'string')
+    .map((t) => ({
+      id: t.id,
+      name: oneLine(t.name),
+      role: oneLine(t.role),
+      type: oneLine(t.type),
+      joinedAt: typeof t.joinedAt === 'string' && Number.isFinite(Date.parse(t.joinedAt)) ? t.joinedAt : null,
+    }));
 }
 
 // Compatibility shape for the many callers that only ask "is this token good": { valid: true,
