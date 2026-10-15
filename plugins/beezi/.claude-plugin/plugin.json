@@ -1,10 +1,17 @@
 {
   "name": "beezi",
   "version": "0.37.9",
-  "description": "Reports Claude Code session token analytics for Beezi task branches and gives you a personal usage summary on demand.",
+  "description": "Reports Claude Code session usage and cost to Beezi, and shows a personal usage summary on demand.",
   "author": {
-    "name": "Beezi"
+    "name": "Beezi",
+    "url": "https://beezi.ai"
   },
+  "homepage": "https://beezi.ai",
+  "repository": "https://github.com/Beezi-AI/beezi-claude-plugin",
+  "documentationUrl": "https://docs.beezi.ai/coding-tool/beezi-claude-plugin",
+  "supportUrl": "https://beezi.ai/contact-us",
+  "privacyPolicyUrl": "https://beezi.ai/privacy-policy",
+  "termsOfServiceUrl": "https://beezi.ai/terms-and-conditions",
   "license": "Apache-2.0",
   "icon": "./assets/beezi_logo.svg"
 }
