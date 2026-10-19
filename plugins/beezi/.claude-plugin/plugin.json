@@ -1,6 +1,6 @@
 {
   "name": "beezi",
-  "version": "0.37.9",
+  "version": "0.37.11",
   "description": "Reports Claude Code session usage and cost to Beezi, and shows a personal usage summary on demand.",
   "author": {
     "name": "Beezi",

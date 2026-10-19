@@ -5,7 +5,7 @@ import { ENV_API_BASE, ENV_UPDATE_MANIFEST_URL } from './paths.mjs';
 export function apiBase() {
   if (process.env.BEEZI_API_URL != null) return process.env.BEEZI_API_URL;
   if (ENV_API_BASE != null) return ENV_API_BASE;
-  return "https://beezi-api-prod.azurewebsites.net/api";
+  return "https://api.beezi.ai/api";
 }
 
 // Origin of the API host — the OAuth discovery documents are mounted at the

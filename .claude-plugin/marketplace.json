@@ -9,7 +9,7 @@
       "name": "beezi",
       "source": "./plugins/beezi",
       "description": "Reports Claude Code session usage and cost to Beezi, and shows a personal usage summary on demand.",
-      "version": "0.37.9",
+      "version": "0.37.11",
       "author": {
         "name": "Beezi"
       },
