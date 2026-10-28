@@ -58,7 +58,7 @@ export function finaleLines(options) {
   const head = options.columns >= WIDE_COLUMNS ? banner(agent, style) : [`  ${style.violet(3, '▰')} beezi × ${agent}`];
   return [''].concat(head, [
     '',
-    `  ${style.boldGreen('✔ Everything is set up. Happy hacking! =)')}`,
+    `  ${style.boldGreen('✓ Everything is set up. Happy hacking! =)')}`,
     `  Open ${agent} and keep working — restart it first if it was already open.`,
     `  ${style.dim(`🐝 ${fun}`)}`,
     '',

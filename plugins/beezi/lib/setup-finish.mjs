@@ -6,6 +6,9 @@ export const FINALIZE_NOTE = 'History import is now closed for this account: pas
 export const DEFAULT_UNCHANGED = 'The default account is unchanged. /beezi:settings account switches it later.';
 export const CRASH_QUESTION = 'How should Beezi crash reports work?';
 export const STATUS_LINE_QUESTION = "Show Beezi in Claude Code's status line?";
+export const UPLOAD_LABEL = 'Uploading past sessions…';
+// backfill.mjs prints this once per batch; the wizard shows it on the activity line instead.
+export const UPLOAD_PROGRESS = /^Beezi: (\d+)\/(\d+) sessions read…$/;
 const CRASH_OPTIONS = [
   { label: 'Correlate (recommended)', description: 'Crash reports with an installation ID, so support can find yours', mode: 'correlate' },
   { label: 'On', description: 'Crash reports without an installation ID', mode: 'on' },
@@ -14,7 +17,7 @@ const CRASH_OPTIONS = [
 ];
 
 export async function uploadHistory(ctx, key) {
-  const result = await ctx.run('backfill.mjs', ['--via', 'login', '--account', key], { stream: true });
+  const result = await ctx.run('backfill.mjs', ['--via', 'login', '--account', key], { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
   if (result.stdout.indexOf(FINALIZED) !== -1) ctx.print(FINALIZE_NOTE);
 }
 

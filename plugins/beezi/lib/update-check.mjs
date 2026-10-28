@@ -118,7 +118,7 @@ export function composeNudge(local, record) {
 }
 
 // The two terminal commands that update this plugin, in order — shared by the SessionStart nudge
-// and /beezi:about so both always name the same steps. null when there is no marketplace to name.
+// and /beezi:status so both always name the same steps. null when there is no marketplace to name.
 export function updateCommands(pluginName, marketplaceName) {
   if (!marketplaceName) return null;
   return [
@@ -127,7 +127,7 @@ export function updateCommands(pluginName, marketplaceName) {
   ];
 }
 
-// The newest published reading, asked for on demand (/beezi:about) rather than at session start:
+// The newest published reading, asked for on demand (/beezi:status) rather than at session start:
 // always fetched fresh, because the user is asking right now. When the fetch fails, the last cached
 // reading for this plugin name stands in, flagged `stale` so the caller can say how old it is.
 // { local, record, stale } — `record` is null when there is neither. Never throws.

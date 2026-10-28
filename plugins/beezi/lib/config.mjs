@@ -52,6 +52,8 @@ export const ENDPOINTS = Object.freeze({
   // Vendor-generic on purpose (Codex reports here too): the server reads the vendor off the
   // X-Beezi-Agent header postJson already sends.
   accountSync: "/me/cli-agent/account",
+  // Full snapshot of the Claude Code plugins enabled on this machine; the server soft-removes the rest.
+  pluginsSync: "/me/claude-code/plugins",
   // Read-only twin of accountSync: what the portal knows about this machine's setup token, so the
   // session-start hook can say when its usage is landing unpriced.
   credentialStatus: "/me/cli-agent/credential-status",

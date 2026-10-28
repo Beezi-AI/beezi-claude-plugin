@@ -50,7 +50,12 @@ import {
 import { oauthTokenEnvWithOsProbe } from './claude-settings-env.mjs';
 import { hasBeenAsked, markAsked, markCorrelationAsked, correlationPrompt } from './telemetry-consent.mjs';
 import { checkForUpdate as _checkForUpdate } from './update-check.mjs';
-import { readSessionWorkspace, resolveReadTenant, expandTargets, isMultiTenant, tenantById } from './workspace.mjs';
+import { readSessionWorkspace, resolveReadTenant, expandTargets, isMultiTenant, tenantById, tenantsOf } from './workspace.mjs';
+import { placeOfDir, routeOfSession } from './route-describe.mjs';
+import { buildBanner, liveOffNote } from './session-banner.mjs';
+
+// Only a new session or /clear asks about a place with no rule (workspace-prompt's ASK_SOURCES).
+const ASK_SOURCES = ['startup', 'clear'];
 
 // Tests (and only tests) inject a bare `getAccessToken`. Map its two answers onto the typed
 // shape so the hook has exactly one code path: a token is ready, no token is unlinked, and a
@@ -141,6 +146,14 @@ export function discoverRepos(cwd, gitImpl, map, deps = {}) {
   return { map, dirty };
 }
 
+// The type of the workspace a target sends to ('analytics', a platform type, or null when unknown).
+function workspaceType(session) {
+  const tenants = tenantsOf(session);
+  const t = session.tenantId != null ? tenantById(session, session.tenantId) : (tenants != null && tenants.length === 1 ? tenants[0] : null);
+  return t == null || t.type == null ? null : t.type;
+}
+
+// { connected, line } for a platform workspace's repo, or null (not a repo, offline).
 async function announceRepo(cwd, session, fetchImpl, gitImpl) {
   const remote = resolveOriginRemote(gitImpl, cwd);
   if (!remote) return null; // not a git repo — silent
@@ -152,10 +165,27 @@ async function announceRepo(cwd, session, fetchImpl, gitImpl) {
     });
     if (!res.ok) return null;
     const { connected, projectName } = await res.json();
-    return connected
-      ? `Beezi: repo connected${projectName ? ` to "${projectName}"` : ''}. Task-branch sessions will be tracked.`
-      : 'Beezi: this repo is not connected to Beezi. No analytics tracked here.';
+    return {
+      connected: Boolean(connected),
+      line: connected
+        ? `Beezi: repo connected${projectName ? ` to "${projectName}"` : ''}. Task-branch sessions will be tracked.`
+        : 'Beezi: this repo is not connected to Beezi. No analytics tracked here.',
+    };
   } catch { return null; } // offline — silent
+}
+
+// The banner for the signed-in accounts; `noted` the keys whose route line already says live tracking is off,
+// `covered` the unconnected keys its route line speaks for.
+function sessionBanner(input, sessions, { workspaceState, trackingByKey, unconnected }) {
+  // The hook's own cwd only: an unknown one gets no route line.
+  const place = typeof input.cwd === 'string' && input.cwd !== '' ? placeOfDir(input.cwd) : null;
+  const asking = input.source == null || ASK_SOURCES.indexOf(input.source) !== -1;
+  const text = buildBanner({ sessions, state: workspaceState, place, trackingByKey, asking, unconnected });
+  const shown = text != null && place != null;
+  const noted = new Set(!shown ? [] : sessions
+    .filter((s) => !unconnected.has(s.key) && liveOffNote(s, trackingByKey.get(s.key), routeOfSession(s, workspaceState, place)) != null)
+    .map((s) => s.key));
+  return { text, noted, covered: shown ? unconnected : new Set() };
 }
 
 // The portal's verdict on the token, kept at full resolution. 401 is a verdict on the
@@ -308,11 +338,17 @@ export async function runSessionStart(input, deps = {}) {
   const [, announcements] = await Promise.all([
     Promise.all(sessions.map((s) => flushQueue(s, { fetchImpl }))),
     Promise.all(targetSessions.map(async (s) => {
-      const line = await announceRepo(input.cwd, s, fetchImpl, gitImpl);
-      return line == null ? null : line.replace('Beezi:', `${targetLabel(s)}:`);
+      // An analytics workspace answers connected for every repo, so its line says nothing; the banner says where analytics go.
+      if (workspaceType(s) === 'analytics') return null;
+      const repo = await announceRepo(input.cwd, s, fetchImpl, gitImpl);
+      return repo == null ? null : { key: s.key, connected: repo.connected, line: repo.line.replace('Beezi:', `${targetLabel(s)}:`) };
     })),
   ]);
-  const systemMessage = [...warnings, ...announcements.filter(Boolean), restartNotice].filter(Boolean).join('\n') || null;
+  // An account whose every target answered "not connected" tracks nothing here.
+  const unconnected = new Set(sessions.map((s) => s.key).filter((key) => {
+    const mine = announcements.filter((a, i) => targetSessions[i].key === key);
+    return mine.length > 0 && mine.every((a) => a != null && a.connected === false);
+  }));
   try { pruneStale(); } catch { /* best-effort */ }
 
   // Pre-warm + self-heal the repo-map: discover this session's repo(s) and drop dead roots.
@@ -322,6 +358,16 @@ export async function runSessionStart(input, deps = {}) {
     const removed = pruneRepoMap(map);
     if (dirty || removed > 0) saveRepoMap(map);
   } catch { /* best-effort */ }
+
+  const defaultKey = await (deps.getDefaultKey == null ? getDefaultKey : deps.getDefaultKey)(deps).catch(() => null);
+  // Built after the pre-warm so placeOfDir reads the warmed repo map.
+  let banner = { text: null, noted: new Set(), covered: new Set() };
+  if (input.source !== 'compact') {
+    try { banner = sessionBanner(input, sessions, { workspaceState, trackingByKey, unconnected }); } catch { /* best-effort */ }
+  }
+  // The banner's route line already says an unconnected repo tracks nothing.
+  const repoLines = announcements.filter((a) => a != null && !(a.connected === false && banner.covered.has(a.key))).map((a) => a.line);
+  const systemMessage = [...warnings, banner.text, ...repoLines, restartNotice].filter(Boolean).join('\n') || null;
 
   // Reconcile billing.json against reality: realign the source to the env (the user may have
   // switched auth method since the last session), and re-capture the plan when the record is
@@ -425,7 +471,6 @@ export async function runSessionStart(input, deps = {}) {
     //
     // Answered from a cached verdict, so the steady state is one file read. A null answer means the
     // question could not be asked, which is not the same as "unresolved" and says nothing.
-    const defaultKey = await (deps.getDefaultKey == null ? getDefaultKey : deps.getDefaultKey)(deps).catch(() => null);
     // Billing is machine-wide: tenant-specific key answers must not race to rewrite it.
     const billingAccountKey = defaultKey;
     await Promise.all(keyStatusSessions.map(async (session) => {
@@ -526,7 +571,15 @@ ${nudge}` : nudge;
     const tracking = trackingByKey.get(session.key);
   const mode = tracking == null || tracking.trackingMode == null ? null : tracking.trackingMode;
   let policy = null;
-  if (mode === TrackingMode.BACKFILL_ONLY) {
+  // The banner's route line already said live tracking is off: only the action is left to say.
+  const noted = banner.noted.has(session.key);
+  if (mode === TrackingMode.BACKFILL_ONLY && noted) {
+    policy = shouldBackfill(tracking)
+      ? 'Beezi: run /beezi:login to upload your session history, or upgrade your workspace plan to track new sessions.'
+      : 'Beezi: upgrade your workspace plan to track new sessions.';
+  } else if (mode === TrackingMode.DISABLED && noted) {
+    policy = null;
+  } else if (mode === TrackingMode.BACKFILL_ONLY) {
     policy = shouldBackfill(tracking)
       ? 'Beezi: audit mode — new sessions are not tracked. Run /beezi:login to upload your session history, or upgrade your workspace plan to track new sessions.'
       : 'Beezi: audit mode — new sessions are not tracked. Upgrade your workspace plan to start tracking them.';

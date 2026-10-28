@@ -6,6 +6,7 @@ import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { maybeSpawnCoworkLive } from '../lib/cowork-live.mjs';
 import { usesRules } from '../lib/workspace-rules.mjs';
 import { startHistoryWorker } from '../lib/history-trigger.mjs';
+import { joined as printJoined, routes as printRoutes } from './workspace.mjs';
 
 // /beezi:sync — uploads every past session this machine still has on disk, skipping whatever Beezi
 // already holds. Unlike the one-time import at the end of /beezi:login, this is repeatable: it asks
@@ -232,8 +233,38 @@ function routeSummary(row, plan) {
   return clauses.length === 0 ? null : `Beezi (${describeAccount(row)}): ${clauses.join('; ')}.`;
 }
 
+const REVIEW_FLAGS = ['--review', '--review-routes'];
+
+// One listing as a block; a failed one prints its ✗ line there and asks nothing, so the upload still runs.
+async function listing(tag, print) {
+  console.log(`<${tag}>`);
+  let total = 0;
+  try {
+    total = await print();
+  } catch (error) {
+    console.log(`✗ ${friendlyMessage(error)}`);
+  }
+  console.log(`</${tag}>`);
+  return total;
+}
+
+// /beezi:sync Step 1 in the same call: --review lists new workspaces, then repos and folders with no rule
+// (--review-routes starts at the second), each as a <joined>/<routes> block; true when neither asks anything.
+async function review(flag, account) {
+  const argv = account == null ? [] : ['--account', account];
+  const flags = { deferUpload: true };
+  if (flag === '--review' && await listing('joined', () => printJoined(argv, flags)) > 0) return false;
+  return await listing('routes', () => printRoutes(argv, flags)) === 0;
+}
+
+// False when --review stopped before the upload for a question.
 async function main() {
-  const { account, rest } = await parseAccountFlag(process.argv.slice(2));
+  const args = process.argv.slice(2);
+  const reviewFlags = args.filter((arg) => REVIEW_FLAGS.indexOf(arg) !== -1);
+  if (reviewFlags.length > 1) fail('Beezi: pass --review or --review-routes, not both.');
+  const reviewFlag = reviewFlags[0];
+  const { account, rest } = await parseAccountFlag(args.filter((arg) => REVIEW_FLAGS.indexOf(arg) === -1));
+  if (reviewFlag != null && !(await review(reviewFlag, account))) return false;
   const rows = account != null
     ? [(await getAccount(account)) || { key: account }]
     : (await listAccounts()).filter((a) => a.status === AccountStatus.LINKED);
@@ -289,6 +320,6 @@ async function main() {
   if (!options.dryRun) for (const row of rows) await startHistoryWorker(row.key);
 }
 
-main().then(() => {
-  if (!process.argv.includes('--dry-run')) maybeSpawnCoworkLive();
+main().then((uploaded) => {
+  if (uploaded !== false && !process.argv.includes('--dry-run')) maybeSpawnCoworkLive();
 }).catch((error) => fail(friendlyMessage(error)));

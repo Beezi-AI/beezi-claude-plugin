@@ -1,6 +1,6 @@
 {
   "name": "beezi",
-  "version": "0.37.11",
+  "version": "0.40.1",
   "private": true,
   "type": "module",
   "description": "Beezi analytics plugin for Claude Code.",

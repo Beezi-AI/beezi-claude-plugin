@@ -42,6 +42,20 @@ export function parseNumbers(answer, count) {
   return picked;
 }
 
+// Unticks a picked row; else ticks an exclusive row alone, or any other row with the exclusive rows cleared.
+export function togglePick(picked, i, exclusive) {
+  if (picked.indexOf(i) !== -1) return picked.filter((p) => p !== i);
+  if (exclusive.indexOf(i) !== -1) return [i];
+  return picked.filter((p) => exclusive.indexOf(p) === -1).concat(i);
+}
+
+// First exclusive row picked together with another row, else -1.
+export function mixedExclusive(picked, exclusive) {
+  if (picked.length < 2) return -1;
+  const found = picked.filter((p) => exclusive.indexOf(p) !== -1);
+  return found.length > 0 ? found[0] : -1;
+}
+
 // Numbered option rows with the default mark and the descriptions dimmed.
 function styledOptions(options, defaultIndex, style) {
   return options.map((option, i) => {
@@ -201,7 +215,7 @@ export function createPrompt(io) {
         output.write(SHOW_CURSOR);
       }
       function finish(value, answer) {
-        output.write(`${erase(drawn)}${style.green('✔')} ${style.bold(question)} ${answer}\n`);
+        output.write(`${erase(drawn)}${style.green('✓')} ${style.bold(question)} ${answer}\n`);
         stop();
         resolve(value);
       }
@@ -277,15 +291,11 @@ export function createPrompt(io) {
     });
   }
 
-  function keyChooseMany(question, options) {
+  function keyChooseMany(question, options, exclusive) {
     let cursor = 0;
     let run = '';
-    const picked = [];
-    const toggle = (i) => {
-      const at = picked.indexOf(i);
-      if (at === -1) picked.push(i);
-      else picked.splice(at, 1);
-    };
+    let before = [];
+    let picked = [];
     return keyQuestion(question, () => menuRows(question, options, cursor, picked, HINT_MANY), (str, key, finish) => {
       if (isSubmit(key)) {
         const chosen = picked.slice().sort((a, b) => a - b);
@@ -298,17 +308,16 @@ export function createPrompt(io) {
         return false;
       }
       if (isDigit(str)) {
-        const previous = run === '' ? -1 : Number(run) - 1;
         run = nextRun(run, str, options.length);
         if (run === '') return false;
-        // A longer run undoes the toggle its shorter prefix applied.
-        if (run.length > 1) toggle(previous);
-        toggle(Number(run) - 1);
+        // A fresh run remembers the ticks before it; a longer run starts over from them, so it undoes its prefix's toggle and clearing.
+        if (run.length === 1) before = picked.slice();
+        picked = togglePick(before, Number(run) - 1, exclusive);
         return true;
       }
       run = '';
       if (key.name === 'space') {
-        toggle(cursor);
+        picked = togglePick(picked, cursor, exclusive);
         return true;
       }
       const next = step(str, key, cursor, options.length);
@@ -358,17 +367,22 @@ export function createPrompt(io) {
     }
   }
 
-  async function chooseMany(question, options) {
+  async function chooseMany(question, options, opts) {
     if (closed) return null;
     if (options.length === 0) return [];
-    if (fitsScreen(options.length + 2) && rawOn()) return keyChooseMany(question, options);
+    const exclusive = opts && Array.isArray(opts.exclusive) ? opts.exclusive : [];
+    if (fitsScreen(options.length + 2) && rawOn()) return keyChooseMany(question, options, exclusive);
     showMenu(question, options, -1);
     for (;;) {
-      const answer = await ask(`${style.boldCyan('Choose one or more (for example 1,3), or press Enter to skip:')} `);
+      const answer = await ask(`${style.boldCyan('Choose one or more (for example 1,2), or press Enter to skip:')} `);
       if (answer === null) return null;
       const picked = parseNumbers(answer, options.length);
-      if (picked !== null) return picked;
-      output.write(`${style.yellow(`Enter numbers from 1 to ${options.length}, separated by commas.`)}\n`);
+      const mixed = picked === null ? -1 : mixedExclusive(picked, exclusive);
+      if (picked !== null && mixed === -1) return picked;
+      const warning = picked === null
+        ? `Enter numbers from 1 to ${options.length}, separated by commas.`
+        : `"${options[mixed].label}" can't be combined with other choices.`;
+      output.write(`${style.yellow(warning)}\n`);
     }
   }
 

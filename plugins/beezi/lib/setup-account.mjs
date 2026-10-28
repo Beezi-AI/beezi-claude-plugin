@@ -3,6 +3,7 @@ import { lastLine, outputLines, report, token } from './setup-routing.mjs';
 export const ACCOUNT_QUESTION = 'This machine is already linked to Beezi. Which account should setup use?';
 export const NETWORK_ERRORS = ['Could not reach the Beezi server', 'The login server took too long'];
 export const STILL_READS = '/beezi:analytics still reads from';
+export const SIGN_IN_LABEL = 'Waiting for you to sign in in your browser…';
 const KEEP_ACCOUNT = 'Keep this account; no browser sign-in';
 const LINK_ANOTHER = { label: 'Link another account', description: 'Sign in through your browser' };
 const ACCOUNT_LINE = /^\d+\. (.+?)(?: \[([^\]]+)\])? key=(\S+)$/;
@@ -31,7 +32,7 @@ export function signInResult(result) {
 }
 
 export async function signIn(ctx) {
-  return signInResult(await ctx.run('login.mjs', [], { stream: true, hide: /^account=/ }));
+  return signInResult(await ctx.run('login.mjs', [], { stream: true, hide: /^account=/, label: SIGN_IN_LABEL }));
 }
 
 // A linked account the user picks, else a fresh sign-in; null stops setup.

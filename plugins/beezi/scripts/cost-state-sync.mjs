@@ -1,6 +1,7 @@
 import { runCostStateScan } from '../lib/cost-state-scan.mjs';
 import { runCoworkSync } from '../lib/cowork-sync.mjs';
 import { runSegmentRepair } from '../lib/segment-repair.mjs';
+import { runPluginsSync } from '../lib/plugins-sync.mjs';
 import { acquireLock, releaseLock } from '../lib/single-instance-lock.mjs';
 import { exitClean } from '../lib/shutdown.mjs';
 
@@ -48,6 +49,8 @@ async function main() {
   // Refused means another window's child is already scanning. Not an error — just leave.
   held = acquireLock(LOCK_NAME);
   if (!held) return;
+  // First, and fenced: one small request that must not be lost to a throw in the longer steps.
+  try { await runPluginsSync(); } catch { /* best-effort */ }
   await runCostStateScan();
   await runCoworkSync();
   // Last, so a long repair can never starve the hourly cost scan or the Cowork sync.

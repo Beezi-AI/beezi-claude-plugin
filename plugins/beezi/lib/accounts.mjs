@@ -19,6 +19,7 @@ import { migrateSingleAccountStore, CREDENTIAL_STATUS } from './credentials.mjs'
 import { markUpgradeNoticePending } from './auth-markers.mjs';
 import { UserError } from './friendly-error.mjs';
 import { rulesOf, outsideKey } from './workspace-rules.mjs';
+import { routingOf, sameRouting } from './rule-undo.mjs';
 import {
   ruleRequestIds, removalRequestIds, newFoldersSendIds, gainedIds, requestHistory, noteAttempt, settleHistory, takeResults, SettleState,
 } from './pending-history.mjs';
@@ -370,6 +371,22 @@ export function removeWorkspaceRule(key, n, deps = {}) {
     requestHistory(row, removalRequestIds(row), new Date().toISOString());
     writeIndex(index);
     return found;
+  });
+}
+
+// Puts `before` back as the row's rules and New folders when they still equal `expected`; 'restored', 'changed' or 'missing'.
+export function restoreRouting(key, { expected, before }, deps = {}) {
+  return withIndexLock(async () => {
+    const index = await readIndex(deps);
+    const row = index.accounts.find((a) => a.key === key);
+    if (!row || row.status !== AccountStatus.LINKED) return 'missing';
+    if (!sameRouting(routingOf(row), expected)) return 'changed';
+    row.workspaceRules = before.workspaceRules;
+    if (before.newFolders == null) delete row.newFolders; else row.newFolders = before.newFolders;
+    // Every workspace the restored rules or New folders reach is owed its history; over-requesting is harmless.
+    requestHistory(row, removalRequestIds(row), new Date().toISOString());
+    writeIndex(index);
+    return 'restored';
   });
 }
 

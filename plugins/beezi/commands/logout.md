@@ -3,10 +3,12 @@ description: Log out one or all Beezi accounts on this machine
 allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs:*), AskUserQuestion
 ---
 
-Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs --list` and show the accounts.
-If none are linked, stop. With one account, select it directly. With several, ask which
-account to log out, including an "All accounts" option. Use account names and workspaces
-as labels; the bracketed key is for the command only.
+Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/logout.mjs --list --single`. With one linked account it
+logs that account out in the same call: its output is the logout result, so report it verbatim
+and stop. With none linked it says so: stop. With several it prints them as a numbered list
+(`1. … [<key>]`) and logs nothing out: show the accounts and ask which account to log out,
+including an "All accounts" option. Use account names and workspaces as labels; the bracketed key
+is for the command only.
 
 If removing the default while any accounts remain, ask which remaining account should become
 the analytics default (when only one remains, use that key). Pass it as `--next-default`.

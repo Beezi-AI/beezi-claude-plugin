@@ -19,11 +19,13 @@ const LOGOUT_LOCK_WAIT_MS = 30_000;
 
 // Explicit logout, as lines. Never claims a server unlink it did not get, and never claims to
 // have logged out when the credentials are still there.
+// `list` with `single`: logs out the only linked account in the same call, and lists when there are several.
 export async function runLogout(deps = {}, options = {}) {
-  if (options.list) return logoutAccounts(deps, options);
+  const listOnly = options.list && !(options.single && (await readIndex(deps)).accounts.length === 1);
+  if (listOnly) return logoutAccounts(deps, options);
   const lifecycle = await acquireCredentialLock({ lifecycle: true, waitMs: deps.lockWaitMs == null ? 30_000 : deps.lockWaitMs }, deps);
   if (!lifecycle) throw new UserError('Another Beezi account change is in progress. Retry /beezi:logout in a moment.');
-  try { return await logoutAccounts(deps, options); }
+  try { return await logoutAccounts(deps, { ...options, list: false }); }
   finally { releaseCredentialLock(lifecycle); }
 }
 

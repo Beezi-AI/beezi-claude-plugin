@@ -1,8 +1,10 @@
 import os from 'os';
 import path from 'path';
 import {
-  AccountStatus, getDefaultKey, listAccounts, markTenantsReviewed, parseAccountFlag, removeWorkspaceRule, setNewFolders, setWorkspaceRule,
+  AccountStatus, getDefaultKey, listAccounts, markTenantsReviewed, parseAccountFlag, removeWorkspaceRule, restoreRouting, setNewFolders, setWorkspaceRule,
 } from '../lib/accounts.mjs';
+import { clearUndo, readUndo, recordUndo, routingOf } from '../lib/rule-undo.mjs';
+import { placeOfDir, routeOfDir } from '../lib/route-describe.mjs';
 import { resolveSessionId } from '../lib/permission-mode-store.mjs';
 import {
   findSessionWorkspaceByCwd,
@@ -30,6 +32,7 @@ import {
 import { canonicalRemote } from '../lib/git.mjs';
 import { normPath, pathHasPrefix } from '../lib/repo-map.mjs';
 import { listAllTranscripts } from '../lib/transcript-index.mjs';
+import { pastSessions } from '../lib/past-sessions.mjs';
 import { UserError, friendlyMessage } from '../lib/friendly-error.mjs';
 import { sessionFor } from '../lib/sessions.mjs';
 import { syncAccountIfNeeded } from '../lib/account-sync.mjs';
@@ -37,6 +40,7 @@ import { fetchOauthKeyStatus } from '../lib/oauth-key-status.mjs';
 import { recordResolvedKeyData } from '../lib/plan-writeback.mjs';
 import { oauthTokenEnvWithOsProbe } from '../lib/claude-settings-env.mjs';
 import { startHistoryWorker, takeDeferFlag } from '../lib/history-trigger.mjs';
+import { isEntryScript } from '../lib/entry-script.mjs';
 
 const USAGE = 'Usage: workspace.mjs rules [--table] [--session <id>] [--account <ref>]'
   + ' | rule add (--current | --repo <url> | --folder <path> | --outside) (<id|name|n>… | none) [--session <id>] [--account <ref>]'
@@ -45,12 +49,17 @@ const USAGE = 'Usage: workspace.mjs rules [--table] [--session <id>] [--account 
   + ' | rule add-all (<id|name|n>… | none) [--session <id>] [--account <ref>]'
   + ' | routes [--session <id>] [--account <ref>]'
   + ' | joined [add-all | done | pick (--repo <url> | --folder <path> | --outside) <id|name|n>] [--session <id>] [--account <ref>]'
-  + ' | new-folders [ask | send <id|name|n>… | none] [--session <id>] [--account <ref>]'
-  + ' | read <id|name|n> [--session <id>] [--account <ref>]';
+  + ' | new-folders [--history | ask | send <id|name|n>… | none] [--session <id>] [--account <ref>]'
+  + ' | read <id|name|n> [--session <id>] [--account <ref>]'
+  + ' | places [--session <id>] [--account <ref>]'
+  + ' | undo [--session <id>]';
 const NOT_LINKED = 'Beezi: this machine is not linked. Run /beezi:login to link an account.';
 const TARGET_FLAGS = ['--current', '--repo', '--folder', '--outside'];
 // Printed commands spell the script path out: tool output does not expand ${CLAUDE_PLUGIN_ROOT}.
 const SCRIPT = `node "${pluginRoot()}/scripts/workspace.mjs"`;
+const UNDO_HINT = ' Undo: /beezi:settings undo';
+// The folder picker offers at most this many places.
+const PICKER_PLACES = 3;
 
 const deferText = (flags) => (flags.deferUpload ? ' --defer-upload' : '');
 
@@ -144,10 +153,16 @@ function placeOf(key) {
   return key.kind === 'outside' ? 'sessions outside a project' : shortLabel(key);
 }
 
-function ruleDone(row, key, tenantIds, changed) {
-  const now = changed ? 'now ' : '';
-  if (tenantIds.length > 0) return `✓ Analytics for ${placeOf(key)} ${now}go to ${tenantNames(row, tenantIds)}.`;
-  return `✓ ${key.kind === 'outside' ? 'Sessions outside a project are' : `${placeOf(key)} is`} ${now}not tracked.`;
+// Where a write sends, in a confirmation line: "Acme and Northwind" or "not tracked".
+function targetWords(row, ids) {
+  return ids.length === 0 ? 'not tracked' : joinTenantNames(row, ids);
+}
+
+// Prints a write's confirmation as the first stdout line (the undo hint unless a flow defers) and records it as the change undo reverts.
+// `change` is the undo line's wording of it (default: the line without "✓ "), `was` a set's old target.
+function confirmChange(fresh, line, before, flags, { change = line.slice('✓ '.length), was = null } = {}) {
+  console.log(`${line}${flags.deferUpload ? '' : UNDO_HINT}`);
+  recordUndo({ account: fresh.key, summary: line.slice('✓ '.length), change, was, before, after: routingOf(fresh) });
 }
 
 function requireMulti(row) {
@@ -200,11 +215,13 @@ function refValues(refs) {
   return values;
 }
 
-// Ids/names/positions (comma lists too) in row order; `none` anywhere wins and means send nowhere.
+// Ids/names/positions (comma lists too) in row order; `none` alone means send nowhere, and none with a workspace is refused.
 function selection(row, refs) {
   const values = refValues(refs);
   if (values.length === 0) throw new UserError(USAGE);
-  if (values.some((v) => v.toLowerCase() === 'none')) return [];
+  const nones = values.filter((v) => v.toLowerCase() === 'none').length;
+  if (nones === values.length) return [];
+  if (nones > 0) throw new UserError('Pick workspaces or none, not both.');
   const picked = values.map((v) => resolveTenantRef(row, v));
   return tenantsOf(row).map((t) => t.id).filter((id) => picked.indexOf(id) !== -1);
 }
@@ -263,11 +280,23 @@ function labeled(key) {
   return key.kind === 'outside' ? shortLabel(key) : `${shortLabel(key)} (${key.label})`;
 }
 
-function printRulesTable(rows, dir, ctx) {
-  console.log(rulesTableLines(rows, dir, ctx).join('\n'));
+// The `here:` line: this directory's place, its rule, where it sends now (now=), its path, then the machine fields with match= last.
+export function hereLine(row, dir, ctx) {
+  const key = routeKeyForDir(dir, ctx);
+  if (key == null) return `here: none account=${row.key}`;
+  const rule = routeForDir(row, dir, ctx);
+  const now = routeOfDir(row, dir, ctx);
+  const place = key.kind === 'outside' ? null : placeOfDir(dir, ctx);
+  const where = place == null || place.path == null ? '' : ` path=${place.path}`;
+  const ruleText = rule == null ? 'no rule' : `R${rule.index}`;
+  return `here: ${labeled(key)} → ${ruleText} now=${now.reason.kind === 'pending' ? 'pending' : idList(now.ids)}${where} account=${row.key} rule=${rule == null ? 'none' : rule.index} kind=${key.kind} match=${key.match}`;
 }
 
-async function rules(argv) {
+function printRulesTable(rows, dir, ctx, sessionId) {
+  console.log(rulesTableLines(rows, dir, ctx, { liveSessionId: sessionId }).join('\n'));
+}
+
+export async function rules(argv) {
   const { session, rest: afterSession } = parseSessionFlag(argv);
   const { account, rest: afterAccount } = await parseAccountFlag(afterSession);
   const table = afterAccount.indexOf('--table') !== -1;
@@ -278,10 +307,11 @@ async function rules(argv) {
     console.log(NOT_LINKED);
     return;
   }
-  const dir = choiceDir(resolveSession(session).state);
+  const current = resolveSession(session);
+  const dir = choiceDir(current.state);
   const ctx = createRouteContext();
   if (table) {
-    printRulesTable(rows, dir, ctx);
+    printRulesTable(rows, dir, ctx, current.sessionId);
     return;
   }
   for (const row of rows) {
@@ -296,13 +326,7 @@ async function rules(argv) {
       for (const r of stored) {
         console.log(`R${r.index}. ${labeled(r)} → ${r.tenantIds.length === 0 ? 'not tracked' : 'tracked'} account=${row.key} rule=${r.index} kind=${r.kind} tenants=${idList(r.tenantIds)} match=${r.match}`);
       }
-      const key = routeKeyForDir(dir, ctx);
-      if (key == null) {
-        console.log(`here: none account=${row.key}`);
-        continue;
-      }
-      const route = routeForDir(row, dir, ctx);
-      console.log(`here: ${labeled(key)} → ${route == null ? 'no rule' : `R${route.index}`} account=${row.key} rule=${route == null ? 'none' : route.index} kind=${key.kind} match=${key.match}`);
+      console.log(hereLine(row, dir, ctx));
       continue;
     }
     const stored = rulesOf(row);
@@ -311,13 +335,7 @@ async function rules(argv) {
     for (const r of stored) {
       console.log(`R${r.index}. ${labeled(r)} → ${sendList(row, r.tenantIds)} account=${row.key} rule=${r.index} kind=${r.kind} tenants=${idList(r.tenantIds)} match=${r.match}`);
     }
-    const key = routeKeyForDir(dir, ctx);
-    if (key == null) {
-      console.log(`here: none account=${row.key}`);
-      continue;
-    }
-    const route = routeForDir(row, dir, ctx);
-    console.log(`here: ${labeled(key)} → ${route == null ? 'no rule' : `R${route.index}`} account=${row.key} rule=${route == null ? 'none' : route.index} kind=${key.kind} match=${key.match}`);
+    console.log(hereLine(row, dir, ctx));
   }
 }
 
@@ -380,9 +398,11 @@ async function ruleAdd(argv, flags = { deferUpload: false }) {
   const ctx = createRouteContext();
   const key = ruleKey(target, choiceDir(current.state), ctx);
   const tenantIds = selection(row, refs);
+  const before = routingOf(row);
   const n = (await setWorkspaceRule(row.key, { kind: key.kind, match: key.match, label: key.label, tenantIds })).index;
-  console.log(ruleDone(row, key, tenantIds, false));
-  await bindOpenSessions(await resolveAccount(row.key), [n], current, ctx);
+  const fresh = await resolveAccount(row.key);
+  confirmChange(fresh, `✓ ${placeOf(key)} → ${targetWords(row, tenantIds)} (rule R${n}).`, before, flags);
+  await bindOpenSessions(fresh, [n], current, ctx);
   await afterRuleWrite(row.key, flags);
   console.log(`rule=${n}`);
 }
@@ -396,9 +416,13 @@ async function ruleSet(argv, flags = { deferUpload: false }) {
   const found = findRule(row, rest[0]);
   requireNoneForSingle(row, rest.slice(1));
   const tenantIds = selection(row, rest.slice(1));
+  const before = routingOf(row);
   await setWorkspaceRule(row.key, { kind: found.kind, match: found.match, label: found.label, tenantIds });
-  console.log(ruleDone(row, found, tenantIds, true));
-  await bindOpenSessions(await resolveAccount(row.key), [found.index], resolveSession(session), createRouteContext());
+  const fresh = await resolveAccount(row.key);
+  const change = `${placeOf(found)} → ${targetWords(row, tenantIds)} (rule R${found.index}).`;
+  const was = targetWords(row, found.tenantIds);
+  confirmChange(fresh, `✓ ${change} Before: ${was}.`, before, flags, { change, was });
+  await bindOpenSessions(fresh, [found.index], resolveSession(session), createRouteContext());
   await afterRuleWrite(row.key, flags);
   console.log(`rule=${found.index}`);
 }
@@ -407,22 +431,33 @@ async function ruleRemove(argv, flags = { deferUpload: false }) {
   const { account, rest } = await parseAccountFlag(argv);
   if (rest.length !== 1) throw new UserError(USAGE);
   const row = await resolveAccount(account);
+  const before = routingOf(row);
   const removed = await removeWorkspaceRule(row.key, String(rest[0]).replace(/^R/i, ''));
-  if (isSingleTenant(row)) {
-    console.log(`✓ Removed the rule for ${placeOf(removed)}. Beezi tracks it again unless another rule covers it.`);
-  } else {
-    console.log(`✓ Removed the rule for ${placeOf(removed)}. New sessions there follow New folders (${newFoldersLabel(row)}).`);
-  }
+  const fresh = await resolveAccount(row.key);
+  const ruleText = `rule R${removed.index} (${placeOf(removed)}).`;
+  confirmChange(fresh, isSingleTenant(row)
+    ? `✓ Removed ${ruleText} It's tracked again unless another rule covers it.`
+    : `✓ Removed ${ruleText} New sessions there follow the default (${newFoldersLabel(row)}).`, before, flags, { change: `removed ${ruleText}` });
   await afterRuleWrite(row.key, flags);
   console.log(`removed=${removed.index}`);
-  // Sessions bound to the removed rule keep their state until something re-binds them: re-route each to whatever still applies.
-  if (isSingleTenant(row)) {
-    const fresh = await resolveAccount(row.key);
-    const ctx = createRouteContext();
-    for (const entry of listSessionWorkspaces()) {
-      const bound = entry.state.route[row.key];
-      if (bound == null || bound.kind !== removed.kind || bound.match !== removed.match) continue;
-      recordSessionRoute(entry.sessionId, row.key, routeForDir(fresh, entry.state.cwd, ctx));
+  await rerouteGone(fresh, [removed], createRouteContext());
+}
+
+// Sessions bound to a rule that is gone would keep sending by it: re-bind each to whatever still applies (none unbinds to New folders).
+// On a multi-workspace account each one's held reports are released (nothing goes out while it has no targets) and workspaces it newly reaches check in once.
+async function rerouteGone(fresh, gone, ctx) {
+  const checkedIn = [];
+  for (const entry of listSessionWorkspaces()) {
+    const bound = entry.state.route[fresh.key];
+    if (bound == null || !gone.some((r) => r.kind === bound.kind && r.match === bound.match)) continue;
+    const prior = resolveTargets(fresh, entry.state).targets;
+    recordSessionRoute(entry.sessionId, fresh.key, routeForDir(fresh, entry.state.cwd, ctx));
+    if (!isMultiTenant(fresh)) continue;
+    releaseHeldQueue(fresh, entry.sessionId);
+    for (const id of resolveTargets(fresh, readSessionWorkspace(entry.sessionId)).targets) {
+      if (prior.indexOf(id) !== -1 || checkedIn.indexOf(id) !== -1) continue;
+      checkedIn.push(id);
+      await checkIn(fresh, id);
     }
   }
 }
@@ -438,6 +473,7 @@ async function ruleAddAll(argv, flags = { deferUpload: false }) {
   const current = resolveSession(session);
   const ctx = createRouteContext();
   const groups = planUnruledRoutes(row, listAllTranscripts(), ctx, { liveSessionId: current.sessionId });
+  const before = routingOf(row);
   const added = [];
   for (const g of groups) {
     added.push((await setWorkspaceRule(row.key, { kind: g.kind, match: g.match, label: g.label, tenantIds })).index);
@@ -447,9 +483,11 @@ async function ruleAddAll(argv, flags = { deferUpload: false }) {
     console.log('✓ No repos or folders are waiting for a rule.');
   } else {
     const those = n === 1 ? 'that repo or folder' : 'those repos and folders';
-    const where = tenantIds.length === 0 ? `${those} ${n === 1 ? 'is' : 'are'} not tracked` : `analytics for ${those} go to ${tenantNames(row, tenantIds)}`;
-    console.log(`✓ Added ${n} rule${n === 1 ? '' : 's'}: ${where}.`);
-    await bindOpenSessions(await resolveAccount(row.key), added, current, ctx);
+    const where = tenantIds.length === 0 ? `${those} ${n === 1 ? 'is' : 'are'} not tracked` : `${those} → ${joinTenantNames(row, tenantIds)}`;
+    const fresh = await resolveAccount(row.key);
+    const rulesText = `${n} rule${n === 1 ? '' : 's'}: ${where}.`;
+    confirmChange(fresh, `✓ Added ${rulesText}`, before, flags, { change: `added ${rulesText}` });
+    await bindOpenSessions(fresh, added, current, ctx);
   }
   await afterRuleWrite(row.key, flags);
   console.log(`rules-added=${n}`);
@@ -469,8 +507,8 @@ function ruleTargetFlag(place) {
   return place.kind === 'outside' ? '--outside' : `--${place.kind} '${place.match.replace(/'/g, "'\\''")}'`;
 }
 
-// Past sessions waiting under New folders = Ask me, grouped by repo or folder, for the planning questions.
-async function routes(argv, flags = { deferUpload: false }) {
+// Past sessions waiting under New folders = Ask me, grouped by repo or folder, for the planning questions; returns the P-line count.
+export async function routes(argv, flags = { deferUpload: false }) {
   const { session, rest: afterSession } = parseSessionFlag(argv);
   const { account, rest } = await parseAccountFlag(afterSession);
   if (rest.length !== 0) throw new UserError(USAGE);
@@ -504,13 +542,14 @@ async function routes(argv, flags = { deferUpload: false }) {
     }
   }
   console.log(`routes=${total}`);
+  return total;
 }
 
 // A match or label holding a control character could forge a machine line, so `joined` leaves such a place out.
 const UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
-// Accounts that joined a workspace since their last re-pick here: every place to re-pick, with where it sends now (login Step 4a, /beezi:sync Step 1).
-async function joined(argv, flags = { deferUpload: false }) {
+// Accounts that joined a workspace since their last re-pick here: every place to re-pick, with where it sends now (login Step 4a, /beezi:sync Step 1); returns the J-line count.
+export async function joined(argv, flags = { deferUpload: false }) {
   const [sub, ...after] = argv;
   if (sub === 'add-all') { await joinedAddAll(after, flags); return; }
   if (sub === 'pick') { await joinedPick(after, flags); return; }
@@ -547,6 +586,7 @@ async function joined(argv, flags = { deferUpload: false }) {
     console.log(`done-command=${SCRIPT} joined done --account ${row.key}${deferText(flags)}`);
   }
   console.log(`joined=${total}`);
+  return total;
 }
 
 // A place's current targets (none if pending) plus addIds, kept to current members and order; add-all pre-filters empty/pending places.
@@ -639,8 +679,9 @@ async function joinedDone(argv, flags = { deferUpload: false }) {
   console.log(`kept=${kept.length}`);
 }
 
-async function newFolders(argv, flags = { deferUpload: false }) {
-  const { session, rest: afterSession } = parseSessionFlag(argv);
+export async function newFolders(argv, flags = { deferUpload: false }) {
+  const history = argv.indexOf('--history') !== -1;
+  const { session, rest: afterSession } = parseSessionFlag(argv.filter((arg) => arg !== '--history'));
   const { account, rest } = await parseAccountFlag(afterSession);
   const row = await resolveAccount(account);
   if (rest.length === 0) {
@@ -652,30 +693,127 @@ async function newFolders(argv, flags = { deferUpload: false }) {
     const newFoldersNow = newFoldersOf(row);
     console.log(`New folders${several ? ` (${accountLabel(row)})` : ''}: ${newFoldersLabel(row)}`);
     printWorkspaces(row);
+    if (history) printHistory(row);
     console.log(`new-folders=${newFoldersNow.mode} set=${newFoldersNow.set ? 'yes' : 'no'} multi=yes account=${row.key}`);
     return;
   }
   requireMulti(row);
   const mode = String(rest[0]).toLowerCase();
-  if ((mode !== 'ask' && mode !== 'send' && mode !== 'none') || (mode !== 'send' && rest.length > 1)) throw new UserError(USAGE);
+  if ((mode !== 'ask' && mode !== 'send' && mode !== 'none') || (mode !== 'send' && rest.length > 1) || history) throw new UserError(USAGE);
   const tenantIds = mode === 'send' ? selection(row, rest.slice(1)) : [];
   if (mode === 'send' && tenantIds.length === 0) throw new UserError('Send needs at least one workspace; use none to send nowhere.');
   const current = resolveSession(session);
-  const before = resolveTargets(row, current.state);
+  const prior = resolveTargets(row, current.state);
+  const before = routingOf(row);
   await setNewFolders(row.key, { mode, tenantIds });
-  if (mode === 'ask') console.log('✓ New folders: Ask me — Beezi asks once per repo or folder.');
-  else if (mode === 'send') console.log(`✓ New folders: analytics go to ${tenantNames(row, tenantIds)}.`);
-  else console.log('✓ New folders: not uploaded.');
-  // A session here with no rule follows the new setting now: its held reports go out and new workspaces check in.
-  if (current.sessionId != null && before.rule == null) {
-    const fresh = await resolveAccount(row.key);
-    releaseHeldQueue(fresh, current.sessionId);
-    for (const id of resolveTargets(fresh, current.state).targets) {
-      if (before.targets.indexOf(id) === -1) await checkIn(fresh, id);
-    }
-  }
+  const fresh = await resolveAccount(row.key);
+  let line = '✓ New folders: Ask me — Beezi asks once per repo or folder.';
+  if (mode === 'send') line = `✓ New folders → ${joinTenantNames(row, tenantIds)}.`;
+  if (mode === 'none') line = '✓ New folders: not tracked.';
+  confirmChange(fresh, line, before, flags);
+  await followNewFolders(fresh, current, prior);
   await afterRuleWrite(row.key, flags);
   console.log(`new-folders=${mode}`);
+}
+
+// The setup wizard's preview: past sessions the upload would send and the places they come from. A count that fails prints
+// nothing, so the question still stands without numbers.
+function printHistory(row) {
+  let counts = null;
+  try { counts = pastSessions(row); } catch { counts = null; }
+  if (counts != null) console.log(`history=${counts.sessions} places=${counts.places}`);
+}
+
+// A session here with no rule follows the new New folders now: its held reports go out and workspaces it newly sends to check in.
+async function followNewFolders(fresh, current, prior) {
+  if (current.sessionId == null || prior.rule != null) return;
+  releaseHeldQueue(fresh, current.sessionId);
+  for (const id of resolveTargets(fresh, current.state).targets) {
+    if (prior.targets.indexOf(id) === -1) await checkIn(fresh, id);
+  }
+}
+
+function sameRule(a, b) {
+  return a.kind === b.kind && a.match === b.match && JSON.stringify(a.tenantIds) === JSON.stringify(b.tenantIds);
+}
+
+// Puts back the rules and New folders from before the last recorded change, unless something changed them since.
+async function undo(argv, flags = { deferUpload: false }) {
+  const { session, rest } = parseSessionFlag(argv);
+  if (rest.length !== 0) throw new UserError(USAGE);
+  const last = readUndo();
+  if (last == null) {
+    console.log('Nothing to undo.');
+    console.log('undone=0');
+    return;
+  }
+  const row = (await listAccounts()).find((a) => a.key === last.account && a.status === AccountStatus.LINKED);
+  const current = resolveSession(session);
+  const result = row == null ? 'missing' : await restoreRouting(row.key, { expected: last.after, before: last.before });
+  clearUndo();
+  if (result !== 'restored') {
+    console.log(result === 'changed' ? 'Nothing undone: the rules changed after that change.' : 'Nothing to undo: that account is no longer linked.');
+    console.log('undone=0');
+    return;
+  }
+  const back = last.was == null ? '' : ` It's back to ${last.was}.`;
+  console.log(`✓ Undid your last change: ${last.change}${back} Sessions already uploaded stay where they went.`);
+  const fresh = await resolveAccount(row.key);
+  const ctx = createRouteContext();
+  // Rules that came back (or got their old workspaces back) re-bind their sessions; rules that went away re-route theirs.
+  const undone = rulesOf({ workspaceRules: last.after.workspaceRules });
+  const restored = rulesOf(fresh).filter((r) => !undone.some((u) => sameRule(u, r)));
+  if (restored.length > 0) await bindOpenSessions(fresh, restored.map((r) => r.index), current, ctx);
+  await rerouteGone(fresh, undone.filter((u) => !rulesOf(fresh).some((r) => r.kind === u.kind && r.match === u.match)), ctx);
+  if (JSON.stringify(last.before.newFolders) !== JSON.stringify(last.after.newFolders)) {
+    await followNewFolders(fresh, current, resolveTargets(row, current.state));
+  }
+  await afterRuleWrite(row.key, flags);
+  console.log('undone=1');
+}
+
+// The same place: repo remotes ignore case, folders compare normalized.
+function samePlace(a, b) {
+  if (a == null || b == null || a.kind !== b.kind) return false;
+  if (a.kind === 'outside') return true;
+  if (a.kind === 'repo') return String(a.match).toLowerCase() === String(b.match).toLowerCase();
+  return normPath(a.match) === normPath(b.match);
+}
+
+// The folder picker's places: recent repos and folders with no rule of their own, other than this directory's, most sessions first.
+export function pickerPlaces(row, entries, dir, ctx, options = {}) {
+  const here = dir == null ? null : routeForDir(row, dir, ctx) || routeKeyForDir(dir, ctx);
+  const stored = rulesOf(row);
+  return planReviewPlaces(row, entries, ctx, options)
+    .filter((place) => !UNSAFE_LINE.test(place.match) && !UNSAFE_LINE.test(place.label))
+    .filter((place) => !samePlace(place, here) && !stored.some((r) => samePlace(r, place)))
+    .slice(0, PICKER_PLACES);
+}
+
+// The picker's lines: a header, then per place its F line and the rule-add command to finish with <tenants>.
+export function pickerLines(row, places, flags = { deferUpload: false }) {
+  if (places.length === 0) return [];
+  const count = places.length === 1 ? '1 repo or folder' : `${places.length} repos or folders`;
+  const lines = [`${accountLabel(row)}: ${count} with recent sessions account=${row.key}`];
+  places.forEach((place, i) => {
+    lines.push(`F${i + 1}. ${labeled(place)}, ${sessionsCount(place.sessions)} account=${row.key} kind=${place.kind} match=${place.match}`);
+    lines.push(`F${i + 1}-command=${SCRIPT} rule add ${ruleTargetFlag(place)} --account ${row.key}${deferText(flags)} <tenants>`);
+  });
+  return lines;
+}
+
+async function places(argv, flags = { deferUpload: false }) {
+  const { session, rest: afterSession } = parseSessionFlag(argv);
+  const { account, rest } = await parseAccountFlag(afterSession);
+  if (rest.length !== 0) throw new UserError(USAGE);
+  const row = await resolveAccount(account);
+  const tenants = tenantsOf(row);
+  const current = resolveSession(session);
+  const found = tenants == null || tenants.length === 0
+    ? []
+    : pickerPlaces(row, listAllTranscripts(), choiceDir(current.state), createRouteContext(), { liveSessionId: current.sessionId });
+  for (const line of pickerLines(row, found, flags)) console.log(line);
+  console.log(`places=${found.length}`);
 }
 
 async function read(argv) {
@@ -702,10 +840,15 @@ async function main() {
   if (cmd === 'joined') { await joined(argv, flags); return; }
   if (cmd === 'new-folders') { await newFolders(argv, flags); return; }
   if (cmd === 'read') { await read(argv); return; }
+  if (cmd === 'places') { await places(argv, flags); return; }
+  if (cmd === 'undo') { await undo(argv, flags); return; }
   throw new UserError(cmd == null ? USAGE : `Unknown command "${cmd}". ${USAGE}`);
 }
 
-main().catch((error) => {
-  console.error(`\n✗ ${friendlyMessage(error)}`);
-  process.exit(1);
-});
+// settings.mjs, sync.mjs and login-flow.mjs import the listings, so main runs only when this file is the entry script.
+if (isEntryScript(import.meta.url)) {
+  main().catch((error) => {
+    console.error(`\n✗ ${friendlyMessage(error)}`);
+    process.exit(1);
+  });
+}

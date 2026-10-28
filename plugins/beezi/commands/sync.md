@@ -13,11 +13,21 @@ question; `multiSelect: true` only with 2 or more options. Make one AskUserQuest
 message and wait for its answers before the next (two calls in one message show the user only
 the last). A dismissed question runs nothing.
 
-## Step 1 — new workspaces, then repos and folders with no rule
+## Step 1 — new workspaces, then repos and folders with no rule, then the upload
 
-First, new workspaces. Run EXACTLY (add `--account <key>` when the user named an account):
+Run EXACTLY this one command, with the Bash tool's `timeout` set to 600000 (add `--account <key>`
+when the user named an account, and the `--tenant` override from Step 2 when the user asked for it):
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/workspace.mjs joined --defer-upload`
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs --review`
+
+It prints a `<joined>` block (new workspaces, below) and stops there when that block's last line
+is not `joined=0`. Otherwise it prints a `<routes>` block (repos and folders with no rule, below)
+and stops there when its last line is not `routes=0`. When both are 0 it goes straight on to the
+upload: everything after the `</routes>` line is Step 2's output, and no other command runs. A
+listing that fails shows a `✗` line inside its block instead and counts as nothing to ask: write
+that line verbatim.
+
+First, new workspaces: the `<joined>` block, which `workspace.mjs joined` prints.
 
 Its output is for you only. For an account that joined a workspace since it was last reviewed on this
 machine, it lists every repo and folder with where its analytics go now. Its lines:
@@ -66,24 +76,31 @@ sessions will be sent there too." `<name>` is the `W.` line's text after `W. ` u
 or "No rule yet" when `<where>` is `no rule yet`; then "None of these" LAST (description "Nothing from
 these goes to <name>"). So a question lists at most 3 places plus "None of these": more `J` lines → split
 them in order into questions of at most 3 places, each ending in " (part j of k)"; that workspace's answer
-is all of its parts together. Choosing "None of these" (alone or with places) means no pick from that
-question.
+is all of its parts together. "None of these" alone means no pick from that question. If it is chosen
+together with any place in the same question, ask that workspace's question again once (every part),
+starting with `"None of these" can't be combined with repos — pick one or the other.` A mixed answer is not an answer. A second
+mixed answer is a dismissal: no `J<i>-command` for that workspace and no `done-command`.
 At most 4 questions per AskUserQuestion call: more → further calls, one after
 another. The printed `J` numbers are global across accounts: preserve each to match its command.
 
 For each new workspace, for each `J` line picked for it, run that line's `J<i>-command=` text EXACTLY
 ONCE, changing nothing except the final `<tenant>`: that workspace's `tenant=` value (e.g. `t1`). Never
 rebuild the command or re-quote its path yourself. A dismissed question runs nothing for its lines.
-After every new workspace's questions have been answered ("None of these" is an answer; skipped or
-dismissed is not), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and the
+After every new workspace's questions have been answered ("None of these" alone is an answer; skipped,
+dismissed or mixed is not), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and the
 next login or sync asks again. Write each command's first line verbatim.
 
-Then, repos and folders with no rule. Run EXACTLY (add `--account <key>` when the user named an
-account):
+Then, repos and folders with no rule. Run nothing for them after `joined=0`: the Step 1 command
+already printed the `<routes>` block. After the `J` questions (answered or dismissed) and their
+commands, run EXACTLY, with the same `timeout`, `--account` and `--tenant` as Step 1's command:
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/workspace.mjs routes --defer-upload`
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs --review-routes`
 
-Its output is for you only, except the one line named below. It lists, per account in several
+It prints the `<routes>` block and, when its last line is `routes=0`, goes straight on to the
+upload as Step 1's command does.
+
+The `<routes>` block is `workspace.mjs routes` output. It is for you only, except the one line
+named below. It lists, per account in several
 workspaces set to "Ask me" for new folders, the repos and folders whose past sessions have no rule
 yet. Its lines:
 
@@ -102,7 +119,8 @@ yet. Its lines:
   ask about it;
 - `routes=<total>` — the number of `P` lines, always last.
 
-Not linked, or `routes=0` → nothing to ask; go to Step 2.
+Not linked, or `routes=0` → nothing to ask: the upload already ran in the same call; go to Step 2
+for its output.
 
 For each account with `P` lines (with several accounts, end every question text with
 " (<email>)"):
@@ -137,22 +155,28 @@ its last option follow the line's `kind=`:
 
 Options: one per `W.` line of that account — label = the workspace name (the text after `W. ` up
 to ` account=`), description = the line's `role=` value, or "Beezi workspace" when it is empty —
-then the last option, description "Nothing from <short> is uploaded" ("Nothing
-from sessions outside a project folder is uploaded" for `outside`). More than 4 options → split
+then the last option, description "Not tracked: nothing from <short> is sent" ("Not tracked:
+nothing from sessions outside a project folder is sent" for `outside`). More than 4 options → split
 them evenly into questions of at most 4 (5 → 3 + 2), the last option in the last one, each ending
 in " (part j of k)"; the `P` line's answer is all of its parts together.
 
+If a `P` line's answer has the last option together with any workspace, across all of its parts,
+run nothing for it yet: ask that `P` line's question again once (every part), starting with
+`"Don't track" can't be combined with a workspace — pick one or the other.` A second mixed answer is a dismissal.
 Then, for each `P` line with an answer, run its `P<i>-command=` text EXACTLY ONCE, changing
 nothing except the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g.
-`t1,t2`), or `none` when the last option was chosen (it wins over the others). Never rebuild the
-command or re-quote its path yourself. A `P` line with nothing chosen, or a dismissed question,
+`t1,t2`), or `none` when the last option was chosen, only when it is the whole answer.
+Never rebuild the command or re-quote its path yourself. A `P` line with nothing chosen, or a dismissed question,
 runs nothing: its sessions are not sent this time, and the next /beezi:sync asks again.
 
 Write each command's first line verbatim.
 
 ## Step 2 — sync
 
-Run EXACTLY this one command (add `--account <key>` when the user named an account):
+When the last listing printed `routes=0`, the upload already ran: its output is everything after
+that listing's `</routes>` line. Run nothing more. Only after the `P` questions (answered or
+dismissed) and their commands, run EXACTLY this one command, with the same `timeout`,
+`--account` and `--tenant` as Step 1's command:
 
 `node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs`
 
@@ -162,7 +186,7 @@ routes: its rule, else the New folders setting ("Send to" workspaces get it; und
 user asks to sync specific workspaces instead: that is an override that sends every past session
 to those workspaces, ignoring rules.
 
-Write its output verbatim as your reply text. Never echo any token.
+Write the upload's output verbatim as your reply text. Never echo any token.
 
 The script uploads every past session still on this machine that Beezi does not
 already have. It asks the server how far each session already reaches and resumes

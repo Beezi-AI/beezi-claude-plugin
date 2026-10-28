@@ -216,6 +216,19 @@ export function costStateSyncFile(key) {
   return path.join(key == null ? beeziHome() : accountDir(key), 'cost-state-sync.json');
 }
 
+// Project-scope enabled plugins the Stop hook saw, keyed by the folder holding the .claude
+// settings: { version, projects: { "<root>": { repo, project, local, seenAt } } }. Root-level like
+// the cost-state gate: the hourly sender reads it from a detached child that has no cwd of its own,
+// and pruneStale() would otherwise forget a project after a quiet fortnight.
+export function pluginProjectsFile() {
+  return path.join(beeziHome(), 'plugin-projects.json');
+}
+
+// When each workspace last took this account's plugin snapshot: { version, byTenant: { "<id>": { sentAt } } }.
+export function pluginsSyncStateFile(key) {
+  return path.join(accountDir(key), 'plugins-sync.json');
+}
+
 export function accountSyncStateFile(key) {
   return path.join(accountDir(key), 'account-sync.json');
 }
@@ -258,6 +271,16 @@ export function telemetryDir() {
 // record would silently re-ask (or worse, re-enable) after 14 days.
 export function telemetryConsentFile() {
   return path.join(beeziHome(), 'telemetry.json');
+}
+
+// Whether the status line ends with the Beezi badge: { version, enabled }. Root-level, one per machine.
+export function statuslineBadgeFile() {
+  return path.join(beeziHome(), 'statusline-badge.json');
+}
+
+// The last rule or New folders change, so /beezi:settings undo can put it back.
+export function ruleUndoFile() {
+  return path.join(beeziHome(), 'rule-undo.json');
 }
 
 // When the diagnostics worker may next attempt delivery: { version, attempts, nextAttemptAt }.

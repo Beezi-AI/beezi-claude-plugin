@@ -3,7 +3,6 @@ import { fileURLToPath } from 'url';
 import {
   isMultiTenant,
   newTenantsOf,
-  readSessionWorkspace,
   resolveTargets,
   roleLabel,
   tenantById,
@@ -57,14 +56,6 @@ function names(row, ids) {
   return list.length < 2 ? list.join('') : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
 }
 
-// How the targets notice names a place: a folder's ~ path, a repo's name, or sessions outside a project.
-function noticePlace(key) {
-  if (key == null) return 'this folder';
-  if (key.kind === 'outside') return 'sessions outside a project';
-  if (key.kind === 'folder' && key.label) return key.label;
-  return shortLabel(key) || 'this folder';
-}
-
 // Splits n items into ceil(n/4) groups whose sizes differ by at most one (5 → 3+2).
 function chunkEvenly(items) {
   const count = Math.ceil(items.length / GROUP_SIZE);
@@ -84,16 +75,18 @@ function placeOf(key) {
     return {
       question: 'Where should analytics for sessions outside a project folder go?',
       dontTrack: 'Don\'t track these',
-      nothing: 'Nothing from sessions outside a project folder is uploaded',
+      nothing: 'Not tracked: nothing from sessions outside a project folder is sent',
     };
   }
   const short = shortLabel(key);
-  // A folder rule covers everything under it, so its question names the whole path and says so.
-  const asked = key != null && key.kind === 'folder' ? `${key.label} (and everything inside it)` : short;
+  // This session's own directory, named as the one you're in; a folder rule covers everything under it, so its question names the whole path and says so.
+  const asked = key != null && key.kind === 'folder'
+    ? `${key.label}, the folder you're in (and everything inside it),`
+    : `${short}, the repo you're in,`;
   return {
     question: `Where should analytics for ${asked} go?`,
-    dontTrack: key != null && key.kind === 'repo' ? 'Don\'t track this repo' : 'Don\'t track this folder',
-    nothing: `Nothing from ${short} is uploaded`,
+    dontTrack: `Don't track ${short}`,
+    nothing: `Not tracked: nothing from ${short} is sent`,
   };
 }
 
@@ -151,7 +144,7 @@ function promptText(asks) {
       ? `the ids of the workspaces chosen in ${span(ask.numbers)} joined by commas`
       : 'the chosen workspaces\' ids joined by commas';
     const lead = several ? `${i === 0 ? 'Then, for' : 'For'} ${emailOf(ask.row)} (${span(ask.numbers)}), run exactly` : 'Then run exactly';
-    return `${lead} \`${ask.command}\`. \`<ids>\` is ${idsOf} (${ask.ids}), or \`none\` when "${ask.dontTrack}" is chosen; it wins over the others.`;
+    return `${lead} \`${ask.command}\`. \`<ids>\` is ${idsOf} (${ask.ids}), or \`none\` only when "${ask.dontTrack}" is the whole answer. If "${ask.dontTrack}" is chosen together with any workspace, ask that account's question${ask.questions.length > 1 ? 's' : ''} again once, starting with "Don't track" can't be combined with a workspace — pick one or the other. A second mixed answer is a dismissal: run nothing for that account.`;
   });
   const tail = several
     ? 'Show the user only the first line of each command\'s output. If a question is dismissed or nothing is chosen for an account, run nothing for it and continue with the user\'s request.'
@@ -196,41 +189,6 @@ export async function buildWorkspacePrompt(input, deps = {}) {
   return promptText(asks);
 }
 
-// SessionStart: one line per multi-workspace account that is not waiting for an answer, or null.
-export async function buildTargetsNotice(input, deps = {}) {
-  if (input == null || typeof input.session_id !== 'string' || input.session_id === '') return null;
-  const rows = await linkedRows(deps);
-  const state = readSessionWorkspace(input.session_id);
-  // A no-rules one-workspace row can never produce a line here (resolveTargets gives 'single'), so
-  // skip its credential read.
-  const shown = await withUsableLogin(rows.filter((row) => isMultiTenant(row) || usesRules(row)), deps);
-  const ctx = createRouteContext();
-  let here;
-  const hereKey = () => {
-    if (here === undefined) here = routeKeyForDir(state != null && state.cwd != null ? state.cwd : inputCwd(input), ctx);
-    return here;
-  };
-  const lines = shown
-    .map((row) => ({ row, resolved: resolveTargets(row, state) }))
-    .filter((r) => (r.resolved.multi && !r.resolved.pendingAsk) || (r.resolved.source === 'rule' && r.resolved.targets.length === 0))
-    .map(({ row, resolved }) => {
-      const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
-      const key = resolved.rule != null ? resolved.rule : hereKey();
-      const where = noticePlace(key);
-      let text;
-      if (resolved.source === 'rule' && resolved.targets.length === 0) {
-        text = `${where} ${key != null && key.kind === 'outside' ? 'are' : 'is'} not tracked (your rule).`;
-      } else if (resolved.source === 'none') {
-        text = `analytics from ${where} are not uploaded (new folders: don't send).`;
-      } else {
-        const fallback = resolved.source === 'new-folders' ? ' (new folder default)' : '';
-        text = `analytics from ${where} go to ${names(row, resolved.targets)}${fallback}.`;
-      }
-      return `${prefix}: ${text} Change with /beezi:settings.`;
-    });
-  return lines.length === 0 ? null : lines.join('\n');
-}
-
 // The current-folder question (buildWorkspacePrompt) may follow: asked per account only while this folder still has no rule.
 function hereGateText(rows, root, sessionId) {
   const commands = rows.map((row) => `\`node "${root}/scripts/workspace.mjs" rules --session ${sessionId} --account ${row.key}\``).join(', then ');
@@ -251,7 +209,7 @@ function joinedPromptText(rows, root, sessionId) {
     'Only if the AskUserQuestion tool is available to you in this session, do the following before anything else; otherwise skip it entirely and never mention it.',
     `Run EXACTLY ${commands}.`,
     `Then read "${root}/commands/sync.md" and follow its Step 1 from "Its output is for you only. For an account that joined" up to the paragraph that begins "Then, repos and folders with no rule. Run", for that output only, with three changes:`,
-    '(1) always ask the first single-select question ("You joined …") first, even with 4 or fewer J lines, and add a last option "Later" (description "Ask me again in my next session") that runs nothing; on "Choose repos", ask for each new workspace the multi-select "Which repos and folders should also send analytics to <name>?" (worded as in sync.md) with the J lines as options, at most 3 per question and ending in "None of these" as in sync.md ("None of these" picks nothing), and for each picked one run its `joined pick` J-command with that workspace\'s tenant id;',
+    '(1) always ask the first single-select question ("You joined …") first, even with 4 or fewer J lines, and add a last option "Later" (description "Ask me again in my next session") that runs nothing; on "Choose repos", ask for each new workspace the multi-select "Which repos and folders should also send analytics to <name>?" (worded as in sync.md) with the J lines as options, at most 3 per question and ending in "None of these" as in sync.md ("None of these" alone picks nothing, and a mixed answer is not an answer: if it is chosen together with any repo or folder, ask that workspace\'s question again once (every part), and a second mixed answer is a dismissal with no joined pick and no done-command; the repeated question starts with "None of these" can\'t be combined with repos — pick one or the other.), and for each picked one run its `joined pick` J-command with that workspace\'s tenant id;',
     '(2) leave out the "Add … to all" option when every J line ends in now=pending or now=none;',
     '(3) stop after that part: run neither routes nor sync.mjs, because the upload starts by itself.',
     ...after,
