@@ -1,4 +1,5 @@
 import { parseAccountFlag, getDefaultKey, getAccount } from '../lib/accounts.mjs';
+import { anonymizationScope } from '../lib/anonymization.mjs';
 import { getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from '../lib/token.mjs';
 import { AUTH_STATES } from '../lib/auth-state.mjs';
 import {
@@ -213,7 +214,7 @@ async function main() {
     }
   }
   const auth = await getAuthentication({}, { account, waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
-  const tokenFor = (tenantId) => (auth != null && auth.authState === AUTH_STATES.READY ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId), tenantId } : null);
+  const tokenFor = (tenantId) => (auth != null && auth.authState === AUTH_STATES.READY ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId), tenantId, ...anonymizationScope(row) } : null);
   const env = oauthTokenEnvWithOsProbe(process.env);
 
   if (parsed.mode === 'status') {

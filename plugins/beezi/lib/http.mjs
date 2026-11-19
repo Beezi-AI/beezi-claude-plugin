@@ -1,19 +1,35 @@
 // Bounded HTTP with a timeout: an authenticated POST of a JSON body, and an unauthenticated GET
 // returning parsed JSON. Both throw on network error or timeout (caller catches).
 // The timeout guards the hook's 10s budget — a hung server must not stall the turn.
+import os from 'os';
 import { machineHeaders } from './machine-identity.mjs';
+import { anonymizationFor, hasKind } from './anonymization.mjs';
+import { AnonKind, anonHost } from './anonymize.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { resolveAbortController } from './abort-compat.mjs';
 import { gzipJson } from './gzip-body.mjs';
 
 const DEFAULT_TIMEOUT_MS = 3000;
+export const HISTORY_CONSENT_HEADER = 'x-beezi-history-consent';
+export const HISTORY_CONSENT_VALUE = 'ask-first';
+
+// The raw hostname, its hash when the block hides hosts, or null (header omitted) when hosts has no key.
+function hostFor(block) {
+  if (!hasKind(block, AnonKind.HOSTS)) return os.hostname();
+  return block.key == null ? null : anonHost(block.key, os.hostname());
+}
 
 export function authHeaders(session) {
   if (session == null || typeof session.token !== 'string' || !session.token) {
     throw new TypeError('An authenticated account session is required.');
   }
-  const headers = { Authorization: `Bearer ${session.token}`, ...machineHeaders(session.clientId) };
-  if (typeof session.tenantId === 'string' && session.tenantId !== '') headers['X-Beezi-Tenant'] = session.tenantId;
+  const tenantId = typeof session.tenantId === 'string' && session.tenantId !== '' ? session.tenantId : null;
+  const headers = {
+    Authorization: `Bearer ${session.token}`,
+    ...machineHeaders(session.clientId, { host: hostFor(anonymizationFor(session, tenantId)) }),
+    [HISTORY_CONSENT_HEADER]: HISTORY_CONSENT_VALUE,
+  };
+  if (tenantId != null) headers['X-Beezi-Tenant'] = tenantId;
   return headers;
 }
 

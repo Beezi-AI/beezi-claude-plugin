@@ -14,6 +14,7 @@ import { clearTrackingState } from './tracking.mjs';
 import { getAuthentication as _getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from './token.mjs';
 import { AUTH_STATES } from './auth-state.mjs';
 import { UserError } from './friendly-error.mjs';
+import { anonymizationScope } from './anonymization.mjs';
 
 const LOGOUT_LOCK_WAIT_MS = 30_000;
 
@@ -45,7 +46,8 @@ async function logoutAccounts(deps, options) {
   if (keys.includes(index.default) && remaining.length && !next) throw new UserError('Choose the remaining analytics default with --next-default <key|email|number> before logging out.');
   const lines = [];
   for (const account of keys) {
-    lines.push(`${describeAccount(index.accounts.find(a => a.key === account))}:`, ...await logoutOne(account, deps));
+    const row = index.accounts.find(a => a.key === account);
+    lines.push(`${describeAccount(row)}:`, ...await logoutOne(row, deps));
     if (account === index.default && next) await setDefault(next, deps);
     await removeAccount(account, deps);
   }
@@ -57,7 +59,8 @@ async function logoutAccounts(deps, options) {
   return lines;
 }
 
-async function logoutOne(account, deps) {
+async function logoutOne(row, deps) {
+  const account = row.key;
   const getAuthentication = deps.getAuthentication == null ? _getAuthentication : deps.getAuthentication;
 
   const before = await readCredentials(deps, { account }).catch(() => null);
@@ -67,11 +70,11 @@ async function logoutOne(account, deps) {
   // be renewed still logs out locally, it just cannot prove the server-side unlink.
   const auth = await getAuthentication(deps, { account, waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
   const token = auth != null && auth.authState === AUTH_STATES.READY ? auth.accessToken : null;
-  let server = token ? await unlinkOnServer({ key: account, token, clientId: auth.clientId || (before && before.credentials && before.credentials.client_id) }, deps) : { unlinked: false, httpStatus: null };
+  let server = token ? await unlinkOnServer({ key: account, token, clientId: auth.clientId || (before && before.credentials && before.credentials.client_id), ...anonymizationScope(row) }, deps) : { unlinked: false, httpStatus: null };
 
   if (server.httpStatus === 401) {
     const retry = await getAuthentication(deps, { account, forceRefresh: true, waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
-    if ((retry && retry.authState) === AUTH_STATES.READY) server = await unlinkOnServer({ key: account, token: retry.accessToken, clientId: retry.clientId || (before && before.credentials && before.credentials.client_id) }, deps);
+    if ((retry && retry.authState) === AUTH_STATES.READY) server = await unlinkOnServer({ key: account, token: retry.accessToken, clientId: retry.clientId || (before && before.credentials && before.credentials.client_id), ...anonymizationScope(row) }, deps);
   }
 
   // The lock, then a REREAD: a refresh worker may have committed a new generation while the

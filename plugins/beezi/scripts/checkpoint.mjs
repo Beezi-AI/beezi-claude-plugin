@@ -10,5 +10,5 @@ if (!isGitCheckpointCommand(command == null ? '' : command)) process.exit(0);
 // recorded by a runtime that is still standing.
 runHook(DIAGNOSTIC_SOURCES.CHECKPOINT, async () => {
   const mod = await importHookModule('./checkpoint.mjs');
-  if (mod != null) await mod.runCheckpoint(input);
+  if (mod != null) await mod.runCheckpoint(input, {}, { backgroundFlush: true, localOnly: true });
 });

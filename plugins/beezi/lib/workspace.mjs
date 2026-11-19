@@ -4,6 +4,7 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { normPath } from './repo-map.mjs';
 import { UserError } from './friendly-error.mjs';
 import { resolveSessionId } from './permission-mode-store.mjs';
+import { readTrackingState, linkedAtMs } from './tracking.mjs';
 
 const STATE_VERSION = 3;
 const NEW_FOLDER_MODES = ['ask', 'send', 'none'];
@@ -60,21 +61,31 @@ export function reviewBaselineMs(row) {
   return null;
 }
 
-// Workspaces whose membership began after the baseline (whoami joinedAt); [] for one or unknown workspaces.
-export function joinedAfterLink(row) {
+// The later of the account link (the tracking stamp live tracking cuts on, else the row's copy) and joining tenantId; null when neither is known.
+export function linkedToTenantMs(row, tenantId, deps = {}) {
+  const tracked = linkedAtMs(readTrackingState(row.key, deps));
+  const linked = tracked == null ? Date.parse(row.linkedAt) : tracked;
+  const tenant = tenantById(row, tenantId);
+  const known = [linked, tenant == null ? NaN : Date.parse(tenant.joinedAt)].filter(Number.isFinite);
+  return known.length === 0 ? null : Math.max(...known);
+}
+
+// linkedToTenantMs for a one-workspace account: its listed workspace, else the row's own id.
+export function loneTenantLinkedMs(row, deps = {}) {
+  const tenants = tenantsOf(row);
+  return linkedToTenantMs(row, tenants != null && tenants.length > 0 ? tenants[0].id : row.tenantId, deps);
+}
+
+// Workspaces joined after the baseline (whoami joinedAt) and not yet through the re-pick pass here; [] for one or unknown workspaces.
+export function newTenantsOf(row) {
   if (!isMultiTenant(row)) return [];
   const baseline = reviewBaselineMs(row);
   if (baseline == null) return [];
+  const reviewed = Array.isArray(row.reviewedTenantIds) ? row.reviewedTenantIds : [];
   return tenantsOf(row).filter((t) => {
     const ms = typeof t.joinedAt === 'string' ? Date.parse(t.joinedAt) : NaN;
-    return Number.isFinite(ms) && ms > baseline;
+    return Number.isFinite(ms) && ms > baseline && reviewed.indexOf(t.id) === -1;
   }).map((t) => t.id);
-}
-
-// Joined after the baseline and not yet through the re-pick pass here.
-export function newTenantsOf(row) {
-  const reviewed = row != null && Array.isArray(row.reviewedTenantIds) ? row.reviewedTenantIds : [];
-  return joinedAfterLink(row).filter((id) => reviewed.indexOf(id) === -1);
 }
 
 // Workspace names for a sentence: "A", "A and B", "A, B and C".

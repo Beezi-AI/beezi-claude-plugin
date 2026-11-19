@@ -1,12 +1,11 @@
 import { lastLine, outputLines, report, token } from './setup-routing.mjs';
 
-export const ACCOUNT_QUESTION = 'This machine is already linked to Beezi. Which account should setup use?';
 export const NETWORK_ERRORS = ['Could not reach the Beezi server', 'The login server took too long'];
-export const STILL_READS = '/beezi:analytics still reads from';
-export const SIGN_IN_LABEL = 'Waiting for you to sign in in your browser…';
-const KEEP_ACCOUNT = 'Keep this account; no browser sign-in';
-const LINK_ANOTHER = { label: 'Link another account', description: 'Sign in through your browser' };
+const SIGN_IN_LABEL = 'Waiting for you to sign in in your browser';
 const ACCOUNT_LINE = /^\d+\. (.+?)(?: \[([^\]]+)\])? key=(\S+)$/;
+const WORKSPACE_SEPARATOR = ' · ';
+// login.mjs lines the setup's own "Signed in" line replaces; the browser link and failures still show.
+const LOGIN_HIDDEN = /^(account=|✓ Beezi analytics linked as |✓ This machine is already linked as | {2}\/beezi:analytics still reads from |Beezi analytics — link an account$|\s*$)/;
 
 // Linked, non-revoked rows of `accounts.mjs list`: "<n>. <description>[ [flags]] key=<key>".
 export function usableAccounts(text) {
@@ -22,30 +21,39 @@ export function usableAccounts(text) {
   return accounts;
 }
 
-// The account a login.mjs run linked; null when the sign-in did not finish.
-export function signInResult(result) {
+// The key a login.mjs run linked; null when the sign-in did not finish.
+export function signInKey(result) {
   const output = `${result.stdout}\n${result.stderr}`;
   const line = lastLine(result.stdout, /^account=\S+$/);
   const offline = NETWORK_ERRORS.some((text) => output.indexOf(text) !== -1);
   if (result.code !== 0 || line === null || offline) return null;
-  return { key: token(line, 'account'), readsElsewhere: result.stdout.indexOf(STILL_READS) !== -1 };
+  return token(line, 'account');
 }
 
-export async function signIn(ctx) {
-  return signInResult(await ctx.run('login.mjs', [], { stream: true, hide: /^account=/, label: SIGN_IN_LABEL }));
-}
-
-// A linked account the user picks, else a fresh sign-in; null stops setup.
-export async function chooseAccount(ctx) {
+async function listAccounts(ctx) {
   const listing = await ctx.run('accounts.mjs', ['list']);
   if (listing.code !== 0) report(ctx, listing);
-  const usable = usableAccounts(listing.stdout);
-  // The default account first, then the rest in listed order.
-  const accounts = usable.filter((a) => a.isDefault).concat(usable.filter((a) => !a.isDefault));
-  if (accounts.length === 0) return signIn(ctx);
-  const options = accounts.map((a) => ({ label: `Continue with ${a.description}`, description: KEEP_ACCOUNT })).concat([LINK_ANOTHER]);
-  const choice = await ctx.ask.choose(ACCOUNT_QUESTION, options, { defaultIndex: 0 });
-  if (choice === null) return null;
-  if (choice === accounts.length) return signIn(ctx);
-  return { key: accounts[choice].key, readsElsewhere: false };
+  return usableAccounts(listing.stdout);
+}
+
+// The default usable account, else the first one, else a browser sign-in; null when the sign-in did not finish.
+export async function chooseAccount(ctx) {
+  const accounts = await listAccounts(ctx);
+  const preferred = accounts.filter((a) => a.isDefault).concat(accounts);
+  if (preferred.length > 0) return preferred[0];
+  const key = signInKey(await ctx.run('login.mjs', [], { stream: true, hide: LOGIN_HIDDEN, label: SIGN_IN_LABEL }));
+  if (key === null) return null;
+  const linked = (await listAccounts(ctx)).filter((a) => a.key === key);
+  return linked.length > 0 ? linked[0] : { key, description: null, isDefault: false };
+}
+
+// "✓ Signed in as <email>" (names bold), with ", workspace <name>" for a one-workspace account, from its `settings.mjs keys` row.
+export async function signedInLine(ctx, account) {
+  const keys = await ctx.run('settings.mjs', ['keys']);
+  const row = outputLines(keys.stdout).filter((line) => line.indexOf(`account=${account.key} `) === 0)[0];
+  const email = row === undefined ? null : token(row, 'email');
+  const at = account.description === null ? -1 : account.description.indexOf(WORKSPACE_SEPARATOR);
+  const one = row !== undefined && token(row, 'workspaces') === '1' && at !== -1;
+  const who = email !== null && email !== 'unknown' ? ` as ${ctx.style.bold(email)}` : '';
+  return `✓ Signed in${who}${one ? `, workspace ${ctx.style.bold(account.description.slice(at + WORKSPACE_SEPARATOR.length))}` : ''}`;
 }

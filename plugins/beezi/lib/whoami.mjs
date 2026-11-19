@@ -2,6 +2,8 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { authHeaders } from './http.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { AUTH_REASONS } from './auth-state.mjs';
+import { oneLine } from './one-line.mjs';
+import { parseAnonymization, parsePastSessions } from './anonymization.mjs';
 
 // What the portal said about this token. 401 and 403 are NOT the same answer: 401 is a verdict
 // on the credential (one refresh may fix it), 403 is a verdict on the account (a seat, a tenant,
@@ -17,6 +19,8 @@ export const PROBE_OUTCOMES = Object.freeze({
 
 // The API's "I could not complete verification" code; never a verdict on the credential.
 const VERIFICATION_UNAVAILABLE = 'OAUTH_VERIFICATION_UNAVAILABLE';
+// A tenant id safe to echo into a printed command: no whitespace, quotes or shell metacharacters.
+export const SAFE_TENANT_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 // Resolve the stored access token against the portal. Returns
 // { outcome, httpStatus, identity } — identity is the whoami body's fields on AUTHENTICATED
@@ -67,40 +71,38 @@ export async function probeIdentity(session, deps = {}) {
   }
   let body = {};
   try { body = await res.json(); } catch { /* keep {} */ }
+  const tenantId = typeof body.tenantId === 'string' && SAFE_TENANT_ID.test(body.tenantId) ? body.tenantId : null;
   return {
     outcome: PROBE_OUTCOMES.AUTHENTICATED,
     httpStatus: res.status,
     identity: {
       email: body.email == null ? null : body.email,
       name: body.name == null ? null : body.name,
-      tenantId: typeof body.tenantId === 'string' ? body.tenantId : null,
-      tenantName: typeof body.tenantName === 'string' ? body.tenantName : null,
+      tenantId,
+      tenantName: oneLine(body.tenantName),
       tenantTier: body.tenantTier == null ? null : body.tenantTier,
       trackingMode: body.trackingMode == null ? null : body.trackingMode,
       backfillCompleted: body.backfillCompleted === true,
       tenants: parseTenants(body.tenants),
+      anonymization: parseAnonymization(body.anonymization, tenantId),
+      pastSessions: parsePastSessions(body.pastSessions),
     },
   };
 }
 
-// Server-supplied names reach model-read lines, so control characters and line breaks collapse to one space.
-function oneLine(value) {
-  if (typeof value !== 'string') return null;
-  const text = value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
-  return text === '' ? null : text;
-}
-
-// Absent list → null (unknown, old server), never []; entries without a string id are dropped.
+// Absent list → null (unknown, old server), never []; entries whose id is not a safe token are dropped.
 function parseTenants(raw) {
   if (!Array.isArray(raw)) return null;
   return raw
-    .filter((t) => t != null && typeof t.id === 'string')
+    .filter((t) => t != null && typeof t.id === 'string' && SAFE_TENANT_ID.test(t.id))
     .map((t) => ({
       id: t.id,
       name: oneLine(t.name),
       role: oneLine(t.role),
       type: oneLine(t.type),
       joinedAt: typeof t.joinedAt === 'string' && Number.isFinite(Date.parse(t.joinedAt)) ? t.joinedAt : null,
+      anonymization: parseAnonymization(t.anonymization, t.id),
+      pastSessions: parsePastSessions(t.pastSessions),
     }));
 }
 

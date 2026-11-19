@@ -19,16 +19,11 @@ const CLEAR_LINE = '\r\x1b[2K';
 const HIDE_CURSOR = '\x1b[?25l';
 const SHOW_CURSOR = '\x1b[?25h';
 
-// Writes complete lines through paint as they arrive, skipping the ones matching hide; a line matching live goes to onLive instead, and the activity line, when given, is cleared before each write and redrawn after.
-function lineEcho(write, hide, paint, activity, live, onLive) {
+// Writes complete lines through paint as they arrive, skipping the ones matching hide; the activity line, when given, is cleared before each write and redrawn after.
+function lineEcho(write, hide, paint, activity) {
   let pending = '';
   const emit = (line) => {
     if (hide !== null && hide.test(line)) return;
-    const found = live === null ? null : live.exec(line);
-    if (found !== null) {
-      onLive(found);
-      return;
-    }
     if (activity !== null) activity.hide();
     write(`${paint(line)}\n`);
     if (activity !== null) activity.show();
@@ -46,20 +41,20 @@ function lineEcho(write, hide, paint, activity, live, onLive) {
   };
 }
 
-// "<frame> <text>" on one terminal row while a child runs: first drawn after FIRST_DRAW_MS, then every FRAME_MS.
-function createActivity(output, frames, timers) {
+// "<margin><frame> <text>" on one terminal row while a child runs: first drawn after FIRST_DRAW_MS, then every FRAME_MS.
+function createActivity(output, frames, timers, margin, accent) {
   let text = '';
   let frame = 0;
   let shown = false;
   let delay = null;
   let ticker = null;
   function fitted() {
-    const room = (output.columns || 80) - 3;
+    const room = (output.columns || 80) - margin.length - 3;
     const chars = Array.from(text);
     return chars.length <= room ? text : `${chars.slice(0, room - 1).join('')}…`;
   }
   function draw() {
-    output.write(`${shown ? '' : HIDE_CURSOR}${CLEAR_LINE}${frames[frame % frames.length]} ${fitted()}`);
+    output.write(`${shown ? '' : HIDE_CURSOR}${CLEAR_LINE}${margin}${accent(frames[frame % frames.length])} ${fitted()}`);
     shown = true;
     frame += 1;
   }
@@ -72,10 +67,6 @@ function createActivity(output, frames, timers) {
         draw();
         ticker = timers.setInterval(draw, FRAME_MS);
       }, FIRST_DRAW_MS);
-    },
-    setText(label) {
-      text = label;
-      if (shown) draw();
     },
     hide() {
       if (shown) output.write(CLEAR_LINE);
@@ -103,7 +94,9 @@ export function createRunner(options) {
   const paint = options.paint || ((line) => line);
   const frames = (options.platform || process.platform) === 'win32' ? ASCII_FRAMES : FRAMES;
   const timers = options.timers || { setTimeout, clearTimeout, setInterval, clearInterval };
-  const activity = options.activity ? createActivity(options.output || stdout, frames, timers) : null;
+  const activity = options.activity
+    ? createActivity(options.output || stdout, frames, timers, options.margin || '', options.accent || ((frame) => frame))
+    : null;
   let label = null;
 
   function run(script, argv, opts) {
@@ -111,13 +104,11 @@ export function createRunner(options) {
     const hide = opts && opts.hide ? opts.hide : null;
     const text = opts && opts.label ? opts.label : label;
     const busy = activity !== null && text !== null ? activity : null;
-    const live = busy !== null && opts && opts.live ? opts.live : null;
-    const onLive = (found) => { busy.setText(`${text} ${found[1]}/${found[2]}`); };
     return new Promise((resolve) => {
       let out = '';
       let err = '';
-      const echoOut = lineEcho((s) => stdout.write(s), hide, paint, busy, live, onLive);
-      const echoErr = lineEcho((s) => stderr.write(s), null, paint, busy, null, onLive);
+      const echoOut = lineEcho((s) => stdout.write(s), hide, paint, busy);
+      const echoErr = lineEcho((s) => stderr.write(s), null, paint, busy);
       const finish = (result) => {
         if (busy !== null) busy.stop();
         resolve(result);

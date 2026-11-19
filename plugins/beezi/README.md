@@ -34,8 +34,8 @@ What it sends, per session and per repository/branch the session touched:
   counts by category (file, search, shell, MCP server name, skill name); active duration; start and
   end times and your timezone; a working/waiting/idle timeline; lines added and removed per file
   extension; and the line count of the `CLAUDE.md` the work ran under.
-  Session history is uploaded the same way: once at the end of `/beezi:login`, and again when you run
-  `/beezi:sync`.
+  Past sessions carry the same numbers, after you say yes or, when the workspace owner chose upload
+  without asking, after a notice (see [Past sessions](#past-sessions-ask-first-or-upload-without-asking)).
 - **Where the work happened** — the repository's `origin` remote with any credentials stripped, the
   branch name and Beezi task id, and, for work outside a git repository, the folder name
   (`local:<folder>`).
@@ -64,6 +64,25 @@ What it sends, per session and per repository/branch the session touched:
 - **Plugin diagnostics, only if you turn them on** with `/beezi:telemetry` — see
   [Plugin diagnostics](#plugin-diagnostics-beezitelemetry). They are off by default.
 
+**Anonymized workspaces.** Each workspace chooses which kinds of names it hides. For each kind it
+hides, everything sent to that workspace carries made-up names, such as `anon:repo:…`; the kinds it
+does not hide are sent as they are:
+
+- **Folders and repositories** — the repository remote and the `local:<folder>` name.
+- **Branches** — the branch name.
+- **Sessions** — the session name; subagent task descriptions and the text of Claude API errors are
+  left out.
+- **Computer names** — this machine's hostname.
+- **Accounts** — your Claude account email; the Claude organization name is left out. An email you
+  type to link a setup token to your account is hashed too.
+
+A made-up name is worked out on this machine from a key the workspace gives it, so the same repo or
+branch always gets the same one, and the real name is not sent once the workspace's setting is
+known. The first check at `/beezi:login` happens before that, so it still carries the hostname. A
+session report waiting on this machine keeps every kind that was hidden when it was recorded, even if the
+workspace later turns one off. The session banner says which workspaces are anonymized, and `/beezi:settings account`
+shows the name this machine appears as when the workspace hides computer names.
+
 What it never sends: your prompts and Claude's replies, file contents, code, diffs, file paths,
 tool inputs or outputs, your Beezi or Claude sign-in tokens, and API keys.
 
@@ -71,7 +90,7 @@ Two other network requests carry none of the data above:
 
 - **Sign-in**: `/beezi:login` opens your browser at Beezi's sign-in service, `https://clerk.beezi.ai`,
   and the plugin exchanges the sign-in code there for its token. It registers this machine as a
-  sign-in client named after its hostname. `/beezi:logout` revokes that client.
+  sign-in client named "Beezi Claude Code plugin". `/beezi:logout` revokes that client.
 - **Update check**: the plugin reads this marketplace's public `marketplace.json` from
   `https://raw.githubusercontent.com` to tell you when a newer version is out. That request sends
   nothing but the fetch itself.
@@ -79,24 +98,64 @@ Two other network requests carry none of the data above:
 Beezi stores your login token in the OS secret store (see [Credential storage](#credential-storage)).
 Local state lives in `~/.beezi/`.
 
+### Past sessions: ask first, or upload without asking
+
+Sessions from before this machine was linked to a workspace are never uploaded unseen. Before
+any upload, Beezi shows a summary per workspace: how many past sessions, their dates and folders,
+which names are sent as they are and which are hidden. The workspace owner chooses what comes next:
+**ask first** (the default) — Beezi asks **Upload now** or **Not now**; or **upload without asking** —
+Beezi shows the summary as a notice, says the workspace chose it, and uploads. It does this at
+the start of a later session (after it has counted them in the background; a no-ask upload then
+runs in the background) and whenever you run `/beezi:sync`. At `/beezi:login` and in terminal setup
+the summary comes with the one tracking question instead, and your answer is the consent: past
+sessions from the repos and folders you track upload in the background, except to a workspace
+whose owner chose never to upload them. Either
+way you still choose which repos and folders send analytics to the workspace (see
+`/beezi:settings rules`). When past sessions go to several workspaces, Beezi shows one summary,
+uploads to the ones that don't ask, then asks once about the rest.
+
+- **Not now is remembered.** A question you dismiss counts as Not now. Beezi asks again only when
+  the workspace owner changes the past-sessions setting, or when a new rule or New folders sends a
+  folder to that workspace; then it asks only about that folder's sessions. When the owner switches
+  to upload without asking, sessions declined before the switch upload too.
+- **The owner can start from today instead.** Login, setup and session start then show and upload
+  nothing. `/beezi:sync` still shows the summary and asks, and an upload you already accepted still
+  finishes.
+- **Rules upload nothing.** Adding, changing or removing a rule only decides where analytics go.
+- **No answer uploads nothing.** For a workspace that asks first, session start only asks Claude to
+  run the question; Not now is remembered only once the question was actually printed. A session that
+  never shows the question uploads nothing. Whether it remembers a decline depends on whether that
+  session can ask, so the next attended session may ask again.
+- **An upload follows the owner's settings when it is sent.** It hides the kinds the workspace hides
+  at that moment, so a kind the owner turns off after you agreed is sent as it is.
+- **Audit workspaces follow the same choice.** An audit workspace whose owner chose upload without
+  asking uploads without asking too.
+- **Declined sessions are not asked about again** at `/beezi:login`, in terminal setup or at session
+  start, but `/beezi:sync` still lists them.
+- **`/beezi:sync` offers have no link cutoff.** It offers every past session Beezi does not already
+  hold in full.
+- Sessions that run after the link are tracked live as before; the question never affects them.
+
 ## Terminal setup
 
-The one-line installers finish by running `node scripts/setup.mjs` in your terminal. It asks the same questions
-as `/beezi:login` (account, new folders, plan, new workspaces and repos with no rule), uploads your past sessions,
-then offers crash reports and the status line, all without a Claude Code session. For an account in several
-workspaces whose New folders was never set, it asks one question, "Where should analytics from this machine go?":
-pick a workspace to send everything there (each option says how many past sessions and repos or folders that
-uploads), **Several workspaces…** to send everything to each of the ones you pick next, or **Let me choose per repo** to be asked about each repo and folder with history. Each step runs the plugin's own
+The one-line installers finish by running `node scripts/setup.mjs` in your terminal. It does what `/beezi:login`
+does, without a Claude Code session: it uses the linked account (or opens the browser to sign in), detects the
+plan without asking, then shows the past-sessions summary and asks one question, "What should it track?":
+**Everything**, or **Let me choose** to tick the repos and folders. For an account in several workspaces the
+question is "Where should they go?": everything to one workspace, to several, or **Let me choose** to tick repos
+for each workspace. Past sessions from what you track then upload in the background. Setup turns crash reports
+on (unless you already chose) and installs the status line when it is off, and its last lines say what is on.
+An account that already chose on this machine is not asked again. Each step runs the plugin's own
 script from a fresh temporary folder, without `CLAUDE_CODE_SESSION_ID` or `CLAUDE_PID`, so nothing binds to an
 earlier session. Steps also run without `CLAUDE_CODE_OAUTH_TOKEN`, as Claude Code runs its hooks, so they find a
 setup token only where a hook can (the settings `env` block, the OS environment) and setup registers the machine the
 same way its sessions report it; a token set only in the shell gets a warning on how to make it visible. It starts no
-Cowork worker; the next Claude Code session does. It needs a terminal; without one, run `/beezi:login` in Claude Code. Its questions are colourful arrow-key menus (↑/↓, then Enter), with typed numbers
+Cowork worker; the next Claude Code session does. It needs a terminal; without one, run `/beezi:login` in Claude Code. Its question is an arrow-key menu (↑/↓, then Enter; Space ticks in a tick list), with typed numbers
 as the fallback where keys cannot be read; `NO_COLOR` turns the colours off.
 
 ## Commands
 
-- `/beezi:login` — link a Beezi account to this machine (browser sign-in with your Beezi account via Clerk OAuth + PKCE); stores that account's credentials in the OS secret store, or a restricted-permission file when no store is available (see Credential storage below). Run it again to add another account: the browser signs in as whichever Beezi account it is already signed in as, so sign out there (or use a private window) first. After upgrading from 0.1.x, run it once — old device-flow tokens are invalid. The flow then captures the machine's Claude subscription plan and finishes with that account's own **history backfill** (see below) — re-running `/beezi:login` for an already-linked account is the way to refresh the plan or resume an interrupted backfill.
+- `/beezi:login` — link a Beezi account to this machine (browser sign-in with your Beezi account via Clerk OAuth + PKCE); stores that account's credentials in the OS secret store, or a restricted-permission file when no store is available (see Credential storage below). Run it again to add another account: the browser signs in as whichever Beezi account it is already signed in as, so sign out there (or use a private window) first. After upgrading from 0.1.x, run it once — old device-flow tokens are invalid. The flow then captures the machine's Claude subscription plan without asking, shows that account's past sessions and asks the same one question as terminal setup (see [Terminal setup](#terminal-setup)), and finishes by uploading past sessions from what you track, turning crash reports on unless you already chose, and installing the status line when it is off — re-running `/beezi:login` for an already-linked account is the way to refresh the plan, and it asks nothing once tracking is set up.
 - `/beezi:settings` — one screen showing where this folder's analytics go, your rules, New folders, crash reports and the status line, then a menu to change them:
   - `/beezi:settings rules` — for an account in several workspaces: a rule sends every session in one repo (matched by its `origin`, however it was cloned) or under one folder to the workspaces it names, or marks it not tracked. A repo rule wins first, then the folder rule with the longest matching path. Sessions in the home folder, `/` or a temp folder share one "outside a project" rule. While New folders is **Ask me**, the first session in a repo or folder with no rule asks once where its analytics go, and the answer becomes its rule; that session's data waits on this machine until it is answered. `/beezi:settings rules add` adds a rule for the current folder and `/beezi:settings rules remove <n>` removes one. A new or changed rule applies at once to open sessions there. A remote that uses an SSH host alias from `~/.ssh/config` (e.g. `git@github-work:org/repo`) is keyed by the alias, so its repo rule does not match the same repo's other clones.
   - `/beezi:settings new-folders` — for an account in several workspaces, where analytics go for a repo or folder with no rule: **Ask me** (the default), **Send to** the workspaces you pick, or **Don't send**. `/beezi:login` asks once.
@@ -119,7 +178,7 @@ the history backfill and `/beezi:sync` — goes to **each** linked account, gate
 own tracking mode. For an account in several workspaces, the backfill and `/beezi:sync` route
 each past session by its own repo or folder — its rule, else the New folders setting — never by
 the session running the command; under **Ask me** both first ask about repos and folders with past
-sessions and no rule yet. `--tenant` on either is an override that sends every past session to the
+sessions and no rule yet. Either way, nothing is uploaded until you answer Upload now, except to a workspace whose owner chose upload without asking, which shows a notice and uploads. `--tenant` on either is an override that sends every past session to the
 named workspaces. Reads go to one: the **default** account alone serves `/beezi:analytics` and
 `/beezi:settings refresh`. For an account in several workspaces a read uses one workspace — the
 one `/beezi:analytics 7d <workspace>` picked for this session, else the first one this session
@@ -134,8 +193,9 @@ into the first account slot automatically on first run.
 
 ## Plugin diagnostics (`/beezi:settings telemetry`)
 
-Off until you turn it on, per machine. When on, the plugin records structured facts about **its
-own** failures — plugin and Claude Code versions, OS, which plugin file failed, and the
+Per machine. Terminal setup and `/beezi:login` turn it on, with account correlation (the recommended
+mode below), unless you already chose a setting; `/beezi:settings telemetry` changes it. When on, the
+plugin records structured facts about **its own** failures — plugin and Claude Code versions, OS, which plugin file failed, and the
 authentication state at the time. Never your code, prompts, file paths, or repository names.
 
 Delivery does not require authorization. Reports go to a public ingestion route with no
@@ -144,7 +204,7 @@ triggered by hook startup and completion, handled crashes, authentication state 
 startup failures and login failures. That is deliberate: an OAuth failure is exactly the failure a
 token cannot report.
 
-Account correlation is a **separate** opt-in. With it, a random installation UUID is minted, bound
+Account correlation is a **separate** setting, on in the mode setup picks. With it, a random installation UUID is minted, bound
 to your account the next time authenticated activity succeeds, and attached to later reports so
 support can find yours. It is stored outside the credential store, survives refresh failures and
 reauthorization, and is discarded when the last account is logged out.
@@ -162,16 +222,16 @@ nothing is collected until you answer, and `on` stays a first-class answer.
 Pending reports live in `~/.beezi/telemetry/`, are capped at 200 events, and expire locally after
 14 days.
 
-## History backfill (runs inside `/beezi:login`)
+## History backfill
 
-The **one-time** upload of past sessions — not a command of its own; it runs automatically as the last step of `/beezi:login` (after the link and the plan capture). It scans every transcript under `~/.claude/projects/`, re-parses each one with the same code path the live hooks use (main transcript + subagents), and ships them to the backfill endpoint in chunks of up to 50 reports; the server absorbs duplicates through its own upsert keys. **In practice it covers only about the last 30 days of sessions:** Claude Code itself deletes local transcripts older than its `cleanupPeriodDays` setting (30 days by default), so the backfill — and `/beezi:sync` — can upload only what is still on disk. The plugin applies no date cutoff of its own; a user who raised `cleanupPeriodDays` in their Claude Code settings gets that longer history. After a fully clean run the pull is **finalized** (sealed) server-side — per account and tool, so log in on every machine that holds history *before* it finalizes; a finalized pull cannot be re-opened. Once used, the import is closed for good: the plugin verifies against the server before scanning anything, and a machine that re-runs it (including manual script runs and `--force`) is refused with a clear message — on audit workspaces it suggests upgrading the plan instead. Safe on every login: a durable ledger at `~/.beezi/accounts/<key>/audit-ledger.json` means only sessions the server never judged are retried, and the ledger is bound to the login that wrote it — an interrupted upload resumes on the next `/beezi:login`. For an account in several workspaces, each past session goes only to the workspaces its own repo or folder routes to (see `/beezi:settings rules`); while New folders is **Ask me** and repos or folders with past sessions still have no rule, a workspace's pull is kept open rather than finalized, and the next `/beezi:login` or `/beezi:sync` asks about them again.
+The upload of past sessions, run after you answer Upload now, or after the notice for a workspace whose owner chose upload without asking (see [Past sessions](#past-sessions-ask-first-or-upload-without-asking)). It uploads exactly the sessions the summary counted. It scans every transcript under `~/.claude/projects/`, re-parses each one with the same code path the live hooks use (main transcript + subagents), and ships them in chunks of up to 50 reports to `/sessions/sync`, or to the backfill endpoint (`/sessions/backfill`) on audit workspaces; the server absorbs duplicates through its own upsert keys. **In practice it covers only about the last 30 days of sessions:** Claude Code itself deletes local transcripts older than its `cleanupPeriodDays` setting (30 days by default), so the backfill — and `/beezi:sync` — can upload only what is still on disk. The plugin applies no date cutoff of its own; a user who raised `cleanupPeriodDays` in their Claude Code settings gets that longer history. An accepted upload never finalizes (seals) the pull. A workspace that an earlier plugin version already finalized is refused with a clear message — on audit workspaces it suggests upgrading the plan instead. A durable ledger at `~/.beezi/accounts/<key>/audit-ledger.json` means only sessions the server never judged are retried, and the ledger is bound to the login that wrote it; sessions an interrupted upload left behind are offered again. For an account in several workspaces, each past session goes only to the workspaces its own repo or folder routes to (see `/beezi:settings rules`); while New folders is **Ask me** and repos or folders with past sessions still have no rule, the next `/beezi:login` or `/beezi:sync` asks about them again.
 
-- **Claude's own cost record (0.30.0+; sent with segments since 0.33.1).** Claude Code writes its own whole-session cost accounting into the last records of a transcript. It is Claude's authoritative number (higher than anything the transcript can be tallied to: advisor iterations and retried API attempts never reach it). When a past session has one of those blocks, the backfill and `/beezi:sync` still run the **full segment path** for it and send the block **in the same chunk**: the server lets the block supersede only the segment-derived cost and tokens, and keeps everything the block cannot carry — billing and plan, the per-repository/branch split, subagents, operations (tools, MCP, skills, plugins), effort and mode breakdowns, and the timeline — from the segments. A block sent next to segments omits `repo_urls` (the server unions them, and the segments already name the repository), and a block with unknown-model cost is never sent next to segments (it does not supersede their tally server-side, so both would count). The block goes up **alone** only when the segment path has nothing to give: every line is already on the server (it then overlays the stored segments), or the transcript cannot be segmented (no working directory, unreadable, emit failure) — only then is the session limited to cost, token counts and a shell read off the transcript's head and tail (span, name, and the repository its first working directory resolves to, without shelling out to git). Sync asks `/sessions/coverage` about every Claude Code session; one an earlier version uploaded as a block alone has no line coverage, so it resumes from line 0 and gains its billing, operations and timeline. Before 0.33.1 a block replaced the segments outright, which is why sessions uploaded by those versions show **Unknown billing** until they are repaired. **The hourly background worker repairs them on its own** (since 0.32.3) (after its cost-record scan and Cowork sync): it takes the sessions this login's ledger records as accepted with zero reports, asks `/sessions/coverage` which of them the server holds no segments for, and runs exactly those through the `/beezi:sync` path — never any other history. It stops starting uploads a minute before the worker's 5-minute watchdog, so a large repair spreads over several hourly passes (a repaired session gains coverage and drops out). Once a pass leaves nothing it can fix, the account is stamped `segmentRepairAt` in its `cost-state-sync.json` and the repair never runs for it again; a refused workspace (`not-allowed`) is stamped too. `/beezi:sync` still repairs them immediately.
-- On workspaces with live tracking, only transcripts from **before this machine was linked** are uploaded (later work was already tracked live), and transcripts touched in the last 30 minutes are skipped as probably-open sessions.
+- **Claude's own cost record (0.30.0+; sent with segments since 0.33.1).** Claude Code writes its own whole-session cost accounting into the last records of a transcript. It is Claude's authoritative number (higher than anything the transcript can be tallied to: advisor iterations and retried API attempts never reach it). When a past session has one of those blocks, the backfill and `/beezi:sync` still run the **full segment path** for it and send the block **in the same chunk**: the server lets the block supersede only the segment-derived cost and tokens, and keeps everything the block cannot carry — billing and plan, the per-repository/branch split, subagents, operations (tools, MCP, skills, plugins), effort and mode breakdowns, and the timeline — from the segments. A block sent next to segments omits `repo_urls` (the server unions them, and the segments already name the repository), and a block with unknown-model cost is never sent next to segments (it does not supersede their tally server-side, so both would count). The block goes up **alone** only when the segment path has nothing to give: every line is already on the server (it then overlays the stored segments), or the transcript cannot be segmented (no working directory, unreadable, emit failure) — only then is the session limited to cost, token counts and a shell read off the transcript's head and tail (span, name, and the repository its first working directory resolves to, without shelling out to git). Sync asks `/sessions/coverage` about every Claude Code session; one an earlier version uploaded as a block alone has no line coverage, so it resumes from line 0 and gains its billing, operations and timeline. Before 0.33.1 a block replaced the segments outright, which is why sessions uploaded by those versions show **Unknown billing** until they are repaired. **The hourly background worker repairs some of them on its own** (since 0.32.3) (after its cost-record scan and Cowork sync): it takes the sessions this login's ledger records as accepted with zero reports, keeps only the ones this machine uploaded after a yes or tracked live, asks `/sessions/coverage` which of them the server holds no segments for, and runs exactly those through the `/beezi:sync` path — never any other history. It stops starting uploads a minute before the worker's 5-minute watchdog, so a large repair spreads over several hourly passes (a repaired session gains coverage and drops out). Once a pass leaves nothing it can fix, the account is stamped `segmentRepairAt` in its `cost-state-sync.json` and the repair never runs for it again; a refused workspace (`not-allowed`) is stamped too. Sessions imported before the link and never accepted at a question are left alone; `/beezi:sync` offers them, and repairs them once you answer Upload now.
+- On workspaces with live tracking, the offer at `/beezi:login`, in terminal setup and at session start covers only transcripts from **before this machine was linked** (later work was already tracked live). `/beezi:sync` has no link cutoff: it offers every session the server does not already hold in full. Transcripts touched in the last 30 minutes are skipped as probably-open sessions.
 - On platform workspaces, only sessions whose repository is **connected to Beezi** can land; expect some to come back as "repository is not connected to Beezi". Analytics workspaces track every repo.
 - Plan and billing fields (`billing_source`, `subscription_plan`, `rate_limit_tier`) are read from the **current** environment, not from the historical session — an uploaded March session carries today's plan.
 - Session timelines travel inside the backfill chunks themselves, so backfilled sessions carry their activity timeline everywhere. Rate-limit events remain live-tracking-only — audit-mode datasets do not include them.
-- For manual runs, `node scripts/backfill.mjs` accepts `--dry-run` (report what would be sent, send nothing), `--since <YYYY-MM-DD>` (only transcripts modified on or after that date — a scoped run never finalizes) and `--force` (ignore the local ledger; only meaningful before the pull finalizes — re-sending a partly-tracked session can re-segment on different boundaries once its per-session cursor has aged out, which can duplicate tokens/cost; use it only when a repository has since been connected).
+- For manual runs, `node scripts/backfill.mjs --account <key>` without `--accept` counts each workspace's past sessions and prints the summary without sending anything. It still saves each workspace's offer, and remembers a workspace with nothing to offer as settled. The printed `upload-command=` (`--accept <workspace> --offer <token>`) then uploads exactly the sessions that offer counted; if the offer changed since it was printed, nothing is uploaded. `--since` and `--force` are no longer read.
 
 Analytics are otherwise tracked automatically via the session lifecycle hooks, and the history backfill only ever uploads sessions the hooks never saw. On audit-mode workspaces (no live tracking) the hooks stay silent by design: the server refuses live reports there, and the plugin caches that verdict in `~/.beezi/accounts/<key>/tracking.json` from the session-start `whoami`.
 
@@ -254,7 +314,7 @@ npm test   # runs node --test (Node built-in runner, no jest); no install/build 
 
 ## Cached Cowork sessions
 
-Beezi also reads Claude Desktop's local Cowork conversation cache on Windows and macOS. `/beezi:sync` imports cached sessions using Claude's final cumulative model usage, including auxiliary models, and starts a live host worker. Successful login and `SessionStart`/`Stop` also start it. After updating/reloading the plugin, run `/beezi:sync` once on the machine running Desktop to start live tracking without another Code session. `--dry-run` never starts the worker.
+Beezi also reads Claude Desktop's local Cowork conversation cache on Windows and macOS. `/beezi:sync` imports cached sessions using Claude's final cumulative model usage, including auxiliary models, and starts a live host worker. Successful login and `SessionStart`/`Stop` also start it. After updating/reloading the plugin, run `/beezi:sync` once on the machine running Desktop to start live tracking without another Code session.
 
 The live worker continues independently while Claude Desktop is open, including while Cowork is idle. It checks cache metadata every 5 seconds and parses changed data at most once every 15 seconds. Completed-turn cumulative results are eligible immediately; there is no 30-minute delay on this live path. Updates normally arrive within one polling/scan interval after Desktop caches a completed result, plus network time. This is completed-turn tracking, not a streaming token meter: active partial messages are not reliable cost totals. Unchanged accepted snapshots are not resent; transient cache/auth/network failures retry with backoff from 15 seconds to 5 minutes.
 
@@ -266,6 +326,6 @@ Cowork records use the runtime session UUID to avoid duplicating a matching Clau
 
 Repeated cumulative snapshots are upserted rather than added. The per-account audit ledger retains the last accepted snapshot so older or incomplete local caches cannot lower its counters; sync operations share a local lock. This cannot prevent an older snapshot from another machine overwriting a newer one on a server without revision checks.
 
-The reader is bounded and read-only. It follows LevelDB's manifest, validates checksums, reconstructs journal fragments, and decodes supported IndexedDB values. Unsupported/corrupt cache formats produce a sync warning and remain retryable. Claude can evict cache entries, and cloud sessions never opened on this machine may be absent; the cache is not a complete session archive. Manual `/beezi:sync --dry-run` previews eligible sessions without sending analytics.
+The reader is bounded and read-only. It follows LevelDB's manifest, validates checksums, reconstructs journal fragments, and decodes supported IndexedDB values. Unsupported/corrupt cache formats produce a sync warning and remain retryable. Claude can evict cache entries, and cloud sessions never opened on this machine may be absent; the cache is not a complete session archive.
 
 As with existing Claude Code history imports, locally cached history is sent to each eligible linked Beezi workspace. Switching Claude accounts can leave earlier accounts' cached sessions on the same OS profile; this reader does not infer a Beezi-to-Claude account mapping.

@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import { configCandidates } from './claude-account.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { usagePingStateFile } from './paths.mjs';
+import { usagePingStateFile, usageSnapshotStateFile } from './paths.mjs';
 
 // Standalone capture of the subscription-limit cache, decoupled from runCheckpoint.
 //
@@ -61,57 +61,89 @@ export async function pingUsageSnapshot(deps = {}) {
   }
 
   // Heavy imports stay off the fast path — reached only when the config file actually changed.
-  const { linkedSessions } = await import('./sessions.mjs');
-  const { maybePostUsageSnapshot } = await import('./usage-snapshot-report.mjs');
-  const { oauthTokenEnvWithOsProbe } = await import('./claude-settings-env.mjs');
+  const sessionsModule = await import('./sessions.mjs');
+  const { listAccounts: _listAccounts, AccountStatus } = await import('./accounts.mjs');
   const { allowsLiveFor, readTrackingState } = await import('./tracking.mjs');
   const { readSessionWorkspace, expandTargets, resolveTargets } = await import('./workspace.mjs');
+  const listAccounts = deps.listAccounts == null ? _listAccounts : deps.listAccounts;
 
-  let sessions = [];
+  // Every gate runs on the account rows, which hold no token, and the hook never reads a
+  // credential at all (a read costs a PowerShell start on Windows): what survives the gates is
+  // written to the outbox as a snapshot item, and the upload worker posts it with the token it
+  // reads once per run.
+  let rows = [];
   try {
-    sessions = await linkedSessions();
+    rows = await listAccounts();
   } catch {
     return { reported: false, reason: 'no-token' };
   }
-  if (sessions.length === 0) return { reported: false, reason: 'no-token' };
+  // Rows become recipients only through accountRecipient: a row's own tenantId is the web-side
+  // tenant, and expandTargets would follow it unexpanded.
+  const accounts = (rows || [])
+    .filter((row) => row != null && row.status === AccountStatus.LINKED)
+    .map(sessionsModule.accountRecipient);
+  if (accounts.length === 0) return { reported: false, reason: 'no-token' };
 
   // Stamped from the hook's session; the env id covers a caller that does not pass one.
   const sessionId = deps.sessionId == null ? env.CLAUDE_CODE_SESSION_ID : deps.sessionId;
   let workspaceState = null;
   try { workspaceState = sessionId == null ? null : readSessionWorkspace(sessionId); } catch { workspaceState = null; }
   // One clone per target workspace; an account with none left is skipped.
-  const accounts = sessions;
-  sessions = expandTargets(accounts, workspaceState);
-  if (sessions.length === 0) {
+  let targets = expandTargets(accounts, workspaceState);
+  if (targets.length === 0) {
     // Pending only while the session awaits a rule; otherwise a Don't track rule or New folders Don't send.
     const pending = accounts.some((s) => resolveTargets(s, workspaceState).pendingAsk);
     return { reported: false, reason: pending ? 'workspace-pending' : 'no-targets' };
   }
 
   // Each account answers for itself: a dark tenant is dropped before the fan-out, not at the server.
-  sessions = sessions.filter((s) => allowsLiveFor(s, readTrackingState(s.key)));
-  if (sessions.length === 0) return { reported: false, reason: 'tracking-disabled' };
+  targets = targets.filter((s) => allowsLiveFor(s, readTrackingState(s.key)));
+  if (targets.length === 0) return { reported: false, reason: 'tracking-disabled' };
 
-  // The SAME env resolution runCheckpoint performs, so the snapshot this path posts carries the
-  // same identity as the session reports that path sends. A setup token can live in Claude Code's
-  // settings file or the OS environment, where the bare process.env above cannot see it — and the
-  // identity stamp suppresses the local uuid precisely when one is in force. Reading a bare env
-  // here would post the stale uuid this machine's other reports withhold, and the two would
-  // resolve to two different accounts server-side.
-  //
-  // Resolved LAST, after the mtime gate and after the sessions: the OS probe is the expensive part,
-  // and a machine that never ran /beezi:login must not pay for it on every config rewrite. An
-  // injected deps.env is trusted verbatim, exactly as in checkpoint — it describes a machine under
-  // test, and a developer's own settings file must not leak into it.
-  const probedEnv = deps.env == null
-    ? oauthTokenEnvWithOsProbe(process.env, { osEnvOauthToken: deps.osEnvOauthToken })
-    : deps.env;
+  // The sample is the usage reading as seen now: the worker posts each stored sample as it was,
+  // so refreshes between this ping and the send are not collapsed into one.
+  const { readUsageUtilization: _readUsageUtilization } = await import('./usage-utilization.mjs');
+  const readUsageUtilization = deps.readUsageUtilization == null ? _readUsageUtilization : deps.readUsageUtilization;
+  let sample = null;
+  try { sample = readUsageUtilization(); } catch { sample = null; }
+  if (!sample) return { reported: false, reason: 'no-utilization' };
 
-  const postDeps = { ...deps, env: probedEnv };
-  // Sequential: clones of one account share a marker file.
-  const results = [];
-  for (const s of sessions) {
-    results.push(await maybePostUsageSnapshot(s, postDeps).catch(() => ({ reported: false, reason: 'network' })));
+  // The marker maybePostUsageSnapshot advances on a confirmed send. A config rewrite that did not
+  // move the reading must not wake the worker (and its credential read) for a sample every target
+  // already sent, so those targets are dropped here, as the post would skip them there.
+  const unsent = targets.filter((s) => !sampleAlreadySent(readJson(usageSnapshotStateFile(s.key)), s.tenantId, sample));
+  if (unsent.length === 0) return { reported: false, reason: 'already-sent' };
+
+  // One snapshot item per account, with that account's surviving target workspaces.
+  const clonesByKey = new Map();
+  for (const s of unsent) {
+    if (!clonesByKey.has(s.key)) clonesByKey.set(s.key, []);
+    clonesByKey.get(s.key).push(s);
   }
-  return { reported: results.some((r) => r.reported), results };
+  const { enqueueOutbox, OUTBOX_KINDS } = await import('./outbox.mjs');
+  let outboxed = 0;
+  for (const [key, clones] of clonesByKey) {
+    try {
+      enqueueOutbox(key, { kind: OUTBOX_KINDS.SNAPSHOT, tenantId: null, targets: clones.map((s) => s.tenantId), sample });
+      outboxed += 1;
+    } catch { /* best-effort: the next ping or turn-end writes it again */ }
+  }
+  if (outboxed === 0) return { reported: false, reason: 'outbox-failed' };
+
+  let spawn = null;
+  try {
+    const spawnUploadWorker = deps.spawnUploadWorker == null
+      ? (await import('./upload-trigger.mjs')).maybeSpawnUploadWorker
+      : deps.spawnUploadWorker;
+    spawn = spawnUploadWorker();
+  } catch { spawn = 'failed'; }
+  return { reported: false, reason: 'outboxed', outboxed, spawn };
+}
+
+// Same rule as maybePostUsageSnapshot's marker: per workspace when the target has one.
+function sampleAlreadySent(state, tenantId, sample) {
+  if (state == null) return false;
+  const byTenant = state.lastSentByTenant == null ? {} : state.lastSentByTenant;
+  const marker = tenantId == null ? state.lastSent : byTenant[tenantId];
+  return marker != null && marker.accountUuid === sample.accountUuid && marker.fetchedAtMs === sample.fetchedAtMs;
 }

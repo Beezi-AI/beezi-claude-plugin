@@ -4,7 +4,7 @@ import { runHook, importHookModule } from '../lib/hook-runner.mjs';
 import { DIAGNOSTIC_SOURCES } from '../lib/telemetry-codes.mjs';
 import { maybeSpawnCostStateSync } from '../lib/cost-state-trigger.mjs';
 import { maybeSpawnCoworkLive } from '../lib/cowork-live.mjs';
-import { maybeStartPendingHistory } from '../lib/history-trigger.mjs';
+import { maybeStartHistoryScans, maybeStartPendingHistory, sharedReads } from '../lib/history-trigger.mjs';
 
 const input = readHookInput();
 if (!input) process.exit(0);
@@ -33,26 +33,33 @@ runHook(DIAGNOSTIC_SOURCES.SESSION_START, async () => {
   try {
     systemMessage = mod == null ? null : await mod.runSessionStart(input);
   } catch (error) { failure = error; }
+  // Read after runSessionStart, which refreshes the rows, and shared by every gate below.
+  const reads = sharedReads();
   if (failure == null) {
     maybeSpawnCostStateSync();
     maybeSpawnCoworkLive();
     // Awaited: the runner exits once this callback resolves, which could cut off the spawn.
-    await maybeStartPendingHistory();
+    await maybeStartPendingHistory(reads);
+    await maybeStartHistoryScans(reads);
   }
   let joinedPrompt = null;
   let workspacePrompt = null;
+  let historyOffer = null;
   let historyNotice = null;
   try {
-    if (prompt != null) joinedPrompt = await prompt.buildJoinedPrompt(input);
+    if (prompt != null) joinedPrompt = await prompt.buildJoinedPrompt(input, reads);
   } catch { /* the ask is best-effort; the session still starts */ }
   try {
     // Re-binds on every source with the tenants runSessionStart just refreshed; asks only on startup or clear.
-    if (prompt != null) workspacePrompt = await prompt.buildWorkspacePrompt(input);
+    if (prompt != null) workspacePrompt = await prompt.buildWorkspacePrompt(input, reads);
   } catch { /* the ask is best-effort; the session still starts */ }
-  // The joined re-pick comes first, so the current-folder question sees its answers.
-  const additionalContext = [joinedPrompt, workspacePrompt].filter(Boolean).join('\n\n') || null;
   try {
-    if (prompt != null && failure == null) historyNotice = await prompt.buildHistoryNotice(input);
+    if (prompt != null && failure == null) historyOffer = await prompt.buildHistoryOfferPrompt(input, reads);
+  } catch { /* the offer is best-effort; the session still starts */ }
+  // The joined re-pick comes first, so the current-folder question sees its answers; the history offer comes last.
+  const additionalContext = [joinedPrompt, workspacePrompt, historyOffer].filter(Boolean).join('\n\n') || null;
+  try {
+    if (prompt != null && failure == null) historyNotice = await prompt.buildHistoryNotice(input, reads);
   } catch { /* the ask is best-effort; the session still starts */ }
   if (historyNotice != null) systemMessage = systemMessage ? `${systemMessage}\n${historyNotice}` : historyNotice;
   if (failure != null) {

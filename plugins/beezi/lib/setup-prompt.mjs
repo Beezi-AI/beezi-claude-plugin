@@ -6,9 +6,12 @@ import { createStyle } from './setup-style.mjs';
 
 const HIDE_CURSOR = '\x1b[?25l';
 const SHOW_CURSOR = '\x1b[?25h';
-const HINT_CHOOSE = '↑/↓ move · Enter select';
-const HINT_SKIP = '↑/↓ move · Enter select · Esc skip';
-const HINT_MANY = '↑/↓ move · Space select · Enter confirm (nothing selected = skip)';
+const HINT_CHOOSE = '↑↓ to move, Enter to choose';
+const HINT_TICK = '↑↓ to move, Space to tick, Enter to confirm';
+const QUESTION_INDENT = '  ';
+const OPTION_INDENT = '    ';
+const WINDOW_ROWS = 10;
+const LABEL_GAP = 3;
 
 function openDevTty() {
   return new tty.ReadStream(fs.openSync('/dev/tty', 'r'));
@@ -42,31 +45,16 @@ export function parseNumbers(answer, count) {
   return picked;
 }
 
-// Unticks a picked row; else ticks an exclusive row alone, or any other row with the exclusive rows cleared.
-export function togglePick(picked, i, exclusive) {
-  if (picked.indexOf(i) !== -1) return picked.filter((p) => p !== i);
-  if (exclusive.indexOf(i) !== -1) return [i];
-  return picked.filter((p) => exclusive.indexOf(p) === -1).concat(i);
+// Unticks a picked row, else ticks it.
+export function togglePick(picked, i) {
+  return picked.indexOf(i) !== -1 ? picked.filter((p) => p !== i) : picked.concat(i);
 }
 
-// First exclusive row picked together with another row, else -1.
-export function mixedExclusive(picked, exclusive) {
-  if (picked.length < 2) return -1;
-  const found = picked.filter((p) => exclusive.indexOf(p) !== -1);
-  return found.length > 0 ? found[0] : -1;
-}
-
-// Numbered option rows with the default mark and the descriptions dimmed.
-function styledOptions(options, defaultIndex, style) {
-  return options.map((option, i) => {
-    const mark = i === defaultIndex ? style.dim(' (default)') : '';
-    const description = option.description ? style.dim(` — ${option.description}`) : '';
-    return `  ${i + 1}) ${option.label}${mark}${description}`;
-  });
-}
-
-export function renderOptions(options, defaultIndex) {
-  return styledOptions(options, defaultIndex, createStyle({ enabled: false }));
+// The first option row shown, moved only as far as keeps the pointer inside the window.
+function windowTop(top, cursor) {
+  if (cursor < top) return cursor;
+  if (cursor >= top + WINDOW_ROWS) return cursor - WINDOW_ROWS + 1;
+  return top;
 }
 
 const WIDE_RANGES = [
@@ -96,6 +84,20 @@ function fit(text, room) {
     used += columnsOf(char);
   }
   return `${kept}…`;
+}
+
+// The label column: the widest label plus the gap, narrowed for the descriptions but never below half the room.
+function labelColumn(options, room) {
+  const labels = Math.max(...options.map((option) => width(option.label)));
+  const descriptions = Math.max(...options.map((option) => (option.description ? width(option.description) : 0)));
+  return Math.min(labels + LABEL_GAP, Math.max(room - descriptions, Math.floor(room / 2)));
+}
+
+// An option's label padded to the column and its description cut to what is left of the room.
+function optionCells(option, column, room) {
+  if (!option.description) return { label: fit(option.label, room), description: '' };
+  const label = fit(option.label, column - LABEL_GAP);
+  return { label: label + ' '.repeat(column - width(label)), description: fit(option.description, room - column) };
 }
 
 // Moves the cursor up over rows lines and clears everything below it.
@@ -144,10 +146,12 @@ function gateLines(input, keyOpen) {
   return { lines, detach: () => input.removeListener('data', onData) };
 }
 
+// io.format renders each lead line (the lines shown above a question) as one or more \n-joined terminal rows.
 export function createPrompt(io) {
   const input = io.input;
   const output = io.output;
   const style = io.style || createStyle({ enabled: false });
+  const format = io.format || ((line) => line);
   const onInterrupt = io.onInterrupt || null;
   let keys = Boolean(io.interactive);
   let cancelKeys = null;
@@ -178,8 +182,22 @@ export function createPrompt(io) {
     return new Promise((resolve) => { waiting = resolve; });
   }
 
-  function showMenu(question, options, defaultIndex) {
-    output.write(`\n${style.bold(question)}\n${styledOptions(options, defaultIndex, style).join('\n')}\n`);
+  function leadRows(lead) {
+    const rows = [];
+    lead.forEach((line) => { rows.push(...format(line).split('\n')); });
+    return rows.length ? [''].concat(rows) : rows;
+  }
+
+  function questionRow(question) {
+    return `${QUESTION_INDENT}${style.accent('◆')} ${style.bold(question)}`;
+  }
+
+  function showMenu(question, options, lead) {
+    const rows = options.map((option, i) => {
+      const description = option.description ? style.dim(`  ${option.description}`) : '';
+      return `${OPTION_INDENT}${i + 1}) ${option.label}${description}`;
+    });
+    output.write(`${leadRows(lead).concat('', questionRow(question), rows).join('\n')}\n`);
   }
 
   // Turns raw mode on for one key question; false, and typed prompts from then on, when keys are off or it throws.
@@ -194,13 +212,13 @@ export function createPrompt(io) {
     }
   }
 
-  // True when count menu rows fit above the terminal's last row, or its height is unknown.
+  // True when count rows fit above the terminal's last row, or its height is unknown.
   function fitsScreen(count) {
     return !output.rows || count < output.rows;
   }
 
-  // Shows rows() with the cursor hidden, redraws it after each key onKey reports as a change, and resolves via finish.
-  function keyQuestion(question, rows, onKey) {
+  // Shows rows() with the cursor hidden, redraws it after each key onKey reports as a change, and erases it all on finish.
+  function keyQuestion(rows, onKey) {
     return new Promise((resolve, reject) => {
       let drawn = 0;
       function draw() {
@@ -214,8 +232,8 @@ export function createPrompt(io) {
         cancelKeys = null;
         output.write(SHOW_CURSOR);
       }
-      function finish(value, answer) {
-        output.write(`${erase(drawn)}${style.green('✓')} ${style.bold(question)} ${answer}\n`);
+      function finish(value) {
+        output.write(erase(drawn));
         stop();
         resolve(value);
       }
@@ -252,158 +270,115 @@ export function createPrompt(io) {
     });
   }
 
-  // The question, one row per option and the hint, each cut to fit one terminal row.
-  function menuRows(question, options, cursor, picked, hint) {
+  // The lead, the question, a window of option rows and the hint, each option row cut to one terminal row.
+  function menuRows(menu, cursor, picked, top) {
     const room = (output.columns || 80) - 1;
-    const optionRoom = room - (picked === null ? 2 : 4);
-    const rows = [`${style.boldCyan('?')} ${style.bold(fit(question, room - 2))}`];
-    options.forEach((option, i) => {
-      const active = i === cursor;
-      const pointer = active ? style.cyan('❯') : ' ';
-      const box = picked === null ? '' : `${picked.indexOf(i) === -1 ? style.dim('◯') : style.green('◉')} `;
-      const label = fit(option.label, optionRoom);
-      const description = option.description ? fit(` — ${option.description}`, optionRoom - width(label)) : '';
-      rows.push(`${pointer} ${box}${active ? style.cyan(label) : label}${description ? style.dim(description) : ''}`);
+    const optionRoom = room - OPTION_INDENT.length - (picked === null ? 2 : 4);
+    const column = labelColumn(menu.options, optionRoom);
+    const rows = leadRows(menu.lead).concat('', questionRow(fit(menu.question, room - QUESTION_INDENT.length - 2)));
+    menu.options.slice(top, top + WINDOW_ROWS).forEach((option, k) => {
+      const i = top + k;
+      const ticked = picked !== null && picked.indexOf(i) !== -1;
+      const cells = optionCells(option, column, optionRoom);
+      let tone = style.dim;
+      if (i === cursor) tone = style.bold;
+      else if (ticked) tone = (text) => text;
+      const pointer = i === cursor ? style.accent('❯') : ' ';
+      let box = '';
+      if (picked !== null) box = `${ticked ? style.accent('◉') : style.dim('◯')} `;
+      rows.push(`${OPTION_INDENT}${pointer} ${box}${tone(cells.label)}${cells.description ? style.dim(cells.description) : ''}`);
     });
-    rows.push(style.dim(`  ${fit(hint, room - 2)}`));
+    rows.push(`${OPTION_INDENT}${style.dim(fit(picked === null ? HINT_CHOOSE : HINT_TICK, room - OPTION_INDENT.length))}`);
     return rows;
   }
 
-  function keyChoose(question, options, defaultIndex) {
-    let cursor = defaultIndex === -1 ? 0 : defaultIndex;
+  function keyChoose(menu) {
+    let cursor = 0;
+    let top = 0;
     let run = '';
-    const hint = defaultIndex === -1 ? HINT_SKIP : HINT_CHOOSE;
-    return keyQuestion(question, () => menuRows(question, options, cursor, null, hint), (str, key, finish) => {
+    return keyQuestion(() => menuRows(menu, cursor, null, top), (str, key, finish) => {
       if (isSubmit(key)) {
-        finish(cursor, style.cyan(options[cursor].label));
+        finish(cursor);
         return false;
       }
-      if (key.name === 'escape' && defaultIndex === -1) {
-        finish(null, style.dim('skipped'));
-        return false;
-      }
-      run = isDigit(str) ? nextRun(run, str, options.length) : '';
-      let next = step(str, key, cursor, options.length);
+      run = isDigit(str) ? nextRun(run, str, menu.options.length) : '';
+      let next = step(str, key, cursor, menu.options.length);
       if (isDigit(str)) next = run === '' ? cursor : Number(run) - 1;
       if (next === cursor) return false;
       cursor = next;
+      top = windowTop(top, cursor);
       return true;
     });
   }
 
-  function keyChooseMany(question, options, exclusive) {
+  function keyChooseMany(menu, initial) {
     let cursor = 0;
+    let top = 0;
     let run = '';
     let before = [];
-    let picked = [];
-    return keyQuestion(question, () => menuRows(question, options, cursor, picked, HINT_MANY), (str, key, finish) => {
+    let picked = initial.slice();
+    return keyQuestion(() => menuRows(menu, cursor, picked, top), (str, key, finish) => {
       if (isSubmit(key)) {
-        const chosen = picked.slice().sort((a, b) => a - b);
-        const labels = chosen.map((i) => options[i].label).join(', ');
-        finish(chosen, chosen.length > 0 ? style.cyan(labels) : style.dim('skipped'));
-        return false;
-      }
-      if (key.name === 'escape') {
-        finish([], style.dim('skipped'));
+        finish(picked.slice().sort((a, b) => a - b));
         return false;
       }
       if (isDigit(str)) {
-        run = nextRun(run, str, options.length);
+        run = nextRun(run, str, menu.options.length);
         if (run === '') return false;
-        // A fresh run remembers the ticks before it; a longer run starts over from them, so it undoes its prefix's toggle and clearing.
+        // A fresh run remembers the ticks before it; a longer run starts over from them, so it undoes its prefix's toggle.
         if (run.length === 1) before = picked.slice();
-        picked = togglePick(before, Number(run) - 1, exclusive);
+        picked = togglePick(before, Number(run) - 1);
         return true;
       }
       run = '';
       if (key.name === 'space') {
-        picked = togglePick(picked, cursor, exclusive);
+        picked = togglePick(picked, cursor);
         return true;
       }
-      const next = step(str, key, cursor, options.length);
+      const next = step(str, key, cursor, menu.options.length);
       if (next === cursor) return false;
       cursor = next;
+      top = windowTop(top, cursor);
       return true;
     });
   }
 
-  function keyConfirm(question, defaultYes) {
-    const choices = defaultYes ? '[Y/n]' : '[y/N]';
-    let answer = null;
-    const row = () => {
-      const room = (output.columns || 80) - 1;
-      const typed = answer === null ? '' : ` ${style.cyan(answer ? 'y' : 'n')}`;
-      return [`${style.boldCyan('?')} ${style.bold(fit(question, room - 10))} ${style.boldCyan(choices)}${typed}`];
-    };
-    return keyQuestion(question, row, (str, key, finish) => {
-      if (isSubmit(key)) {
-        const value = answer === null ? defaultYes : answer;
-        finish(value, style.cyan(value ? 'Yes' : 'No'));
-        return false;
-      }
-      let next = answer;
-      if (str === 'y' || str === 'Y') next = true;
-      if (str === 'n' || str === 'N') next = false;
-      if (next === answer) return false;
-      answer = next;
-      return true;
-    });
-  }
-
+  // Answers the 0-based option; Enter picks the first. Esc does nothing: the question cannot be dismissed. opts.lead lines show above it and fold away with it.
   async function choose(question, options, opts) {
     if (closed) return null;
-    const defaultIndex = opts && typeof opts.defaultIndex === 'number' ? opts.defaultIndex : -1;
-    if (fitsScreen(options.length + 2) && rawOn()) return keyChoose(question, options, defaultIndex);
-    showMenu(question, options, defaultIndex);
-    const range = `1-${options.length}`;
-    const query = defaultIndex === -1 ? `Choose ${range}, or press Enter to skip:` : `Choose ${range} [${defaultIndex + 1}]:`;
+    const menu = { question, options, lead: opts && Array.isArray(opts.lead) ? opts.lead : [] };
+    if (fitsScreen(menuRows(menu, 0, null, 0).length) && rawOn()) return keyChoose(menu);
+    showMenu(question, options, menu.lead);
     for (;;) {
-      const answer = await ask(`${style.boldCyan(query)} `);
+      const answer = await ask(`${QUESTION_INDENT}${style.bold(`Choose 1-${options.length} [1]:`)} `);
       if (answer === null) return null;
-      if (answer === '') return defaultIndex === -1 ? null : defaultIndex;
+      if (answer === '') return 0;
       const picked = parseNumbers(answer, options.length);
       if (picked !== null && picked.length === 1) return picked[0];
-      output.write(`${style.yellow(`Enter one number from 1 to ${options.length}.`)}\n`);
+      output.write(`${QUESTION_INDENT}Enter one number from 1 to ${options.length}.\n`);
     }
   }
 
+  // Answers the ticked rows, sorted; opts.initial rows start ticked, a typed Enter keeps them and `none` ticks nothing. Esc does nothing.
   async function chooseMany(question, options, opts) {
     if (closed) return null;
     if (options.length === 0) return [];
-    const exclusive = opts && Array.isArray(opts.exclusive) ? opts.exclusive : [];
-    if (fitsScreen(options.length + 2) && rawOn()) return keyChooseMany(question, options, exclusive);
-    showMenu(question, options, -1);
+    const initial = opts && Array.isArray(opts.initial) ? opts.initial : [];
+    const menu = { question, options, lead: [] };
+    if (fitsScreen(menuRows(menu, 0, initial, 0).length) && rawOn()) return keyChooseMany(menu, initial);
+    showMenu(question, options, []);
+    const query = initial.length === 0
+      ? 'Choose one or more (for example 1,2), or press Enter for none:'
+      : `Choose one or more (for example 1,2), or type none [${initial.map((i) => i + 1).join(',')}]:`;
     for (;;) {
-      const answer = await ask(`${style.boldCyan('Choose one or more (for example 1,2), or press Enter to skip:')} `);
+      const answer = await ask(`${QUESTION_INDENT}${style.bold(query)} `);
       if (answer === null) return null;
+      if (answer === '') return initial.slice();
+      if (answer.trim().toLowerCase() === 'none') return [];
       const picked = parseNumbers(answer, options.length);
-      const mixed = picked === null ? -1 : mixedExclusive(picked, exclusive);
-      if (picked !== null && mixed === -1) return picked;
-      const warning = picked === null
-        ? `Enter numbers from 1 to ${options.length}, separated by commas.`
-        : `"${options[mixed].label}" can't be combined with other choices.`;
-      output.write(`${style.yellow(warning)}\n`);
+      if (picked !== null) return picked;
+      output.write(`${QUESTION_INDENT}Enter numbers from 1 to ${options.length}, separated by commas.\n`);
     }
-  }
-
-  async function confirm(question, defaultYes) {
-    if (closed) return null;
-    if (rawOn()) return keyConfirm(question, defaultYes);
-    const query = `\n${style.bold(question)} ${style.boldCyan(defaultYes ? '[Y/n]' : '[y/N]')} `;
-    for (;;) {
-      const answer = await ask(query);
-      if (answer === null) return null;
-      if (answer === '') return defaultYes;
-      if (/^(y|yes)$/i.test(answer)) return true;
-      if (/^(n|no)$/i.test(answer)) return false;
-      output.write(`${style.yellow('Answer y or n.')}\n`);
-    }
-  }
-
-  // Reads one line in both modes.
-  async function text(question) {
-    const answer = await ask(`\n${style.bold(question)} `);
-    return answer === null || answer === '' ? null : answer;
   }
 
   // Dismisses an open key question, closes the line reader and, in key mode, stops reading the terminal.
@@ -416,5 +391,5 @@ export function createPrompt(io) {
     }
   }
 
-  return { choose, chooseMany, confirm, text, close };
+  return { choose, chooseMany, close };
 }

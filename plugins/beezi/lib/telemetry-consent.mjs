@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { telemetryConsentFile } from './paths.mjs';
 
@@ -30,6 +31,13 @@ export function hasBeenAsked() {
 export function isCorrelationGranted() {
   const state = readConsent();
   return state != null && state.consent === 'granted' && state.correlation === 'granted';
+}
+
+// Undecided only with no consent file or one that records a prompt shown and never answered; an unreadable or other-version file counts as decided.
+export function hasDecided() {
+  if (!fs.existsSync(telemetryConsentFile())) return false;
+  const state = readConsent();
+  return state == null || state.consent === 'granted' || state.consent === 'denied' || state.correlation === 'denied';
 }
 
 export function hasCorrelationBeenAsked() {

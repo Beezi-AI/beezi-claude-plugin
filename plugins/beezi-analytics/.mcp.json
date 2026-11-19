@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "beezi": {
+      "type": "http",
+      "url": "https://api.beezi.ai/api/mcp",
+      "headers": {
+        "X-Beezi-Plugin": "light"
+      }
+    }
+  }
+}

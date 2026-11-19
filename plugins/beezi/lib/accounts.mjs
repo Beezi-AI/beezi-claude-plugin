@@ -18,10 +18,11 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { migrateSingleAccountStore, CREDENTIAL_STATUS } from './credentials.mjs';
 import { markUpgradeNoticePending } from './auth-markers.mjs';
 import { UserError } from './friendly-error.mjs';
+import { SAFE_TENANT_ID } from './whoami.mjs';
 import { rulesOf, outsideKey } from './workspace-rules.mjs';
 import { routingOf, sameRouting } from './rule-undo.mjs';
 import {
-  ruleRequestIds, removalRequestIds, newFoldersSendIds, gainedIds, requestHistory, noteAttempt, settleHistory, takeResults, SettleState,
+  ruleRequestIds, newFoldersSendIds, defaultRouteIds, gainedIds, requestHistory, noteAttempt, settleHistory, takeResults, SettleState,
 } from './pending-history.mjs';
 
 const INDEX_VERSION = 1;
@@ -40,7 +41,10 @@ function emptyIndex() {
 
 function normalize(raw) {
   if (!raw || raw.version !== INDEX_VERSION || !Array.isArray(raw.accounts)) return null;
-  const accounts = raw.accounts.filter((a) => a && typeof a.key === 'string' && /^[0-9a-f]{8}$/.test(a.key));
+  const accounts = raw.accounts
+    .filter((a) => a && typeof a.key === 'string' && /^[0-9a-f]{8}$/.test(a.key))
+    // A top-level id stored before the whoami filter reads as none, as the filter would have stored it.
+    .map((a) => (a.tenantId == null || (typeof a.tenantId === 'string' && SAFE_TENANT_ID.test(a.tenantId)) ? a : { ...a, tenantId: null }));
   let def = accounts.some((a) => a.key === raw.default) ? raw.default : null;
   // A lone linked account is the default in memory, so a lost `default` is never a dead end.
   if (def == null) {
@@ -208,6 +212,8 @@ export function addAccount(row, deps = {}) {
       tenantId: row.tenantId == null ? null : row.tenantId,
       tenantName: row.tenantName == null ? null : row.tenantName,
       tenants: Array.isArray(row.tenants) ? row.tenants : null,
+      anonymization: row.anonymization == null ? null : row.anonymization,
+      pastSessions: row.pastSessions == null ? null : row.pastSessions,
       newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
       workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
       clientId: row.clientId == null ? null : row.clientId,
@@ -227,7 +233,7 @@ export function updateAccount(key, patch, deps = {}) {
     const index = await readIndex(deps);
     const row = index.accounts.find((a) => a.key === key);
     if (!row) return index;
-    for (const field of ['email', 'name', 'tenantId', 'tenantName', 'tenants', 'newFolders', 'workspaceRules', 'clientId', 'linkedAt', 'status']) {
+    for (const field of ['email', 'name', 'tenantId', 'tenantName', 'tenants', 'anonymization', 'pastSessions', 'newFolders', 'workspaceRules', 'clientId', 'linkedAt', 'status']) {
       if (patch[field] == null) continue;
       row[field] = field === 'email' ? String(patch[field]).toLowerCase() : patch[field];
     }
@@ -253,7 +259,7 @@ export function setNewFolders(key, { mode, tenantIds = [] } = {}, deps = {}) {
     row.newFolders = { mode, tenantIds: mode === 'send' ? ids : [] };
     // Replaced by newFolders and rules.
     delete row.tenantPolicies;
-    requestHistory(row, gainedIds(before, newFoldersSendIds(row)), new Date().toISOString());
+    reopenOffer(row, gainedIds(before, newFoldersSendIds(row)), { kind: 'new-folders' });
     writeIndex(index);
     return row.newFolders;
   });
@@ -281,6 +287,17 @@ function addTenantIds(key, field, ids, deps) {
 // Workspaces whose re-pick pass finished on this machine (workspace.mjs joined done / add-all).
 export function markTenantsReviewed(key, ids, deps = {}) {
   return addTenantIds(key, 'reviewedTenantIds', ids, deps);
+}
+
+// Setup's tracking question was answered for this account on this machine (workspace.mjs setup everything / chosen).
+export function markTrackingChosen(key, nowIso, deps = {}) {
+  return withIndexLock(async () => {
+    const index = await readIndex(deps);
+    const row = index.accounts.find((a) => a.key === key);
+    if (!row) throw new UserError('No such linked account.');
+    row.trackingChosenAt = nowIso;
+    writeIndex(index);
+  });
 }
 
 // The history worker stamps the start of its pass on the entries it is about to run.
@@ -318,6 +335,111 @@ export function takeHistoryResults(key, limit = null, deps = {}) {
   });
 }
 
+const samePlace = (a, b) => a.kind === b.kind && a.match === b.match;
+
+// Adds the place to each workspace's re-open list once and drops its ready offer, so the next scan lists only that place.
+export function reopenOffer(row, tenantIds, place) {
+  for (const id of tenantIds) {
+    const state = ensureOfferState(row, id);
+    if (!state.reopen.some((p) => samePlace(p, place))) state.reopen.push(place);
+    delete state.ready;
+  }
+}
+
+// The row's offer state for one workspace key (lib/history-offer.mjs offerTenantKey), created on first write.
+function ensureOfferState(row, tenantKey) {
+  if (row.historyOffers == null || typeof row.historyOffers !== 'object') row.historyOffers = {};
+  const state = row.historyOffers[tenantKey] != null ? row.historyOffers[tenantKey] : {};
+  if (!Array.isArray(state.reopen)) state.reopen = [];
+  row.historyOffers[tenantKey] = state;
+  return state;
+}
+
+function updateOffers(key, deps, fn) {
+  return withIndexLock(async () => {
+    const index = await readIndex(deps);
+    const row = index.accounts.find((a) => a.key === key);
+    if (!row) return;
+    const result = fn(row);
+    writeIndex(index);
+    return result;
+  });
+}
+
+function stampDecline(state, changedAt) {
+  state.declined = { at: new Date().toISOString(), changedAt };
+  state.reopen = [];
+}
+
+// A decline (or an unanswered question) remembered under the changedAt it was given.
+export function recordOfferDecline(key, tenantKey, changedAt, deps = {}) {
+  return updateOffers(key, deps, (row) => {
+    const state = ensureOfferState(row, tenantKey);
+    stampDecline(state, changedAt);
+    delete state.ready;
+  });
+}
+
+// A printed question stands for a decline until it is answered.
+export const markOfferAsked = recordOfferDecline;
+
+// An upload finished or a scan found nothing to offer; only the re-opened places that run read (`handled`) are dropped.
+export function recordOfferSettled(key, tenantKey, { changedAt, handled }, deps = {}) {
+  const done = Array.isArray(handled) ? handled : [];
+  return updateOffers(key, deps, (row) => {
+    const state = ensureOfferState(row, tenantKey);
+    state.settled = { at: new Date().toISOString(), changedAt };
+    state.reopen = state.reopen.filter((place) => !done.some((d) => samePlace(d, place)));
+    delete state.ready;
+    delete state.declined;
+  });
+}
+
+// A scan's offer waiting to be shown: the changedAt it was counted under and the token of its offer file.
+export function recordOfferReady(key, tenantKey, { changedAt, token }, deps = {}) {
+  return updateOffers(key, deps, (row) => {
+    ensureOfferState(row, tenantKey).ready = { at: new Date().toISOString(), changedAt, token };
+  });
+}
+
+export function clearOfferReady(key, tenantKey, deps = {}) {
+  return updateOffers(key, deps, (row) => {
+    delete ensureOfferState(row, tenantKey).ready;
+  });
+}
+
+// An upload that left active sessions behind: the workspace scans again, keeping its re-opened places.
+export function recordOfferRescan(key, tenantKey, deps = {}) {
+  return updateOffers(key, deps, (row) => {
+    const state = ensureOfferState(row, tenantKey);
+    delete state.ready;
+    delete state.declined;
+    delete state.settled;
+  });
+}
+
+export function noteScanRetry(key, tenantKey, retryAtIso, deps = {}) {
+  return updateOffers(key, deps, (row) => {
+    ensureOfferState(row, tenantKey).retryAt = retryAtIso;
+  });
+}
+
+export function noteOfferScan(key, tenantKeys, nowIso, deps = {}) {
+  return updateOffers(key, deps, (row) => {
+    for (const tenantKey of tenantKeys) {
+      const state = ensureOfferState(row, tenantKey);
+      state.scanAt = nowIso;
+      delete state.retryAt;
+    }
+  });
+}
+
+// An accepted offer owes tenantId (a workspace id, the lone one included) exactly the offer's sessions; true when an entry holds them.
+export async function requestConsentedHistory(key, tenantId, nowIso, offer, deps = {}) {
+  const owed = await updateOffers(key, deps, (row) => requestHistory(row, [tenantId], nowIso, offer).some((e) => e.tenantId === tenantId));
+  return owed === true;
+}
+
 // Adds a routing rule, or replaces the tenantIds of the one with the same kind and match in place; returns its 1-based number.
 export function setWorkspaceRule(key, { kind, match, label = null, tenantIds } = {}, deps = {}) {
   if (kind !== 'repo' && kind !== 'folder' && kind !== 'outside') {
@@ -335,6 +457,7 @@ export function setWorkspaceRule(key, { kind, match, label = null, tenantIds } =
     if (!row) throw new UserError('No such linked account.');
     const stored = Array.isArray(row.workspaceRules) ? row.workspaceRules.slice() : [];
     const existing = rulesOf({ workspaceRules: stored }).find((r) => r.kind === kind && r.match === match);
+    const before = existing == null ? defaultRouteIds(row) : ruleRequestIds(row, existing.tenantIds);
     const rule = {
       kind,
       match,
@@ -351,8 +474,7 @@ export function setWorkspaceRule(key, { kind, match, label = null, tenantIds } =
       n = stored.length;
     }
     row.workspaceRules = stored;
-    // Every workspace the rule sends to is owed its history; the worker skips what it already has (lib/pending-history.mjs).
-    requestHistory(row, ruleRequestIds(row, tenantIds), new Date().toISOString());
+    reopenOffer(row, gainedIds(before, ruleRequestIds(row, tenantIds)), { kind, match });
     writeIndex(index);
     return { index: n, rule };
   });
@@ -368,7 +490,6 @@ export function removeWorkspaceRule(key, n, deps = {}) {
     const found = Number.isInteger(position) ? rulesOf(row).find((r) => r.index === position) : null;
     if (found == null) throw new UserError(`There is no rule ${n}. Run /beezi:settings rules to list them.`);
     row.workspaceRules.splice(position - 1, 1);
-    requestHistory(row, removalRequestIds(row), new Date().toISOString());
     writeIndex(index);
     return found;
   });
@@ -383,8 +504,6 @@ export function restoreRouting(key, { expected, before }, deps = {}) {
     if (!sameRouting(routingOf(row), expected)) return 'changed';
     row.workspaceRules = before.workspaceRules;
     if (before.newFolders == null) delete row.newFolders; else row.newFolders = before.newFolders;
-    // Every workspace the restored rules or New folders reach is owed its history; over-requesting is harmless.
-    requestHistory(row, removalRequestIds(row), new Date().toISOString());
     writeIndex(index);
     return 'restored';
   });

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { readTranscript } from './transcript-reader.mjs';
 
 // A subagent transcript at either depth. Matching the prefix, not just the extension,
 // is what keeps a workflow run's journal.jsonl from being read as an agent.
@@ -28,31 +29,12 @@ function readAgentMeta(dir, agentId) {
 // gives a subagent, e.g. "Explore analytics plugin"). Scans the MAIN transcript once; a subagent's
 // meta.json.toolUseId joins back to these to resolve its display name. Empty Map on any read/parse
 // failure — names just go unresolved, never throw.
-// `deps.transcriptMemo` supplies the session's parsed records: the ones this split parses, as only '' and unparseable lines are skipped differently.
 export function buildTaskDescriptionMap(transcriptPath, deps = {}) {
   const map = new Map();
-  if (deps.transcriptMemo != null) {
-    let view;
-    try { view = deps.transcriptMemo.main(transcriptPath); } catch { return map; }
-    for (const { line } of view.records) addTaskDescriptions(map, line);
-    return map;
-  }
-  let raw;
-  try {
-    raw = fs.readFileSync(transcriptPath, 'utf-8');
-  } catch {
-    return map;
-  }
-  for (const line of raw.split('\n')) {
-    if (!line) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    addTaskDescriptions(map, rec);
-  }
+  const read = deps.transcriptMemo == null ? (p) => readTranscript(p, 0) : deps.transcriptMemo.main;
+  let view;
+  try { view = read(transcriptPath); } catch { return map; }
+  for (const { line } of view.records) addTaskDescriptions(map, line);
   return map;
 }
 

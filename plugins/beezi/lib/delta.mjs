@@ -1,8 +1,9 @@
-import fs from 'fs';
 import { extractPathSignal } from './repo-timeline.mjs';
 import { computeCodeChanges } from './code-changes.mjs';
 import { computeOperations } from './operations.mjs';
 import { buildActiveIntervals, totalMs } from './active-time.mjs';
+import { readTranscript } from './transcript-reader.mjs';
+import { exactResetsAt } from './rate-limit-reset.mjs';
 
 // Gaps longer than this between two activity lines count as idle, not active time. Exported so the
 // session-timeline derivation classifies "working" against the exact same threshold.
@@ -151,7 +152,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   // A memo's whole-file records are windowed by line number; any other cursor reads the file as before.
   const view = resolvers.readRecords != null && Number.isInteger(fromLine) && fromLine >= 0
     ? recordsAfter(resolvers.readRecords(transcriptPath), fromLine)
-    : parseTranscriptLines(fs.readFileSync(transcriptPath, 'utf-8'), fromLine);
+    : readTranscript(transcriptPath, fromLine);
   const parsed = view.records;
 
   // Pre-pass: message id -> last tool-path signal across all of the message's block-lines.
@@ -258,6 +259,8 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
           : (line.apiErrorStatus === 429 ? 'rate_limit' : 'unknown'),
         text: messageText(line.message),
         occurredAt: line.timestamp == null ? null : line.timestamp,
+        // The exact reset the line itself carries; null leaves it to the text parser at send time.
+        resetsAt: exactResetsAt(line),
         lineNo,
       });
     }
@@ -330,24 +333,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   return { nextCursor, segments, apiErrorEvents };
 }
 
-// computeDelta's line rules over a whole JSONL text: the line count, and the records from `fromLine` on with 1-based lineNo.
-export function parseTranscriptLines(content, fromLine) {
-  // Strip trailing newline(s): a JSONL file at rest ends with '\n', and the trailing empty
-  // split element would otherwise advance the cursor past the last real line, skipping the
-  // next window's first record.
-  const trimmed = content.replace(/\n+$/, '');
-  const raw = trimmed === '' ? [] : trimmed.split('\n');
-  const records = [];
-  for (let i = fromLine; i < raw.length; i++) {
-    if (!raw[i].trim()) continue;
-    let line;
-    try { line = JSON.parse(raw[i]); } catch { continue; }
-    records.push({ lineNo: i + 1, line });
-  }
-  return { lineCount: raw.length, records };
-}
-
-// A whole-file parse cut to the cursor's window: lineNo is index + 1, so `lineNo > fromLine` is the loop above started at `fromLine`.
+// A whole-file read cut to the cursor's window: the same `lineNo > fromLine` rule readTranscript applies.
 function recordsAfter(whole, fromLine) {
   return { lineCount: whole.lineCount, records: whole.records.filter((r) => r.lineNo > fromLine) };
 }

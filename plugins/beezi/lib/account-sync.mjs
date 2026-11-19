@@ -8,6 +8,8 @@ import { hasCustomGateway } from './billing.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
 import { keyFingerprint, hasKeyIdentity } from './oauth-identity.mjs';
 import { oauthTokenEnv } from './claude-settings-env.mjs';
+import { anonymizationFor, hasKind, kindsOf } from './anonymization.mjs';
+import { AnonKind, anonymizeAccountSync } from './anonymize.mjs';
 
 // Re-exported from its leaf home so existing importers keep working; the definition moved so the
 // identity helpers could live in a module with no import cycle back into billing config.
@@ -213,7 +215,11 @@ export async function syncAccountIfNeeded(session, options = {}, deps = {}) {
   try {
     let config = null;
     try { config = readConfig(); } catch { config = null; }
-    const payload = buildAccountSyncPayload({ config, env });
+    const block = anonymizationFor(session, session.tenantId);
+    const anonymized = hasKind(block, AnonKind.ACCOUNTS);
+    if (anonymized && block.key == null) return { synced: false, reason: 'anonymization-key-missing' };
+    const built = buildAccountSyncPayload({ config, env });
+    const payload = anonymized ? anonymizeAccountSync(built, block.key, kindsOf(block)) : built;
     if (isEmptyPayload(payload)) return { synced: false, reason: 'nothing-known' };
 
     const hash = payloadHash(payload);

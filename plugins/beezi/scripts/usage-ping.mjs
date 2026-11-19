@@ -12,4 +12,10 @@ const input = readHookInput();
 runHook(DIAGNOSTIC_SOURCES.USAGE_PING, async () => {
   const mod = await importHookModule('./usage-ping.mjs');
   if (mod != null) await mod.pingUsageSnapshot({ sessionId: input == null ? null : input.session_id });
+  if (input == null || input.hook_event_name !== 'UserPromptSubmit') return;
+  // Its own try: a failing usage-check gate must never count against the ping.
+  try {
+    const check = await importHookModule('./usage-check.mjs');
+    if (check != null) await check.maybeStartUsageCheck();
+  } catch { /* never */ }
 });

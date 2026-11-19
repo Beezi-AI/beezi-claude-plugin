@@ -3,6 +3,8 @@ import { postJson } from './http.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { keyFingerprint } from './oauth-identity.mjs';
 import { oauthTokenEnv } from './claude-settings-env.mjs';
+import { anonymizationFor, hasKind } from './anonymization.mjs';
+import { AnonKind, anonAccount, isAnonValue } from './anonymize.mjs';
 
 // Interactive resolution of the subscription behind CLAUDE_CODE_OAUTH_TOKEN.
 //
@@ -34,6 +36,10 @@ const REQUEST_TIMEOUT_MS = 8000;
 
 const KNOWN_STATUSES = ['resolved', 'unlinked', 'unknown_key'];
 
+const ACCOUNT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const NO_ACCOUNT_KEY_MESSAGE = 'Beezi: this workspace hides account emails, and this machine has no key for it yet. Start a new Claude Code session, then try again.';
+
 function str(value) {
   return typeof value === 'string' && value !== '' ? value : null;
 }
@@ -56,6 +62,13 @@ function fingerprintFrom(deps) {
 // belongs to /credential-status, which is a different route.
 function keyBody(fingerprint) {
   return { key: { prefix: fingerprint.prefix, last4: fingerprint.last4, length: fingerprint.length } };
+}
+
+// The portal's scrubLinkTarget rule under the session tenant's block; null when it must hash but has no key.
+export function linkTargetForWire(session, target) {
+  const block = anonymizationFor(session, session.tenantId);
+  if (!hasKind(block, AnonKind.ACCOUNTS) || isAnonValue(target) || ACCOUNT_UUID_RE.test(target)) return target;
+  return block.key == null ? null : anonAccount(block.key, target);
 }
 
 async function post(path, session, body, deps) {
@@ -195,13 +208,15 @@ export async function submitKeyLink(session, target, deps = {}) {
       message: 'No Claude setup token found on this machine (CLAUDE_CODE_OAUTH_TOKEN). There is no key to resolve.',
     };
   }
-  const chosen = str(target);
+  const chosen = str(typeof target === 'string' ? target.trim() : target);
   if (chosen == null) return { ok: false, message: 'No target given. Pass --target <email-or-account-id>.' };
+  const wireTarget = linkTargetForWire(session, chosen);
+  if (wireTarget == null) return { ok: false, message: NO_ACCOUNT_KEY_MESSAGE };
 
   let res;
   try {
     const body = keyBody(fingerprint);
-    body.target = chosen;
+    body.target = wireTarget;
     res = await post(ENDPOINTS.keyResolutionLink, session, body, deps);
   } catch {
     return { ok: false, message: 'Could not reach the Beezi server. Check your connection and try again.' };

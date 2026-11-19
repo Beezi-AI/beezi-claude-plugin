@@ -2,7 +2,7 @@ import { readBillingConfig } from './billing-config.mjs';
 import { BillingSource } from './billing.mjs';
 import { isCorrelationGranted, isTelemetryGranted, readConsent } from './telemetry-consent.mjs';
 
-const PLAN_LABELS = { pro: 'Pro', max_5x: 'Max 5x', max_20x: 'Max 20x', team: 'Team', enterprise: 'Enterprise', api_key: 'API key', gateway: 'Billed by your gateway' };
+export const PLAN_LABELS = { pro: 'Pro', max_5x: 'Max', max_20x: 'Ultra', team: 'Team', enterprise: 'Enterprise', api_key: 'API key', gateway: 'Billed by your gateway' };
 
 // correlate, on (correlation never answered), anonymous (correlation declined) or off.
 export function crashMode() {

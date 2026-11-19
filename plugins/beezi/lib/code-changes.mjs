@@ -1,12 +1,5 @@
 import path from 'path';
-
-// A string's line count, tolerating one trailing newline. Empty/undefined → 0.
-function lineCount(s) {
-  if (!s) return 0;
-  return s.replace(/\n$/, '').split('\n').length;
-}
-
-const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
+import { EDIT_TOOLS } from './transcript-reader.mjs';
 
 function extOf(filePath) {
   const ext = path.extname(filePath || '').toLowerCase();
@@ -39,20 +32,9 @@ export function computeCodeChanges(lines) {
       const filePath = input.file_path || input.notebook_path || null;
       touch(filePath);
 
-      if (block.name === 'Edit') {
-        linesRemoved += lineCount(input.old_string);
-        linesAdded += lineCount(input.new_string);
-      } else if (block.name === 'MultiEdit') {
-        for (const e of input.edits || []) {
-          linesRemoved += lineCount(e.old_string);
-          linesAdded += lineCount(e.new_string);
-        }
-      } else if (block.name === 'Write') {
-        linesAdded += lineCount(input.content);
-      } else if (block.name === 'NotebookEdit') {
-        // NotebookEdit input has no old_source; count new cell source as added only.
-        linesAdded += lineCount(input.new_source);
-      }
+      const { added, removed } = block.editLines || { added: 0, removed: 0 };
+      linesAdded += added;
+      linesRemoved += removed;
     }
   }
 

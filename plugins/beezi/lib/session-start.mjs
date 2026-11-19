@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import { getAccessToken as _getAccessToken, getAuthentication as _getAuthentication } from './token.mjs';
-import { flushQueue } from './checkpoint.mjs';
+import { flushUnderUploadLock } from './checkpoint.mjs';
+import { maybeSpawnUploadWorker } from './upload-trigger.mjs';
+import { hookDeadline } from './hook-budget.mjs';
 import { git as _git, resolveOriginRemote } from './git.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
 import {
@@ -14,6 +16,7 @@ import {
 import { stateDir } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { pruneStale } from './prune.mjs';
+import { pruneStaleLocks, CHECKPOINT_LOCK_PREFIX, CHECKPOINT_LOCK_STALE_MS } from './single-instance-lock.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { whoami, probeIdentity, PROBE_OUTCOMES } from './whoami.mjs';
@@ -28,11 +31,12 @@ import {
   recordWhoami,
   readTrackingState,
   allowsLiveFor,
-  shouldBackfill,
   TrackingMode,
 } from './tracking.mjs';
+import { workspacesAt } from './history-trigger.mjs';
 import { BillingSource, hasCustomGateway } from './billing.mjs';
 import { statuslineCaptureDetached as _statuslineCaptureDetached } from './statusline-install.mjs';
+import { takeDesktopUsageCheckNotice as _takeDesktopUsageCheckNotice } from './usage-check.mjs';
 import {
   readBillingConfig as _readBillingConfig,
   writeBillingConfig as _writeBillingConfig,
@@ -219,6 +223,8 @@ export async function runSessionStart(input, deps = {}) {
   const recordWhoamiImpl = deps.recordWhoamiImpl == null ? recordWhoami : deps.recordWhoamiImpl;
   const statuslineCaptureDetached =
     deps.statuslineCaptureDetached == null ? _statuslineCaptureDetached : deps.statuslineCaptureDetached;
+  const takeDesktopUsageCheckNotice =
+    deps.takeDesktopUsageCheckNotice == null ? _takeDesktopUsageCheckNotice : deps.takeDesktopUsageCheckNotice;
 
   // The plugin's own version check. Started BEFORE the credential store is touched (getAccessToken
   // may spawn `security` / `secret-tool` / PowerShell) and awaited only at the return points, so its
@@ -296,7 +302,7 @@ export async function runSessionStart(input, deps = {}) {
     try { recordWhoamiImpl(session.key, probe.who, session.clientId); } catch { /* best-effort */ }
     if (probe.who != null) {
       const patch = {};
-      for (const field of ['email', 'name', 'tenantId', 'tenantName', 'tenants']) {
+      for (const field of ['email', 'name', 'tenantId', 'tenantName', 'tenants', 'anonymization', 'pastSessions']) {
         if (probe.who[field] != null) patch[field] = probe.who[field];
       }
       try { await updateAccount(session.key, patch); } catch { /* best-effort */ }
@@ -335,8 +341,19 @@ export async function runSessionStart(input, deps = {}) {
   const targetKey = (s) => `${s.key}:${s.tenantId == null ? '' : s.tenantId}`;
   const liveAllowed = liveSessions.length > 0;
   initSessionState(input.session_id, { cwd: input.cwd == null ? null : input.cwd, transcriptPath: input.transcript_path == null ? null : input.transcript_path });
+  // Whatever earlier sessions left queued goes to the detached background uploader. Only a
+  // refused spawn flushes here, deadline-bounded and under the uploader's lock.
+  const spawnUploadWorker = deps.spawnUploadWorker == null ? maybeSpawnUploadWorker : deps.spawnUploadWorker;
+  let spawnOutcome;
+  try { spawnOutcome = spawnUploadWorker(); } catch { spawnOutcome = 'failed'; }
   const [, announcements] = await Promise.all([
-    Promise.all(sessions.map((s) => flushQueue(s, { fetchImpl }))),
+    spawnOutcome === 'failed'
+      ? flushUnderUploadLock(sessions, {
+        fetchImpl,
+        deadline: deps.deadline == null ? hookDeadline() : deps.deadline,
+        acquireUploadLock: deps.acquireUploadLock,
+      })
+      : null,
     Promise.all(targetSessions.map(async (s) => {
       // An analytics workspace answers connected for every repo, so its line says nothing; the banner says where analytics go.
       if (workspaceType(s) === 'analytics') return null;
@@ -349,7 +366,11 @@ export async function runSessionStart(input, deps = {}) {
     const mine = announcements.filter((a, i) => targetSessions[i].key === key);
     return mine.length > 0 && mine.every((a) => a != null && a.connected === false);
   }));
-  try { pruneStale(); } catch { /* best-effort */ }
+  // Every account row, revoked ones included: a queue or outbox no session flushes can only age
+  // out. The same keys cover both dirs, and a stale outbox `.sending` claim goes back here.
+  try { pruneStale({ accountKeys: rows.map((r) => r.key) }); } catch { /* best-effort */ }
+  // A checkpoint killed while holding its session lock leaves one dir per session behind.
+  try { pruneStaleLocks(CHECKPOINT_LOCK_PREFIX, CHECKPOINT_LOCK_STALE_MS); } catch { /* best-effort */ }
 
   // Pre-warm + self-heal the repo-map: discover this session's repo(s) and drop dead roots.
   try {
@@ -560,33 +581,38 @@ ${nudge}` : nudge;
       const nudge = 'Beezi: your status line no longer runs Beezi’s wrapper, so live plan-usage capture is off. Turn it back on with /beezi:settings statusline on.';
       message = message ? `${message}\n${nudge}` : nudge;
     }
+
+    let usageCheckNotice = null;
+    try { usageCheckNotice = takeDesktopUsageCheckNotice({ env: oauthEnv }); } catch { /* best-effort */ }
+    if (usageCheckNotice) message = message ? `${message}\n${usageCheckNotice}` : usageCheckNotice;
   }
 
-  // Tracking-policy messages: tell a dark workspace it is dark, and point at the login flow
-  // wherever the one-time history pull has not completed yet (paid tenants included) — the
-  // backfill runs as the last step of /beezi:login.
+  // Tracking-policy messages: tell a dark workspace it is dark, and point an audit workspace at
+  // /beezi:sync until its past sessions are settled.
   for (const session of sessions) {
     // A multi-workspace account's cached mode describes the web-side workspace, not this session's.
     if (isMultiTenant(session)) continue;
     const tracking = trackingByKey.get(session.key);
   const mode = tracking == null || tracking.trackingMode == null ? null : tracking.trackingMode;
+  // Offer state is keyed by the row's real workspace id, which the session clone cleared.
+  const own = rows.find((r) => r.key === session.key);
+  const historyOpen = mode === TrackingMode.BACKFILL_ONLY
+    && (await workspacesAt({ ...session, tenantId: own == null ? null : own.tenantId }, tracking, 'SETTLED')).length === 0;
   let policy = null;
   // The banner's route line already said live tracking is off: only the action is left to say.
   const noted = banner.noted.has(session.key);
   if (mode === TrackingMode.BACKFILL_ONLY && noted) {
-    policy = shouldBackfill(tracking)
-      ? 'Beezi: run /beezi:login to upload your session history, or upgrade your workspace plan to track new sessions.'
+    policy = historyOpen
+      ? 'Beezi: run /beezi:sync to upload your session history, or upgrade your workspace plan to track new sessions.'
       : 'Beezi: upgrade your workspace plan to track new sessions.';
   } else if (mode === TrackingMode.DISABLED && noted) {
     policy = null;
   } else if (mode === TrackingMode.BACKFILL_ONLY) {
-    policy = shouldBackfill(tracking)
-      ? 'Beezi: audit mode — new sessions are not tracked. Run /beezi:login to upload your session history, or upgrade your workspace plan to track new sessions.'
+    policy = historyOpen
+      ? 'Beezi: audit mode — new sessions are not tracked. Run /beezi:sync to upload your session history, or upgrade your workspace plan to track new sessions.'
       : 'Beezi: audit mode — new sessions are not tracked. Upgrade your workspace plan to start tracking them.';
   } else if (mode === TrackingMode.DISABLED) {
     policy = 'Beezi: analytics are off for this workspace.';
-  } else if (shouldBackfill(tracking)) {
-    policy = 'Beezi: run /beezi:login once to include your past sessions.';
   }
   if (policy) message = append(message, policy.replace('Beezi:', `${label(session)}:`));
 

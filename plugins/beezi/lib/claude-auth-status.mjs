@@ -45,9 +45,10 @@ export function runClaudeAuthStatus(deps = {}) {
   let stdout;
   try {
     // The native install exposes a real executable; PATH resolves it without a shell.
-    stdout = exec('claude', ['auth', 'status', '--json'], options);
+    stdout = exec(deps.command == null ? 'claude' : deps.command, ['auth', 'status', '--json'], options);
   } catch {
-    if (platform !== 'win32') return null;
+    // An explicit binary was already resolved without a shell; never retry it through one.
+    if (deps.command != null || platform !== 'win32') return null;
     // npm installs on Windows ship a `claude.cmd` shim that only a shell can resolve. One fixed
     // literal command line (no interpolation, no args array) — nothing for a shell to mis-parse.
     try {

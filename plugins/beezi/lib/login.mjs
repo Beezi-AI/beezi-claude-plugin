@@ -20,6 +20,7 @@ import { DIAGNOSTIC_SOURCES } from './telemetry-codes.mjs';
 import { recordAuthResult as _recordAuthResult } from './telemetry-auth.mjs';
 import { UserError } from './friendly-error.mjs';
 import { resolveTargets, currentSessionWorkspace } from './workspace.mjs';
+import { anonymizationScope } from './anonymization.mjs';
 
 export function openBrowser(url) {
   // The URL comes from the server response — never pass it through a shell. Require a
@@ -112,11 +113,13 @@ export async function runLogin(deps = {}) {
     if (!lifecycle) throw new UserError('Another Beezi account change is in progress. Retry /beezi:login in a moment.');
     const who = { valid: true, ...verified.identity };
     const identity = { email: who.email.toLowerCase(), name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
-      tenants: Array.isArray(who.tenants) ? who.tenants : null };
+      tenants: Array.isArray(who.tenants) ? who.tenants : null, anonymization: who.anonymization, pastSessions: who.pastSessions };
+    // From here on the login's own requests (the discard's DELETE /machine) know the workspace's setting.
+    fresh = { ...fresh, ...anonymizationScope(identity) };
     async function checkStored(a) {
       let auth = await getAuthentication(deps, { account: a.key, waitMs: INTERACTIVE_REFRESH_WAIT_MS });
       if (auth.authState !== AUTH_STATES.READY) return { auth, probe: null };
-      let session = { key: a.key, token: auth.accessToken, clientId: auth.clientId || a.clientId };
+      let session = { key: a.key, token: auth.accessToken, clientId: auth.clientId || a.clientId, ...anonymizationScope(a) };
       let probe = await probeIdentity(session, { ...deps, base });
       if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
         auth = await getAuthentication(deps, { account: a.key, forceRefresh: true, waitMs: INTERACTIVE_REFRESH_WAIT_MS });
@@ -206,7 +209,8 @@ export async function runLogin(deps = {}) {
     const merged = { ...(existing || {}), ...identity, key, tenants: identity.tenants != null ? identity.tenants : (existing ? existing.tenants : null) };
     const resolved = resolveTargets(merged, currentSessionWorkspace());
     for (const tenantId of resolved.targets) {
-      const session = resolved.multi ? { ...fresh, key, tenantId } : { ...fresh, key };
+      const scope = { ...fresh, key, tenants: merged.tenants, anonymization: merged.anonymization };
+      const session = resolved.multi ? { ...scope, tenantId } : scope;
       await sync(session, { force: true, via: 'login' }, { env: oauthTokenEnvWithOsProbe(process.env) }).catch(() => {});
     }
     log(`account=${key}`);

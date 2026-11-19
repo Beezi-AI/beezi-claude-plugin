@@ -2,12 +2,17 @@ import { linkedSessions } from './sessions.mjs';
 import { listAllTranscripts } from './transcript-index.mjs';
 import { loadLedger as _loadLedger } from './audit-ledger.mjs';
 import { fetchCoverage as _fetchCoverage } from './session-coverage.mjs';
-import { runAudit as _runAudit, SYNC_MODE } from './session-audit.mjs';
+import {
+  runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE,
+} from './session-audit.mjs';
 import { BackfillHalt, BackfillSessionStatus } from './audit-flush.mjs';
 import { readSyncState, isSegmentRepaired, markSegmentRepaired } from './cost-state-sync-state.mjs';
 import { readTrackingState, isTrackingDisabled } from './tracking.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
-import { isMultiTenant } from './workspace.mjs';
+import { isMultiTenant, loneTenantLinkedMs } from './workspace.mjs';
+import { usesRules } from './workspace-rules.mjs';
+import { listAccounts } from './accounts.mjs';
+import { DRAIN_LOCK_WAIT_MS } from './upload-drain.mjs';
 
 // Retrying these cannot help: the workspace refuses uploads for good, so the repair stops asking.
 const FINAL_HALTS = [BackfillHalt.NOT_ALLOWED, BackfillHalt.ALREADY_COMPLETED];
@@ -21,7 +26,8 @@ const FINAL_HALTS = [BackfillHalt.NOT_ALLOWED, BackfillHalt.ALREADY_COMPLETED];
 // user never sent is not this job's call.
 // 1. The ledger names the candidates — an accepted Claude Code session that went up with zero
 //    reports. Loaded under the CURRENT login's identity, so a ledger left by another workspace's
-//    login can never push its sessions into this one.
+//    login can never push its sessions into this one. Only sessions Beezi already holds qualify:
+//    last written after the workspace's live cutoff, or stamped consented by a replay.
 // 2. Coverage narrows them to the ones the server holds no segments for. A live-tracked session
 //    that only got a cost-record overlay is in the ledger too, but is not broken — and re-parsing it
 //    every hour would cost a full transcript read for nothing.
@@ -51,6 +57,8 @@ async function repairAccount(session, deps, options) {
   const listTranscripts = deps.listTranscripts == null ? listAllTranscripts : deps.listTranscripts;
   const fetchCoverage = deps.fetchCoverageImpl == null ? _fetchCoverage : deps.fetchCoverageImpl;
   const runAudit = deps.runAuditImpl == null ? _runAudit : deps.runAuditImpl;
+  const listRows = deps.listAccounts == null ? listAccounts : deps.listAccounts;
+  const planWorkspaceRuns = deps.planWorkspaceRuns == null ? _planWorkspaceRuns : deps.planWorkspaceRuns;
   const markRepaired = deps.markSegmentRepairedImpl == null ? markSegmentRepaired : deps.markSegmentRepairedImpl;
   const now = deps.now == null ? (() => Date.now()) : deps.now;
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
@@ -78,7 +86,15 @@ async function repairAccount(session, deps, options) {
   }
   // listAllTranscripts is Claude Code only. A Cowork session never has segments, so it is excluded
   // by construction rather than by a check that could drift.
-  const transcripts = suspects.size === 0 ? [] : listTranscripts().filter((entry) => suspects.has(entry.sessionId));
+  if (suspects.size === 0) { done(); return { repaired: true, candidates: 0 }; }
+
+  const row = (await listRows(deps)).find((r) => r.key === session.key);
+  // When this account's one workspace went live on this machine; null when unknown.
+  const cutoffMs = row == null ? null : loneTenantLinkedMs(row, deps);
+  // A folder the developer has since set to Don't track is never repaired.
+  const excluded = row != null && usesRules(row) ? dontTrackSessionIds(planWorkspaceRuns(row)) : new Set();
+  const held = (entry) => ledger.sessions[entry.sessionId].consented === true || (cutoffMs != null && entry.mtimeMs >= cutoffMs);
+  const transcripts = listTranscripts().filter((entry) => suspects.has(entry.sessionId) && !excluded.has(entry.sessionId) && held(entry));
   if (transcripts.length === 0) { done(); return { repaired: true, candidates: 0 }; }
 
   // Null is "could not ask", not "nothing stored" — repairing on it would re-parse every suspect.
@@ -90,22 +106,35 @@ async function repairAccount(session, deps, options) {
 
   // Halt at a batch boundary before the worker's watchdog kills the process mid-upload. The batch
   // dropped by the halt stays at coverage 0 and is picked up on the next pass.
+  // The sync path first waits up to DRAIN_LOCK_WAIT_MS for the `upload` lock, and shouldContinue is
+  // not consulted during that wait. Bound it by the time left, so a busy worker cannot carry this
+  // pass past the deadline; the caller's deadline already holds the margin before the watchdog.
+  // Out of wait, the audit returns busy, nothing is stamped and the next pass retries.
+  const auditDeps = {
+    ...deps,
+    fetchImpl,
+    listTranscripts: () => broken,
+    shouldContinue: () => !outOfTime(),
+  };
+  if (deadlineMs != null) {
+    const given = deps.uploadLockDeps == null ? null : deps.uploadLockDeps.waitMs;
+    const cap = given == null ? DRAIN_LOCK_WAIT_MS : Math.min(given, DRAIN_LOCK_WAIT_MS);
+    const waitMs = Math.max(0, Math.min(cap, deadlineMs - now()));
+    auditDeps.uploadLockDeps = Object.assign({}, deps.uploadLockDeps, { waitMs });
+  }
   const result = await runAudit(
-    {
-      ...deps,
-      fetchImpl,
-      listTranscripts: () => broken,
-      shouldContinue: () => !outOfTime(),
-    },
-    { mode: SYNC_MODE, account: session.key },
+    auditDeps,
+    { mode: SYNC_MODE, account: session.key, onlySessionIds: broken.map((entry) => entry.sessionId) },
   );
 
   const final = result.halt != null && FINAL_HALTS.indexOf(result.halt) >= 0;
-  // A transcript that failed to read for the first time gets one more pass, as in shouldFinalize;
+  // A transcript that failed to read for the first time gets one more pass;
   // the ledger's unreadable marker lets the pass after that stamp the account regardless.
   const clean = result.ok === true && result.halt == null &&
     result.reportsFailed === 0 && result.costStatesFailed === 0 && result.unattributed === 0 &&
-    !(result.retriableUnreadable > 0);
+    !(result.retriableUnreadable > 0) &&
+    // Held back by reports still in the live queue: not repaired yet, the next pass retries them.
+    !(result.pendingLive > 0);
   if (final || clean) done();
   return {
     repaired: final || clean,

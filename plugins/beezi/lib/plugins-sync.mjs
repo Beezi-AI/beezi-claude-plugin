@@ -11,6 +11,8 @@ import { createRouteContext, routePastSession, rulesOf } from './workspace-rules
 import { buildPluginSnapshot } from './enabled-plugins.mjs';
 import { readInstalledPlugins } from './about.mjs';
 import { readProjectCache, liveProjects } from './plugin-projects.mjs';
+import { anonymizationFor, hasKind } from './anonymization.mjs';
+import { AnonKind, anonRemote } from './anonymize.mjs';
 
 // Tells Beezi which Claude Code plugins are enabled on this machine. Runs inside the hourly
 // detached child (scripts/cost-state-sync.mjs), which the Stop hook and SessionStart spawn.
@@ -108,6 +110,14 @@ export function targetsFor(session, tracking, routes, state) {
     .map((id) => ({ tenantId: id, roots: roots.filter((root) => routes[root].indexOf(id) !== -1) }));
 }
 
+// A workspace that hides repos gets each repo hashed as session reports are; null (hold the full snapshot back) when one needs hashing and there is no key.
+export function pluginsForWire(plugins, session, tenantId) {
+  const block = anonymizationFor(session, tenantId);
+  if (!hasKind(block, AnonKind.REPOS)) return plugins;
+  if (block.key == null) return plugins.some((p) => p.repo != null) ? null : plugins;
+  return plugins.map((p) => (p.repo == null ? p : { ...p, repo: anonRemote(block.key, p.repo) }));
+}
+
 function pick(projects, roots) {
   const out = {};
   for (const root of roots) out[root] = projects[root];
@@ -160,7 +170,10 @@ export async function runPluginsSync(deps = {}) {
       const routes = projectRoutes(session, projects, ctx, route);
       for (const target of targetsFor(session, tracking, routes, state)) {
         const tenantId = target.tenantId;
-        const body = { plugins: buildPluginSnapshot(pick(projects, target.roots), snapshotDeps) };
+        const plugins = pluginsForWire(buildPluginSnapshot(pick(projects, target.roots), snapshotDeps), session, tenantId);
+        // Held back unsent and unstamped: a partial snapshot would soft-remove the project plugins it leaves out.
+        if (plugins == null) continue;
+        const body = { plugins };
         const tenantKey = tenantId == null ? DEFAULT_TENANT : tenantId;
         if (!isDue(stampFor(state, tenantKey), nowMs)) continue;
         let outcome = 'failed';

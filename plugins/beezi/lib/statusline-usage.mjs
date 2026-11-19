@@ -132,3 +132,31 @@ export function clearPendingStatuslineUsage(count) {
   const pending = Array.isArray(state.pending) ? state.pending : [];
   writeJsonSecure(file, { ...state, version: 1, pending: pending.slice(count) });
 }
+
+const ACCOUNT_FIELDS = ['uuid', 'email', 'organizationUuid', 'organizationName'];
+
+function sameAccount(a, b) {
+  if (a == null || b == null) return a == null && b == null;
+  return ACCOUNT_FIELDS.every((k) => (a[k] == null ? null : a[k]) === (b[k] == null ? null : b[k]));
+}
+
+// A pending row's identity: its fetched_at and the account it was recorded under.
+export function samePendingRow(a, b) {
+  return a != null && b != null && a.fetched_at === b.fetched_at && sameAccount(a.account, b.account);
+}
+
+// Drops the first pending row with the same fetched_at and account as `row`, the one the drain
+// just settled. By identity, not position: the recorder drops the oldest row at the cap from
+// another process while a drain runs, so a positional clear could delete a row never sent.
+// Returns whether a row was removed; nothing matching leaves the file untouched.
+export function clearPendingRow(row) {
+  if (row == null) return false;
+  const file = statuslineUsageFile();
+  let state = readJson(file);
+  if (state == null) state = {};
+  const pending = Array.isArray(state.pending) ? state.pending : [];
+  const index = pending.findIndex((p) => samePendingRow(p, row));
+  if (index === -1) return false;
+  writeJsonSecure(file, { ...state, version: 1, pending: pending.slice(0, index).concat(pending.slice(index + 1)) });
+  return true;
+}

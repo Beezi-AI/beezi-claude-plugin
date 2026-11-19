@@ -1,6 +1,6 @@
 {
   "name": "beezi",
-  "version": "0.40.1",
+  "version": "0.46.3",
   "private": true,
   "type": "module",
   "description": "Beezi analytics plugin for Claude Code.",
@@ -9,6 +9,6 @@
     "node": ">=13.2"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1"
   }
 }

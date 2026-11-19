@@ -2,6 +2,8 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
+import { anonymizationFor, kindsOf, reportForWire, unionKinds, wireKinds } from './anonymization.mjs';
+import { anonymizeCostState } from './anonymize.mjs';
 
 // The backfill route caps chunks at 100 array items and mounts a 5mb body limit; 50 items with
 // 1MB of headroom keeps every chunk comfortably inside both.
@@ -39,7 +41,29 @@ export const BackfillHalt = Object.freeze({
   NOT_ALLOWED: 'not-allowed',
   UNSUPPORTED_SERVER: 'unsupported-server',
   FORBIDDEN: 'forbidden',
+  ANONYMIZATION_KEY_MISSING: 'anonymization-key-missing',
+  // The run's whoami gave no anonymization block for the workspace, so nothing is sent.
+  ANONYMIZATION_UNKNOWN: 'anonymization-unknown',
 });
+
+// A group as the live queue would send it: the marker stripped, private reports and their cost state anonymized; null when private without a key.
+function groupForWire(group, session) {
+  const tenantId = session.tenantId;
+  const reports = group.reports == null ? [] : group.reports;
+  const wireReports = reports.map((report) => reportForWire(report, session, tenantId));
+  if (wireReports.indexOf(null) !== -1) return null;
+  const out = group.reports == null ? { ...group } : { ...group, reports: wireReports };
+  if (group.costState == null) return out;
+  const block = anonymizationFor(session, tenantId);
+  const kinds = unionKinds([kindsOf(block)].concat(reports.map((report) => wireKinds(report, session, tenantId))));
+  if (kinds.length === 0) return out;
+  return block == null || block.key == null ? null : { ...out, costState: anonymizeCostState(group.costState, block.key, kinds) };
+}
+
+function groupsForWire(sessionGroups, session) {
+  const groups = sessionGroups.map((group) => groupForWire(group, session));
+  return groups.indexOf(null) === -1 ? groups : null;
+}
 
 const wireBytes = (reports, timelines = [], costStates = []) =>
   Buffer.byteLength(JSON.stringify({ sessions: reports, timelines, costStates }), 'utf-8');
@@ -213,7 +237,14 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
     halt: null,
     lastError: null,
   };
-  const chunks = planChunks(sessionGroups, options);
+  // Null only when a group has a private report or cost state, so an empty run never halts.
+  const groups = groupsForWire(sessionGroups, session);
+  if (groups == null) {
+    result.halt = BackfillHalt.ANONYMIZATION_KEY_MISSING;
+    result.lastError = BackfillHalt.ANONYMIZATION_KEY_MISSING;
+    return result;
+  }
+  const chunks = planChunks(groups, options);
   if (chunks.length === 0) return result;
 
   // /beezi:sync posts the identical wire shape to a repeatable route that never seals the pull.
@@ -546,21 +577,4 @@ export async function flushBackfillChunks(sessionGroups, session, deps = {}, opt
   }
 
   return result;
-}
-
-// Seal this user's pull for the calling tool. Idempotent server-side (snapshot_taken_at is
-// COALESCEd), so retrying a lost response is safe.
-export async function completeBackfill(session, deps = {}, options = {}) {
-  const postJsonImpl = deps.postJsonImpl == null ? postJson : deps.postJsonImpl;
-  const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
-  const timeoutMs = options.timeoutMs == null ? DEFAULT_BACKFILL_TIMEOUT_MS : options.timeoutMs;
-  const url = `${apiBase()}${ENDPOINTS.sessionsBackfillComplete}`;
-  try {
-    const res = await postJsonImpl(url, session, {}, { fetchImpl, timeoutMs });
-    if (res.status >= 200 && res.status < 300) return { completed: true, code: null };
-    const { code, message } = await readResponseBody(res);
-    return { completed: false, code, reason: message == null ? `HTTP ${res.status}` : message };
-  } catch {
-    return { completed: false, code: null, reason: 'network' };
-  }
 }

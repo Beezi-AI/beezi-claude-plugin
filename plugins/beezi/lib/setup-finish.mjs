@@ -1,64 +1,109 @@
-import { usableAccounts } from './setup-account.mjs';
-import { lastLine, report, token } from './setup-routing.mjs';
+import { STOPPED, lastLine, outputLines, report, token } from './setup-routing.mjs';
+import { markReported as _markReported } from './upload-progress.mjs';
+import { REST_LINE, barLine, doneLine, followUploads, plainLine } from './upload-progress-view.mjs';
 
-export const FINALIZED = 'your history pull is finalized.';
-export const FINALIZE_NOTE = 'History import is now closed for this account: past sessions on other machines can no longer be imported. New sessions are still tracked everywhere Beezi is installed.';
-export const DEFAULT_UNCHANGED = 'The default account is unchanged. /beezi:settings account switches it later.';
-export const CRASH_QUESTION = 'How should Beezi crash reports work?';
-export const STATUS_LINE_QUESTION = "Show Beezi in Claude Code's status line?";
-export const UPLOAD_LABEL = 'Uploading past sessions…';
-// backfill.mjs prints this once per batch; the wizard shows it on the activity line instead.
-export const UPLOAD_PROGRESS = /^Beezi: (\d+)\/(\d+) sessions read…$/;
-const CRASH_OPTIONS = [
-  { label: 'Correlate (recommended)', description: 'Crash reports with an installation ID, so support can find yours', mode: 'correlate' },
-  { label: 'On', description: 'Crash reports without an installation ID', mode: 'on' },
-  { label: 'Off', description: 'No crash reports; pending ones are deleted', mode: 'off' },
-  { label: 'Anonymous', description: 'Stay on, and delete the installation ID and the reports that carry it', mode: 'anonymous' },
-];
+const FAILURE_LINE = /^(?:✗ |Beezi: )/;
+const CLEAR_LINE = '\r\x1b[2K';
+// Off a terminal setup runs under an agent's tool, whose call times out.
+const PLAIN_CAP_MS = 100000;
+// setup-main's left margin, and the widest row its format keeps whole (setup-style's wrapLines).
+const MARGIN_COLUMNS = 2;
+const MAX_ROW = 100;
 
-export async function uploadHistory(ctx, key) {
-  const result = await ctx.run('backfill.mjs', ['--via', 'login', '--account', key], { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
-  if (result.stdout.indexOf(FINALIZED) !== -1) ctx.print(FINALIZE_NOTE);
+function realSleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
-export async function offerDefault(ctx, account) {
-  if (!account.readsElsewhere) return;
-  const listing = await ctx.run('accounts.mjs', ['list']);
-  const row = usableAccounts(listing.stdout).find((a) => a.key === account.key);
-  const name = row === undefined ? 'the account you just linked' : row.description;
-  const yes = await ctx.ask.confirm(`Make ${name} the account /beezi:analytics reads from?`, false);
-  if (yes === true) report(ctx, await ctx.run('accounts.mjs', ['use', account.key]));
-  if (yes === false) ctx.print(DEFAULT_UNCHANGED);
+// A failed upload's stdout ✗ and Beezi: lines, then its stderr; never its route summary, workspace headers or progress.
+function failureLines(result) {
+  const said = outputLines(result.stdout).map((line) => line.trim()).filter((line) => FAILURE_LINE.test(line));
+  const lines = said.concat(outputLines(result.stderr).map((line) => line.trimEnd()).filter((line) => line !== ''));
+  return lines.length > 0 ? lines : [STOPPED];
 }
 
-// The options with the current mode marked as the default.
-export function crashChoice(current) {
-  const options = CRASH_OPTIONS.map((option) => (option.mode === current
-    ? { label: option.label, description: `${option.description}, current setting`, mode: option.mode }
-    : option));
-  return { options, defaultIndex: CRASH_OPTIONS.findIndex((option) => option.mode === current) };
+// The bar line cut to one row of a `columns`-wide terminal: the workspace name is shortened with '…', so the in-place
+// redraw, which clears one row, never leaves a wrapped row behind.
+function fittedBar(record, ascii, columns) {
+  const room = Math.min(Math.max((columns || 80) - 1, 20), MAX_ROW) - MARGIN_COLUMNS;
+  const line = barLine(record, { ascii });
+  if (line.length <= room) return line;
+  const keep = record.workspace.length - (line.length - room) - 1;
+  if (keep < 1) return `${line.slice(0, room - 1)}…`;
+  return barLine({ ...record, workspace: `${record.workspace.slice(0, keep).trimEnd()}…` }, { ascii });
 }
 
-// Runs telemetry.mjs for every answer, the current mode included.
-async function askCrashReports(ctx, current) {
-  const choice = crashChoice(current);
-  const picked = await ctx.ask.choose(CRASH_QUESTION, choice.options, { defaultIndex: choice.defaultIndex });
-  if (picked === null) return;
-  report(ctx, await ctx.run('telemetry.mjs', [choice.options[picked].mode]));
+// Follows the worker's progress records of `tenantIds` from `sinceMs`: on a terminal one line redrawn in place, else a
+// plain line per change; each workspace's done line, or REST_LINE when following ends first. The worker carries on.
+async function followPast(ctx, key, tenantIds, sinceMs) {
+  const onTerminal = ctx.activity === true;
+  const ascii = (ctx.platform || process.platform) === 'win32';
+  const markReported = ctx.markReported || _markReported;
+  const interrupt = ctx.interrupt || { stopped: false };
+  // On a terminal each line replaces the bar drawn before it.
+  const show = (line, end) => {
+    if (onTerminal) ctx.output.write(CLEAR_LINE);
+    ctx.print(line, end);
+  };
+  interrupt.following = true;
+  let followed;
+  try {
+    followed = await followUploads({
+      key,
+      tenantIds,
+      sinceMs,
+      capMs: onTerminal ? Infinity : PLAIN_CAP_MS,
+      shouldStop: () => interrupt.stopped,
+      onUpdate: (record) => (onTerminal ? show(fittedBar(record, ascii, ctx.output.columns), '') : ctx.print(plainLine(record))),
+      onDone: (record) => {
+        show(doneLine(record));
+        // A failed write only lets the next session repeat the done line.
+        try {
+          markReported(key, record.tenantId);
+        } catch {}
+      },
+      read: ctx.read,
+      now: ctx.now,
+      sleep: ctx.sleep || realSleep,
+    });
+  } finally {
+    interrupt.following = false;
+  }
+  if (followed.stopped || followed.timedOut) show(REST_LINE);
 }
 
-// Crash reports, then the status line when it is off, from `settings.mjs keys`.
-export async function askMachineSettings(ctx) {
-  const keys = await ctx.run('settings.mjs', ['keys']);
-  if (keys.code !== 0) {
-    report(ctx, keys);
+// Queues the consented upload and follows it until each workspace is done; a failure prints only its failure lines.
+export async function uploadPast(ctx, key) {
+  const sinceMs = (ctx.now || Date.now)();
+  const result = await ctx.run('backfill.mjs', ['--account', key, '--consented']);
+  if (result.code !== 0) {
+    failureLines(result).forEach((line) => ctx.print(line));
     return;
   }
-  const line = lastLine(keys.stdout, /^crash=/);
-  if (line === null) return;
-  await askCrashReports(ctx, token(line, 'crash'));
-  if (token(line, 'statusline') !== 'off') return;
-  if (await ctx.ask.confirm(STATUS_LINE_QUESTION, true) === true) {
-    report(ctx, await ctx.run('statusline-install.mjs', []));
+  const line = lastLine(result.stdout, /^uploading=\d+ /);
+  const tenants = line === null ? null : token(line, 'tenants');
+  if (tenants === null || tenants === '') return;
+  await followPast(ctx, key, tenants.split(','), sinceMs);
+}
+
+// The `crash=… statusline=…` line of `settings.mjs keys`, or null.
+async function machineLine(ctx) {
+  const keys = await ctx.run('settings.mjs', ['keys']);
+  if (keys.code !== 0) report(ctx, keys);
+  return lastLine(keys.stdout, /^crash=/);
+}
+
+// Crash reports on for an undecided machine and the status line installed when off; resolves what is on afterwards.
+export async function applyDefaults(ctx) {
+  const telemetry = await ctx.run('telemetry.mjs', ['default']);
+  if (telemetry.code !== 0) report(ctx, telemetry);
+  let line = await machineLine(ctx);
+  if (line !== null && token(line, 'statusline') === 'off') {
+    // A settings file the installer can't parse is not an error here: the status line just stays off.
+    await ctx.run('statusline-install.mjs', []);
+    line = await machineLine(ctx);
   }
+  return {
+    crash: line !== null && token(line, 'crash') !== 'off',
+    statusline: line !== null && token(line, 'statusline') === 'on',
+  };
 }

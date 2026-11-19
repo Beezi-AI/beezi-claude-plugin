@@ -32,6 +32,24 @@ export function claimPulse(sessionId, deps = {}) {
   return true;
 }
 
+// A git checkpoint just ran the turn-end work, so the pulse need not repeat it within the
+// interval: stamp the marker as a fresh claim. mtime is set explicitly, not by rewriting the
+// file: truncating an already-empty file does not reliably move its mtime (Windows).
+// -> true when the marker now carries `now`. Never throws.
+export function refreshPulseClaim(sessionId, deps = {}) {
+  const now = deps.now == null ? Date.now : deps.now;
+  const marker = markerFile(sessionId);
+  try {
+    fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    fs.closeSync(fs.openSync(marker, 'a'));
+    const at = new Date(now());
+    fs.utimesSync(marker, at, at);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Returns { ran } — ran is true when this firing performed the checkpoint.
 export async function maybeRunPulse(input, deps = {}) {
   if (input == null || !input.session_id || !input.transcript_path) return { ran: false };
@@ -39,8 +57,10 @@ export async function maybeRunPulse(input, deps = {}) {
   // Heavy import only after a successful claim, so the gated path stays at node startup.
   const runCheckpoint =
     deps.runCheckpoint == null ? (await import('./checkpoint.mjs')).runCheckpoint : deps.runCheckpoint;
-  // emitTimeline: the pulse substitutes for a Stop that is not coming, so it ships everything
-  // a turn end would — segments, timeline, usage snapshot, statusline drain.
-  const result = await runCheckpoint(input, {}, { emitTimeline: true });
+  // The pulse substitutes for a Stop that is not coming, so it runs what a Stop would: segments,
+  // plus the timeline, usage snapshot and statusline drain on the Stop cadence. localOnly: no
+  // credential read and no network; the queue and the outbox go to the background uploader.
+  // No lockWaitMs: a PostToolUse run skips when the session lock is held.
+  const result = await runCheckpoint(input, {}, { emitTimeline: 'cadence', backgroundFlush: true, localOnly: true });
   return { ran: true, result };
 }

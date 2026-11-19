@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
+import { ACCOUNTS_DIR, CLAUDE_SESSIONS_DIR } from './dir-names.mjs';
 
 // Baked environment identity: scripts/make-variant.sh writes env.json into dev/staging variants;
 // the prod plugin ships { "name": "" }. Missing or unreadable reads as prod.
@@ -15,6 +16,14 @@ function readEnvJson() {
   }
 }
 const ENV_JSON = readEnvJson();
+
+export function pluginRoot(deps = {}) {
+  const env = deps.env == null ? process.env : deps.env;
+  const root = deps.pluginRoot != null
+    ? deps.pluginRoot
+    : (env.CLAUDE_PLUGIN_ROOT || path.join(path.dirname(fileURLToPath(import.meta.url)), '..'));
+  return root.replace(/\\/g, '/');
+}
 
 // Namespace for every machine-local artifact: state dir and OS credential entry alike.
 // BEEZI_ENV overrides for local development; otherwise the identity is baked into the variant,
@@ -62,7 +71,7 @@ export function accountsIndexFile() {
 }
 
 export function accountsRoot() {
-  return path.join(beeziHome(), 'accounts');
+  return path.join(beeziHome(), ACCOUNTS_DIR);
 }
 
 // Held by mkdir while the single-account store is folded into accounts/<key>/; see
@@ -142,6 +151,12 @@ export function queueDir(key) {
   return path.join(accountDir(key), 'queue');
 }
 
+// Hook network work other than session reports (errors, timelines, the usage snapshot), written
+// by hooks and sent by the upload worker. Never holds a token; pruneStale sweeps it like queue/.
+export function outboxDir(key) {
+  return path.join(accountDir(key), 'outbox');
+}
+
 export function stateDir() {
   return path.join(beeziHome(), 'state');
 }
@@ -162,6 +177,21 @@ export function repoMapFile() {
 // living there would expire and make every old session look importable again on the next run.
 export function auditLedgerFile(key, tenantId = null) {
   return path.join(accountDir(key), tenantId == null ? 'audit-ledger.json' : `audit-ledger.${tenantTag(tenantId)}.json`);
+}
+
+// The past-session offer a scan left for the next prompt; at the account dir root, away from pruneStale().
+export function historyOfferFile(key, tenantId = null) {
+  return path.join(accountDir(key), tenantId == null ? 'history-offer.json' : `history-offer.${tenantTag(tenantId)}.json`);
+}
+
+// Session ids the developer was asked about and did not upload, per workspace, next to the offer file.
+export function historyDeclinedFile(key, tenantId = null) {
+  return path.join(accountDir(key), tenantId == null ? 'history-declined.json' : `history-declined.${tenantTag(tenantId)}.json`);
+}
+
+// The setup listing the user was shown, kept for the consented upload, next to the offer files.
+export function setupListingFile(key) {
+  return path.join(accountDir(key), 'setup-listing.json');
 }
 
 // File-name-safe form of a tenant id, shared by per-tenant ledgers and queue copies.
@@ -254,6 +284,13 @@ export function usagePingStateFile() {
   return path.join(beeziHome(), 'usage-ping.json');
 }
 
+// The background uploader's run record: { version, state, pid, startedAt, lastRunAt, retryAfterAt,
+// attemptedAt, outcome }. Root-level, one per Beezi home: the spawn gate and the worker share it,
+// and pruneStale() must never sweep it, or a stalled run's retry backoff would vanish with it.
+export function uploadWorkerFile() {
+  return path.join(beeziHome(), 'upload-worker.json');
+}
+
 // Rate-limit observations captured by the status line, awaiting the next drain. Separate from
 // usage-snapshot.json because the status line writes it on render and must never contend with
 // the reporting path's own markers.
@@ -276,6 +313,26 @@ export function telemetryConsentFile() {
 // Whether the status line ends with the Beezi badge: { version, enabled }. Root-level, one per machine.
 export function statuslineBadgeFile() {
   return path.join(beeziHome(), 'statusline-badge.json');
+}
+
+// Whether the plan-usage check may run where the status line can't: { version, enabled }. Off until turned on.
+export function usageCheckFile() {
+  return path.join(beeziHome(), 'usage-check.json');
+}
+
+// The check's throttle and last outcome: { version, lastAttemptAt, consecutiveFailures, lastOutcome, ... }.
+export function usageCheckStateFile() {
+  return path.join(stateDir(), 'usage-check.json');
+}
+
+// Present once the desktop-app notice has been shown, so it shows once per machine.
+export function usageCheckNoticeFile() {
+  return path.join(beeziHome(), 'usage-check-notice.json');
+}
+
+// The probe's working directory, so its `claude -p` run never touches a project folder.
+export function usageCheckCwd() {
+  return path.join(beeziHome(), 'usage-check-cwd');
 }
 
 // The last rule or New folders change, so /beezi:settings undo can put it back.
@@ -301,5 +358,5 @@ export function claudeProjectsDir() {
 }
 
 export function claudeSessionsDir() {
-  return path.join(claudeHome(), 'sessions');
+  return path.join(claudeHome(), CLAUDE_SESSIONS_DIR);
 }

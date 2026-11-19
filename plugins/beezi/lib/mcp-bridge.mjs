@@ -11,6 +11,7 @@ import { recordMcpStartupFailure } from './telemetry-auth.mjs';
 import { maybeSpawnDiagnostics as _maybeSpawnDiagnostics } from './diagnostics-trigger.mjs';
 import { findSessionWorkspaceByCwd, isMultiTenant, readSessionWorkspace, resolveReadTenant, tenantById } from './workspace.mjs';
 import { resolveSessionId } from './permission-mode-store.mjs';
+import { anonymizationScope } from './anonymization.mjs';
 
 // Stdio ⇄ Streamable-HTTP bridge for the Beezi MCP server. Claude Code runs the
 // bridge as a local stdio MCP server, so it never sees the portal's OAuth
@@ -266,7 +267,7 @@ export function createBridge(deps = {}) {
       const row = account ? await getAccount(account) : null;
       const tenantId = resolveBridgeWorkspace(row).tenantId;
       selectScope(account, tenantId);
-      const token = { key: account, token: accessToken, clientId: (row && row.clientId), tenantId };
+      const token = { key: account, token: accessToken, clientId: (row && row.clientId), tenantId, ...anonymizationScope(row) };
       try {
         await reinitialize(token);
         // The client accepted an empty tool list during the synthetic handshake; this makes
@@ -379,7 +380,7 @@ export function createBridge(deps = {}) {
       .then(() => getAuthentication({}, { account }))
       .catch(() => ({ authState: AUTH_STATES.UNAVAILABLE, accessToken: null }));
     let token = auth.authState === AUTH_STATES.READY
-      ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId), tenantId: scope.tenantId }
+      ? { key: account, token: auth.accessToken, clientId: auth.clientId || (row && row.clientId), tenantId: scope.tenantId, ...anonymizationScope(row) }
       : null;
     if (!token) {
       // The bridge cannot start with real tools. Recorded with the reason the accessor gave, and

@@ -1,5 +1,5 @@
-import fs from 'fs';
 import { findTranscriptBySessionId } from './transcript.mjs';
+import { scanTranscript } from './transcript-reader.mjs';
 import { readPermissionModeRecord, resolveSessionId } from './permission-mode-store.mjs';
 
 // The two permission modes that stop /beezi:login.
@@ -54,31 +54,22 @@ export function readPermissionMode(transcriptPath) {
 // "which is newer" comparison needs. User-line stamps carry their own.
 // Returns { mode, at }.
 export function readPermissionModeStamp(transcriptPath) {
-  let content;
-  try {
-    content = fs.readFileSync(transcriptPath, 'utf-8');
-  } catch {
-    return { mode: null, at: null };
-  }
   let mode = null;
   let at = null;
   let newestSeen = null;
-  for (const raw of content.split('\n')) {
-    if (!raw.trim()) continue;
-    let line;
-    try {
-      line = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-    if (line != null && line.isSidechain === true) continue;
-    const ts = line == null || typeof line.timestamp !== 'string' ? NaN : Date.parse(line.timestamp);
-    if (Number.isFinite(ts) && (newestSeen === null || ts > newestSeen)) newestSeen = ts;
-    const pm = permissionModeOf(line);
-    if (pm !== null) {
-      mode = pm;
-      at = Number.isFinite(ts) ? ts : newestSeen;
-    }
+  try {
+    scanTranscript(transcriptPath, 0, ({ line }) => {
+      if (line != null && line.isSidechain === true) return;
+      const ts = line == null || typeof line.timestamp !== 'string' ? NaN : Date.parse(line.timestamp);
+      if (Number.isFinite(ts) && (newestSeen === null || ts > newestSeen)) newestSeen = ts;
+      const pm = permissionModeOf(line);
+      if (pm !== null) {
+        mode = pm;
+        at = Number.isFinite(ts) ? ts : newestSeen;
+      }
+    });
+  } catch {
+    return { mode: null, at: null };
   }
   return { mode, at };
 }

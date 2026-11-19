@@ -1,5 +1,3 @@
-import path from 'path';
-import { fileURLToPath } from 'url';
 import {
   isMultiTenant,
   newTenantsOf,
@@ -8,19 +6,17 @@ import {
   tenantById,
 } from './workspace.mjs';
 import { bindSessionRoutes, createRouteContext, routeKeyForDir, shortLabel, usesRules } from './workspace-rules.mjs';
-import { resultLine } from './pending-history.mjs';
+import { resultLine, HistoryStatus } from './pending-history.mjs';
+import { readTrackingState } from './tracking.mjs';
+import { workspacesAt } from './history-trigger.mjs';
+import { pluginRoot } from './paths.mjs';
+import { offerTenantKey } from './offer-gate.mjs';
+import { readProgress as _readProgress, markReported as _markReported } from './upload-progress.mjs';
 
 const GROUP_SIZE = 4;
 // Only a new session or /clear asks; resume and compact never do.
 const ASK_SOURCES = ['startup', 'clear'];
-
-export function pluginRoot(deps = {}) {
-  const env = deps.env == null ? process.env : deps.env;
-  const root = deps.pluginRoot != null
-    ? deps.pluginRoot
-    : (env.CLAUDE_PLUGIN_ROOT || path.join(path.dirname(fileURLToPath(import.meta.url)), '..'));
-  return root.replace(/\\/g, '/');
-}
+const ASK_GUARD = 'Only if the AskUserQuestion tool is available to you in this session, do the following before anything else; otherwise skip it entirely and never mention it.';
 
 async function linkedRows(deps) {
   const accounts = await import('./accounts.mjs');
@@ -206,12 +202,12 @@ function joinedPromptText(rows, root, sessionId) {
   const after = sessionId == null ? ['Then continue with the user\'s request.'] : hereGateText(rows, root, sessionId);
   return [
     `Beezi: ${who}.`,
-    'Only if the AskUserQuestion tool is available to you in this session, do the following before anything else; otherwise skip it entirely and never mention it.',
+    ASK_GUARD,
     `Run EXACTLY ${commands}.`,
     `Then read "${root}/commands/sync.md" and follow its Step 1 from "Its output is for you only. For an account that joined" up to the paragraph that begins "Then, repos and folders with no rule. Run", for that output only, with three changes:`,
     '(1) always ask the first single-select question ("You joined …") first, even with 4 or fewer J lines, and add a last option "Later" (description "Ask me again in my next session") that runs nothing; on "Choose repos", ask for each new workspace the multi-select "Which repos and folders should also send analytics to <name>?" (worded as in sync.md) with the J lines as options, at most 3 per question and ending in "None of these" as in sync.md ("None of these" alone picks nothing, and a mixed answer is not an answer: if it is chosen together with any repo or folder, ask that workspace\'s question again once (every part), and a second mixed answer is a dismissal with no joined pick and no done-command; the repeated question starts with "None of these" can\'t be combined with repos — pick one or the other.), and for each picked one run its `joined pick` J-command with that workspace\'s tenant id;',
     '(2) leave out the "Add … to all" option when every J line ends in now=pending or now=none;',
-    '(3) stop after that part: run neither routes nor sync.mjs, because the upload starts by itself.',
+    '(3) stop after that part: run neither routes nor sync.mjs. These answers upload nothing; if this machine has past sessions for the new workspaces, Beezi asks about them in a later session, or shows a notice and uploads them then for a workspace whose owner chose upload without asking.',
     ...after,
   ].join(' ');
 }
@@ -227,7 +223,15 @@ export async function buildJoinedPrompt(input, deps = {}) {
   return rows.length === 0 ? null : joinedPromptText(rows, pluginRoot(deps), sessionId);
 }
 
-// SessionStart: one user-only line per finished history upload, shown once on startup or clear.
+// A sent result whose foreground run, the card or the prompt hook already showed its done line.
+function reportedAlready(row, result, readProgress) {
+  if (result.status !== HistoryStatus.SENT) return false;
+  const record = readProgress(row.key, offerTenantKey(row, result.tenantId));
+  return record != null && record.reported === true;
+}
+
+// SessionStart: one user-only line per finished history upload not yet reported, shown once on startup or clear; a sent
+// result shown marks its workspace record reported, so the card and the prompt hook don't repeat it.
 export async function buildHistoryNotice(input, deps = {}) {
   if (input == null) return null;
   if (input.source != null && ASK_SOURCES.indexOf(input.source) === -1) return null;
@@ -235,12 +239,55 @@ export async function buildHistoryNotice(input, deps = {}) {
   const waiting = rows.filter((row) => Array.isArray(row.historyResults) && row.historyResults.length > 0);
   if (waiting.length === 0) return null;
   const take = deps.takeHistoryResults == null ? (await import('./accounts.mjs')).takeHistoryResults : deps.takeHistoryResults;
+  const readProgress = deps.readProgress == null ? _readProgress : deps.readProgress;
+  const markReported = deps.markReported == null ? _markReported : deps.markReported;
   const lines = [];
   for (const row of waiting) {
     let taken = [];
     try { taken = await take(row.key); } catch { continue; }
     const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
-    for (const result of taken) lines.push(resultLine(result, { prefix, nameOf: (id) => nameOf(row, id), syncName: '/beezi:sync' }));
+    for (const result of taken.filter((r) => !reportedAlready(row, r, readProgress))) {
+      lines.push(resultLine(result, { prefix, nameOf: (id) => nameOf(row, id), syncName: '/beezi:sync' }));
+      // A failed mark only lets the card or the prompt hook show this upload's done line too.
+      if (result.status === HistoryStatus.SENT) {
+        try { markReported(row.key, offerTenantKey(row, result.tenantId)); } catch {}
+      }
+    }
   }
   return lines.length === 0 ? null : lines.join('\n');
+}
+
+function historyOfferText(rows, root) {
+  const commands = rows.map((row) => `\`node "${root}/scripts/history.mjs" offer --account ${row.key}\``).join(', then ');
+  const options = optionList([
+    { label: 'Upload now', description: 'Sends them to <workspace> now' },
+    { label: 'Not now', description: 'Nothing is sent. /beezi:sync uploads them any time' },
+  ]);
+  const notNow = optionText({ label: 'Not now', description: 'Nothing more is uploaded. Run /beezi:sync any time.' });
+  return [
+    ASK_GUARD,
+    `Run EXACTLY ${commands}. If it prints \`offers=0 notices=0\`, say nothing about this.`,
+    'For each `<notice>` or `<offers>` block it prints (workspaces that upload past sessions without asking), write its lines, and the `Uploading …` and `✓ …` lines after it, to the user verbatim inside one plain fenced code block (```, no language), keeping every leading space and line break; ask nothing about them.',
+    'For each `<offer>` block it prints, write its lines the same way, except the `question=`, `upload-command=` and `decline-command=` lines (an `<offer>` with no other lines gets no code block).',
+    `Then use the AskUserQuestion tool to ask one single-select question per \`<offer>\` block, up to 4 per call, one call per message: that block's \`question=\` text, with the options ${options}, where <workspace> is the workspace named in that question.`,
+    'If the answer is "Upload now", run that block\'s `upload-command=` EXACTLY and show the user only its last line.',
+    'On any other answer, including a dismissed question, run that block\'s `decline-command=` EXACTLY and show nothing from it.',
+    `For each \`<ask>\` block, write nothing from it and make one AskUserQuestion call with one multiSelect: true question: its \`question=\` text word for word, with one option per \`workspace=\` line (label the \`workspace=\` value, description the \`description=\` value after it), then ${notNow} last.`,
+    'For each picked workspace run the `upload-command=` after its `workspace=` line EXACTLY and show the user only its last line; for each other workspace of the block run its `decline-command=` EXACTLY and show nothing from it.',
+    'If "Not now" is chosen together with any workspace, run nothing yet and ask that question again once, starting with `"Not now" can\'t be combined with a workspace — pick one or the other.` A second mixed answer, nothing picked or a dismissed question counts as "Not now", which runs every `decline-command=` of the block.',
+    'Then continue with the user\'s request.',
+  ].join(' ');
+}
+
+// SessionStart: the instruction to run history.mjs offer for accounts with a scanned offer waiting, on startup or clear only; writes nothing.
+export async function buildHistoryOfferPrompt(input, deps = {}) {
+  if (input == null || ASK_SOURCES.indexOf(input.source) === -1) return null;
+  const readTracking = deps.readTrackingState == null ? readTrackingState : deps.readTrackingState;
+  const waiting = [];
+  for (const row of await linkedRows(deps)) {
+    if ((await workspacesAt(row, readTracking(row.key), 'READY')).length > 0) waiting.push(row);
+  }
+  if (waiting.length === 0) return null;
+  const rows = await withUsableLogin(waiting, deps);
+  return rows.length === 0 ? null : historyOfferText(rows, pluginRoot(deps));
 }

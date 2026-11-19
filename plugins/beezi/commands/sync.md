@@ -1,6 +1,6 @@
 ---
 description: Upload past Claude Code sessions to Beezi analytics, skipping ones already uploaded
-allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/workspace.mjs:*), AskUserQuestion
+allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/history.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/workspace.mjs:*), AskUserQuestion
 ---
 
 Do not read or inspect any files yourself.
@@ -13,7 +13,7 @@ question; `multiSelect: true` only with 2 or more options. Make one AskUserQuest
 message and wait for its answers before the next (two calls in one message show the user only
 the last). A dismissed question runs nothing.
 
-## Step 1 — new workspaces, then repos and folders with no rule, then the upload
+## Step 1 — new workspaces, then repos and folders with no rule, then the summary
 
 Run EXACTLY this one command, with the Bash tool's `timeout` set to 600000 (add `--account <key>`
 when the user named an account, and the `--tenant` override from Step 2 when the user asked for it):
@@ -23,7 +23,7 @@ when the user named an account, and the `--tenant` override from Step 2 when the
 It prints a `<joined>` block (new workspaces, below) and stops there when that block's last line
 is not `joined=0`. Otherwise it prints a `<routes>` block (repos and folders with no rule, below)
 and stops there when its last line is not `routes=0`. When both are 0 it goes straight on to the
-upload: everything after the `</routes>` line is Step 2's output, and no other command runs. A
+summary: everything after the `</routes>` line is Step 2's output, and no other summary command runs. A
 listing that fails shows a `✗` line inside its block instead and counts as nothing to ask: write
 that line verbatim.
 
@@ -48,7 +48,7 @@ machine, it lists every repo and folder with where its analytics go now. Its lin
   and folders sending where they send now;
 - `joined=<total>` — the number of `J` lines, always last.
 
-Run the printed commands unchanged; whatever they route gets its history uploaded.
+Run the printed commands unchanged; they only set where analytics go.
 
 `joined=0` → nothing to ask; go to "Then, repos and folders with no rule" below.
 
@@ -56,7 +56,7 @@ For each account with `J` lines (with several accounts, end every question text 
 using that account's `W.` lines and commands:
 
 More than 4 `J` lines → first ask (single-select) "You joined <names>. Where should analytics for these
-<N> repos and folders go? Their past sessions will be sent there too." (`<N>` = that account's number of
+<N> repos and folders go?" (`<N>` = that account's number of
 `J` lines) with the options "Add <names> to all <N>" (description "Repos you don't track, and ones with
 no rule yet, stay as they are"), "Choose repos" ("Pick which repos and folders go to each new
 workspace") and "Leave them as they are" ("Nothing changes, and you're not asked about <names> again").
@@ -69,8 +69,7 @@ workspace") and "Leave them as they are" ("Nothing changes, and you're not asked
 4 or fewer `J` lines → the per-workspace questions.
 
 Per-workspace questions — for each `W.` line with `new=yes` of that account, in order, ask the
-`multiSelect: true` question "Which repos and folders should also send analytics to <name>? Their past
-sessions will be sent there too." `<name>` is the `W.` line's text after `W. ` up to ` account=`, and
+`multiSelect: true` question "Which repos and folders should also send analytics to <name>?" `<name>` is the `W.` line's text after `W. ` up to ` account=`, and
 `<tenant>` its `tenant=` value. Options: one per `J` line of that account, in order — label = `<short>`
 (the `J` line's text after `J<i>. ` up to ` (` or `,`), description = "Now: <where>" (`<where>` = the text after `now: ` up to ` account=`),
 or "No rule yet" when `<where>` is `no rule yet`; then "None of these" LAST (description "Nothing from
@@ -97,7 +96,7 @@ commands, run EXACTLY, with the same `timeout`, `--account` and `--tenant` as St
 `node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs --review-routes`
 
 It prints the `<routes>` block and, when its last line is `routes=0`, goes straight on to the
-upload as Step 1's command does.
+summary as Step 1's command does.
 
 The `<routes>` block is `workspace.mjs routes` output. It is for you only, except the one line
 named below. It lists, per account in several
@@ -119,7 +118,7 @@ yet. Its lines:
   ask about it;
 - `routes=<total>` — the number of `P` lines, always last.
 
-Not linked, or `routes=0` → nothing to ask: the upload already ran in the same call; go to Step 2
+Not linked, or `routes=0` → nothing to ask: the summary already ran in the same call; go to Step 2
 for its output.
 
 For each account with `P` lines (with several accounts, end every question text with
@@ -171,40 +170,73 @@ runs nothing: its sessions are not sent this time, and the next /beezi:sync asks
 
 Write each command's first line verbatim.
 
-## Step 2 — sync
+## Step 2 — past sessions
 
-When the last listing printed `routes=0`, the upload already ran: its output is everything after
-that listing's `</routes>` line. Run nothing more. Only after the `P` questions (answered or
-dismissed) and their commands, run EXACTLY this one command, with the same `timeout`,
-`--account` and `--tenant` as Step 1's command:
+When the last listing printed `routes=0`, the summary already ran: its output is everything after
+that listing's `</routes>` line. Otherwise, only after the `P` questions (answered or dismissed)
+and their commands, run EXACTLY this one command, with the same `timeout`, `--account` and
+`--tenant` as Step 1's command:
 
 `node ${CLAUDE_PLUGIN_ROOT}/scripts/sync.mjs`
 
-For an account in several workspaces, each past session goes where its own repo or folder
-routes: its rule, else the New folders setting ("Send to" workspaces get it; under "Ask me" or
-"Don't send" it is not sent this time). Add `--account <key> --tenant <id>[,<id>…]` only when the
-user asks to sync specific workspaces instead: that is an override that sends every past session
-to those workspaces, ignoring rules.
+It uploads only to workspaces whose owner chose to upload past sessions without asking, and asks
+about every other one: per account with past sessions Beezi does not have yet, it prints the blocks
+below, then `offers=<n> notices=<m>`. For an account in several workspaces, each past session
+goes where its own repo or folder routes: its rule, else the New folders setting ("Send to"
+workspaces get it; under "Ask me" or "Don't send" it is not sent this time). Add `--account <key>
+--tenant <id>[,<id>…]` only when the user asks to sync specific workspaces instead: that is an
+override that offers every past session to those workspaces, ignoring rules, and always asks.
 
-Write the upload's output verbatim as your reply text. Never echo any token.
+Its blocks, in order:
 
-The script uploads every past session still on this machine that Beezi does not
-already have. It asks the server how far each session already reaches and resumes
-from exactly there, so it is safe to run as often as the user likes — a repeat run
-uploads nothing and reports that everything is up to date.
+- `<notice …>` (one workspace that uploads without asking) or `<offers …>` (several workspaces with
+  past sessions, in two groups): write its lines, and the `Uploading …` and `✓ Uploaded …` lines
+  after it, verbatim inside one plain fenced code block (```, no language), keeping every leading
+  space and line break. Ask nothing about them: that upload already ran.
+- `<offer …>` (one workspace that asks first): write its lines the same way, except `question=`,
+  `upload-command=` and `decline-command=`; an `<offer>` after an `<offers>` block has no other
+  lines and gets no code block. Then ask ONE AskUserQuestion per block, up to 4 per call: question = the
+  `question=` value; options `Upload now` (description "Send these sessions to Beezi now") and `Not now`
+  (description "Nothing is sent. /beezi:sync uploads them any time"). `Upload now` → run the block's
+  `upload-command=` text EXACTLY ONCE, with the Bash `timeout` set to 600000, and write its output
+  verbatim. Anything else, a dismissal included → run its `decline-command=` text EXACTLY ONCE and
+  write its line verbatim.
+- `<ask …>` (several workspaces that ask first, at most 3 per block): write nothing from it. Ask ONE
+  `multiSelect: true` AskUserQuestion per block, one call per block: question = its `question=`
+  value, word for word; one option per `workspace=` line, in order — label = the `workspace=` value,
+  description = the `description=` value after it — then `Not now` LAST (description "Nothing more
+  is uploaded. Run /beezi:sync any time."). Each `workspace=` line is followed by that workspace's
+  own `upload-command=` and `decline-command=`. For each picked workspace run its `upload-command=`
+  text EXACTLY ONCE, with the Bash `timeout` set to 600000, and write its output verbatim; for each
+  other workspace of the block run its `decline-command=` text EXACTLY ONCE and write its line
+  verbatim. If `Not now` is chosen together with any workspace, run nothing yet: ask that block's
+  question again once, starting with `"Not now" can't be combined with a workspace — pick one or the other.`
+  A second mixed answer counts as `Not now`. `Not now`, nothing picked or a dismissal → run every
+  `decline-command=` of the block.
+
+These are the only questions where a dismissal runs a command. Never run an `upload-command=`
+without an `Upload now` answer or a picked workspace. With `offers=0 notices=0`, write the printed
+lines verbatim and add nothing.
+
+Outside the blocks, write verbatim only a `Note:` line, a line saying another sync is running, a
+`no … sessions found` line, the `✓ Beezi: nothing new to upload.` line (and the `… still open. Run
+/beezi:sync again after …` line under it), a `Beezi: analytics are off for …` line, a `Beezi: could not count past
+sessions for …` line, a `… hides some names, but this machine has no valid key for it yet …` line, the `one-time import has been used` line (and the upgrade line under it), or a
+`✗` line. Every other line (a `Beezi (<account>): …` route line, whose counts are not the offered
+sessions, the `— … —` headers, the `… sessions read…` progress lines and the `offers=<n> notices=<m>` line) is for you only. Never echo any token.
+
+Each upload resumes from exactly what Beezi already has, so /beezi:sync is safe to run as often as
+the user likes.
 
 Notes for interpreting the output:
 
-- "everything is already uploaded" is a success, not a failure — it means Beezi is
-  in sync. Do not re-run the command or suggest flags to force it.
+- `✓ Beezi: nothing new to upload` is a success, not a failure — it means Beezi is
+  in sync. Do not re-run the command or suggest flags to force it. A `… still open` line under it
+  names sessions that are still running; they can be uploaded with /beezi:sync after they finish.
 - If it says this machine is not linked, point the user at `/beezi:login`.
 - If it says the portal does not support `/beezi:sync` yet, the workspace's Beezi
   server needs updating — the user's history is not lost, and the command will work
   after the update.
-- A `Beezi (<account>): …` line says where that account's past sessions go. "… not sent this
-  time" is expected after a skipped question: the next /beezi:sync asks again, and
-  /beezi:settings rules adds a rule from inside that repo or folder. When it is an account's only
-  line, the run succeeded with nothing to send.
 
 Account selection: With no flag, sync processes every linked account in turn. Add `--account <key>` to sync one account.
 

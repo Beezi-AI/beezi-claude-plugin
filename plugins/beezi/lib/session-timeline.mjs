@@ -1,6 +1,6 @@
-import fs from 'fs';
 import path from 'path';
 import { listSubagentTranscripts } from './subagents.mjs';
+import { readTranscript } from './transcript-reader.mjs';
 import { IDLE_GAP_SEC, isTimingAnchor } from './delta.mjs';
 import { typedSkillOf } from './operations.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
@@ -65,15 +65,7 @@ export const BREAK_GAP_SEC = 6 * 60 * 60;
 
 // Parse a JSONL transcript into an array of records; blank/malformed lines are skipped.
 function parseTranscript(transcriptPath) {
-  const content = fs.readFileSync(transcriptPath, 'utf-8');
-  const trimmed = content.replace(/\n+$/, '');
-  if (trimmed === '') return [];
-  const out = [];
-  for (const raw of trimmed.split('\n')) {
-    if (!raw.trim()) continue;
-    try { out.push(JSON.parse(raw)); } catch { /* skip malformed */ }
-  }
-  return out;
+  return readTranscript(transcriptPath, 0).records.map((r) => r.line);
 }
 
 function tsOf(line) {
@@ -163,8 +155,8 @@ const PLAN_DOC_HINTS = ['design', 'spec', 'plan'];
 const PLAN_DIR_NAMES = { plan: true, plans: true, spec: true, specs: true, design: true, designs: true };
 const PLAN_DOC_EXT = '.md';
 
-// Mirrors code-changes.mjs's EDIT_TOOLS (not imported: that module doesn't export it, and this
-// file already mirrors rather than shares the block-scan idiom — see hasExitPlanMode).
+// Mirrors transcript-reader.mjs's EDIT_TOOLS (not imported: this file mirrors rather than shares
+// the block-scan idiom — see hasExitPlanMode).
 const EDIT_TOOLS = { Edit: true, MultiEdit: true, Write: true, NotebookEdit: true };
 
 // Forward slashes, so a Windows path parses with path.posix. Mirrors repo-timeline.mjs's norm().
@@ -678,7 +670,7 @@ function dropLeadIn(lines) {
 // `deps.readPermissionMarkers` is injectable so the tests never touch the developer's real
 // ~/.beezi/state — a stray marker file there would otherwise flip assertions on unrelated runs.
 export function computeSessionTimeline(transcriptPath, sessionId, deps = {}) {
-  // The audit run's per-session memo already holds parseTranscript's records for this file.
+  // The run's per-session memo already holds parseTranscript's records for this file.
   const transcriptMemo = deps.transcriptMemo == null ? null : deps.transcriptMemo;
   let lines;
   try {

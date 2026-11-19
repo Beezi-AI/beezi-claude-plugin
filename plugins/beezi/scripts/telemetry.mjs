@@ -1,6 +1,6 @@
 import {
   grantConsent, denyConsent, grantCorrelation, denyCorrelation,
-  isTelemetryGranted, isCorrelationGranted,
+  isTelemetryGranted, isCorrelationGranted, hasDecided,
 } from '../lib/telemetry-consent.mjs';
 import { purgeAllDiagnostics, purgeCorrelatedDiagnostics } from '../lib/telemetry-flush.mjs';
 
@@ -29,6 +29,11 @@ export function setTelemetry(mode) {
     purgeCorrelatedDiagnostics();
     return `Beezi diagnostics stay ON, without account correlation. ${CORRELATION_OFF} Pending correlated reports were deleted.`;
   }
+  if (mode === 'default') {
+    if (hasDecided()) return null;
+    grantCorrelation();
+    return '✓ Crash reports are on.';
+  }
   if (!isTelemetryGranted()) {
     return 'Beezi diagnostics are OFF. Use /beezi:settings telemetry on|off|correlate|anonymous to change.';
   }
@@ -36,5 +41,6 @@ export function setTelemetry(mode) {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('telemetry.mjs')) {
-  process.stdout.write(`${setTelemetry(process.argv[2])}\n`);
+  const message = setTelemetry(process.argv[2]);
+  if (message != null) process.stdout.write(`${message}\n`);
 }

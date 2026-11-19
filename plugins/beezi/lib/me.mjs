@@ -1,6 +1,7 @@
 import { readIndex, describeAccount, updateAccount } from './accounts.mjs';
 import { getAuthentication as _getAuthentication, INTERACTIVE_REFRESH_WAIT_MS } from './token.mjs';
 import { probeIdentity as _probeIdentity, PROBE_OUTCOMES } from './whoami.mjs';
+import { anonymizationScope } from './anonymization.mjs';
 import { AUTH_STATES, AUTH_REASONS } from './auth-state.mjs';
 import { DIAGNOSTIC_SOURCES } from './telemetry-codes.mjs';
 import { recordAuthResult as _recordAuthResult } from './telemetry-auth.mjs';
@@ -32,13 +33,14 @@ export async function accountHealth(account, deps = {}) {
   const auth = await getAuthentication(deps, { account: account.key, waitMs });
   if (auth.authState !== AUTH_STATES.READY) return fail(authStatusLines(auth));
 
-  let probe = await probeIdentity({ key: account.key, token: auth.accessToken, clientId: auth.clientId || account.clientId }, deps);
+  const scope = anonymizationScope(account);
+  let probe = await probeIdentity({ key: account.key, token: auth.accessToken, clientId: auth.clientId || account.clientId, ...scope }, deps);
   if (probe.outcome === PROBE_OUTCOMES.UNAUTHORIZED) {
     // The server's word beats this client's expiry estimate for an opaque token — but only a
     // real 401 earns the retry. A 403 or a 503 is never a reason to spend a refresh grant.
     const retry = await getAuthentication(deps, { account: account.key, forceRefresh: true, waitMs });
     if (retry.authState !== AUTH_STATES.READY) return fail(authStatusLines(retry));
-    probe = await probeIdentity({ key: account.key, token: retry.accessToken, clientId: retry.clientId || account.clientId }, deps);
+    probe = await probeIdentity({ key: account.key, token: retry.accessToken, clientId: retry.clientId || account.clientId, ...scope }, deps);
   }
   if (probe.outcome === PROBE_OUTCOMES.FORBIDDEN) {
     recordAuthResultImpl(

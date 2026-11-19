@@ -2,16 +2,34 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { usageSnapshotStateFile } from './paths.mjs';
+import { usageSnapshotStateFile, statuslineUsageFile } from './paths.mjs';
 import { readUsageUtilization as _readUsageUtilization } from './usage-utilization.mjs';
 import { readClaudeAccount as _readClaudeAccount } from './claude-account.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
 import { normalizePlan } from './billing.mjs';
 import { buildIdentityStamp, recordOwnsIdentity } from './identity-stamp.mjs';
+import { PRIVATE_MARK, accountKindMap, anonymizationFor, wireKinds, markPrivate } from './anonymization.mjs';
+import { AnonKind, anonymizeUsage, without } from './anonymize.mjs';
 import {
   readPendingStatuslineUsage as _readPendingStatuslineUsage,
-  clearPendingStatuslineUsage as _clearPendingStatuslineUsage,
+  clearPendingRow as _clearPendingRow,
+  samePendingRow,
 } from './statusline-usage.mjs';
+
+// Stamps every row waiting in the status-line file with the kinds its targets hide now, so a later drain never sends it
+// raw. Rows are matched by identity on a re-read just before the write: one cleared meanwhile stays gone, one appended meanwhile stays unmarked.
+export function markPendingStatuslineUsage(kindMap, deps = {}) {
+  if (Object.keys(kindMap).length === 0) return;
+  const readPending = deps.readPendingStatuslineUsage == null ? _readPendingStatuslineUsage : deps.readPendingStatuslineUsage;
+  const waiting = readPending();
+  if (waiting.length === 0) return;
+  const file = statuslineUsageFile();
+  let state = readJson(file);
+  if (state == null) state = {};
+  const pending = Array.isArray(state.pending) ? state.pending : [];
+  const marked = pending.map((row) => (waiting.some((w) => samePendingRow(w, row)) ? markPrivate(row, kindMap) : row));
+  writeJsonSecure(file, { ...state, version: 1, pending: marked });
+}
 
 // The API deep-whitelists nested limit entries (forbidNonWhitelisted): an unknown upstream key
 // inside limits[] would 400 the whole snapshot. Send exactly the known keys; JSON serialization
@@ -119,6 +137,15 @@ export function buildSnapshotPayload(utilization, account, stamp = {}, billing =
   };
 }
 
+// The body one target receives under its marked and current kinds; null when accounts are hidden and no key is known.
+function bodyForTarget(body, session) {
+  const kinds = wireKinds(body, session, session.tenantId);
+  const plain = without(body, [PRIVATE_MARK]);
+  if (kinds.indexOf(AnonKind.ACCOUNTS) === -1) return plain;
+  const block = anonymizationFor(session, session.tenantId);
+  return block == null || block.key == null ? null : anonymizeUsage(plain, block.key, kinds);
+}
+
 // The identity one drained row ships under. A row recorded its own account (statusline-usage.mjs)
 // because it may be drained after a switch — of account, or of subscription within one login — and
 // the identity in force at drain time would put its limits on the wrong one. Rows recorded before
@@ -162,13 +189,17 @@ export async function drainStatuslineSnapshots(sessions, deps = {}) {
   // keeps a caller that has none working, just blind to those two places.
   const env = deps.env == null ? process.env : deps.env;
   const readPending = deps.readPendingStatuslineUsage == null ? _readPendingStatuslineUsage : deps.readPendingStatuslineUsage;
-  const clearPending = deps.clearPendingStatuslineUsage == null ? _clearPendingStatuslineUsage : deps.clearPendingStatuslineUsage;
+  const clearPendingRow = deps.clearPendingRow == null ? _clearPendingRow : deps.clearPendingRow;
+  const markPending = deps.markPendingStatuslineUsage == null ? markPendingStatuslineUsage : deps.markPendingStatuslineUsage;
   const readAccount = deps.readClaudeAccount == null ? _readClaudeAccount : deps.readClaudeAccount;
   // Only accounts holding both a token and a key can settle a row, so nothing else joins the fan-out.
   const recipients = (sessions || []).filter((s) => s && s.key);
   const live = recipients.filter((s) => s.token);
   const waitingForToken = live.length < recipients.length;
-  if (live.length === 0) return { posted: 0, reason: 'no-token' };
+  if (live.length === 0) {
+    markPending(accountKindMap(recipients));
+    return { posted: 0, reason: 'no-token' };
+  }
 
   const pending = readPending();
   if (!pending.length) return { posted: 0, reason: 'empty' };
@@ -218,19 +249,27 @@ export async function drainStatuslineSnapshots(sessions, deps = {}) {
     const { account: recorded, ...row } = pendingRow;
     const body = { ...rowIdentity(identity, recorded, keyInForce, planUuid, planOrg), ...row, limits: null, raw: null };
     // Settled = stored (2xx) or refused for good (any 4xx, a dark or unauthorized tenant included);
-    // only a 5xx or a transport failure is retryable, so one refusing account cannot pin the queue.
+    // only a 5xx, a transport failure or a missing anonymization key keeps the row; MAX_PENDING bounds what that can hold.
     const settled = await Promise.all(live.map(async (session) => {
+      const wire = bodyForTarget(body, session);
+      if (wire == null) return false;
       try {
-        const res = await postJson(`${apiBase()}${ENDPOINTS.usageSnapshot}`, session, body, { fetchImpl });
+        const res = await postJson(`${apiBase()}${ENDPOINTS.usageSnapshot}`, session, wire, { fetchImpl });
         return (res.status >= 200 && res.status < 300) || (res.status >= 400 && res.status < 500);
       } catch {
         return false;
       }
     }));
-    if (waitingForToken || settled.some((ok) => !ok)) break;
+    if (waitingForToken || settled.some((ok) => !ok)) {
+      // Kept rows remember the kinds they waited under, so turning accounts off later cannot expose them.
+      markPending(accountKindMap(live));
+      break;
+    }
+    // Cleared the moment it settles, by identity: a hook killed mid-drain never re-sends it, and
+    // a row the status line records meanwhile is never mistaken for it.
+    clearPendingRow(pendingRow);
     posted += 1;
   }
-  if (posted > 0) clearPending(posted);
   return { posted };
 }
 
@@ -246,8 +285,13 @@ export async function maybePostUsageSnapshot(session, deps = {}) {
   const readAccount = deps.readClaudeAccount == null ? _readClaudeAccount : deps.readClaudeAccount;
   if (!session || !session.token || session.key == null) return { reported: false, reason: 'no-token' };
 
+  // deps.utilization: a sample stored at enqueue time (the outbox snapshot item). The worker sends
+  // each stored sample as it was seen, so refreshes between enqueue and send are not collapsed.
   let utilization = null;
-  try { utilization = readUtilization(); } catch { utilization = null; }
+  if (deps.utilization != null) utilization = deps.utilization;
+  else {
+    try { utilization = readUtilization(); } catch { utilization = null; }
+  }
   if (!utilization) return { reported: false, reason: 'no-utilization' };
 
   const stateFile = usageSnapshotStateFile(session.key);
@@ -272,7 +316,8 @@ export async function maybePostUsageSnapshot(session, deps = {}) {
   // these are, and it is half the server's dedupe key. billing.json rides along so the plan fields
   // and the mismatch guard read from the same record every other path uses.
   const stamp = buildIdentityStamp(account, billing, env);
-  const payload = buildSnapshotPayload(utilization, account, stamp, billing);
+  const payload = bodyForTarget(buildSnapshotPayload(utilization, account, stamp, billing), session);
+  if (payload == null) return { reported: false, reason: 'anonymization-key-missing' };
   try {
     const res = await postJson(`${apiBase()}${ENDPOINTS.usageSnapshot}`, session, payload, { fetchImpl });
     if (res.status >= 200 && res.status < 300) {

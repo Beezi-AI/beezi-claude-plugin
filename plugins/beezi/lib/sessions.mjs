@@ -8,12 +8,21 @@ function toSession(row, token) {
     name: row.name == null ? null : row.name,
     tenantName: row.tenantName == null ? null : row.tenantName,
     tenants: Array.isArray(row.tenants) ? row.tenants : null,
+    anonymization: row.anonymization == null ? null : row.anonymization,
+    pastSessions: row.pastSessions == null ? null : row.pastSessions,
     newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
     workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
     tenantId: null,
     token,
     clientId: row.clientId == null ? null : row.clientId,
   };
+}
+
+// The only way an account row becomes a recipient: the session shape with no token and
+// tenantId null. The row's own tenantId is the web-side tenant and must never be followed;
+// expandTargets passes an entry with a set tenantId through unexpanded.
+export function accountRecipient(row) {
+  return toSession(row, null);
 }
 
 async function resolve(row, deps) {

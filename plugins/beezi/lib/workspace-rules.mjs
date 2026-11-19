@@ -9,7 +9,6 @@ import { loadLedger, isImported } from './audit-ledger.mjs';
 import { isLiveTrackingAllowed, readTrackingState } from './tracking.mjs';
 
 // Copied from session-audit.mjs so planning skips what the backfill skips.
-const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
 // The re-pick pass lists places with sessions from the last 30 days, as Codex's upload window does.
 const REVIEW_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
@@ -238,7 +237,7 @@ export function planSessionRoutes(row, entries, ctx, { readState = readSessionWo
   return routes;
 }
 
-// The one "waiting" test, shared by `routes` and the backfill seal hold so a pull is held only for what `routes` asks about: New folders is Ask me, settled, readable, pending, and in no workspace's ledger.
+// The "waiting" test behind `routes`: New folders is Ask me, and the session is settled, readable, pending and in no workspace's ledger.
 // Map<sessionId, key> plus `noDirectory` (waiting with no recorded directory); `routes` option reuses planSessionRoutes results.
 export function waitingRoutes(row, entries, ctx, {
   liveSessionId = null,
@@ -259,7 +258,6 @@ export function waitingRoutes(row, entries, ctx, {
     if (entry == null || entry.sessionId == null) continue;
     if (liveSessionId != null && entry.sessionId === liveSessionId) continue;
     if (nowMs - entry.mtimeMs < ACTIVE_SESSION_WINDOW_MS) continue;
-    if (entry.size > MAX_TRANSCRIPT_BYTES) continue;
     if (ledgers.some((ledger) => isImported(ledger, entry.sessionId))) continue;
     let cwd = null;
     let cwdRead = false;
@@ -336,7 +334,6 @@ export function planReviewPlaces(row, entries, ctx, {
     if (liveSessionId != null && entry.sessionId === liveSessionId) continue;
     if (nowMs - entry.mtimeMs < ACTIVE_SESSION_WINDOW_MS) continue;
     if (nowMs - entry.mtimeMs > REVIEW_WINDOW_MS) continue;
-    if (entry.size > MAX_TRANSCRIPT_BYTES) continue;
     const state = safeReadState(readState, entry.sessionId);
     const dir = state != null && typeof state.cwd === 'string' && state.cwd !== '' ? state.cwd : readCwd(entry.transcriptPath);
     if (dir == null) continue;

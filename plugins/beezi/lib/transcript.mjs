@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { claudeProjectsDir, stateDir } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
+import { scanTranscript } from './transcript-reader.mjs';
 
 // Claude Code stores transcripts under a per-project dir named from the cwd with
 // every non-alphanumeric character replaced by '-'.
@@ -33,23 +34,17 @@ function newestJsonl(dir) {
 }
 
 function transcriptMatchesCwd(file, cwd) {
-  let content;
+  let matches = false;
   try {
-    content = fs.readFileSync(file, 'utf-8');
+    scanTranscript(file, 0, ({ line }) => {
+      if (line == null || !line.cwd) return false;
+      matches = line.cwd === cwd;
+      return true;
+    });
   } catch {
     return false;
   }
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (parsed.cwd) return parsed.cwd === cwd;
-  }
-  return false;
+  return matches;
 }
 
 // Locate a session's transcript by its id, scanning every project dir. Immune to cwd

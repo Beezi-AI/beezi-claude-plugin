@@ -9,16 +9,28 @@
       "name": "beezi",
       "source": "./plugins/beezi",
       "description": "Reports Claude Code session usage and cost to Beezi, and shows a personal usage summary on demand.",
-      "version": "0.40.1",
-      "author": {
-        "name": "Beezi"
-      },
+      "version": "0.46.3",
+      "author": { "name": "Beezi" },
       "license": "Apache-2.0",
       "keywords": [
         "analytics",
         "token-usage",
         "beezi",
         "telemetry"
+      ],
+      "category": "analytics"
+    },
+    {
+      "name": "beezi-analytics",
+      "source": "./plugins/beezi-analytics",
+      "description": "See your Beezi usage analytics in Claude Code: spend, sessions, status and recommendations for the last 7 or 30 days. Read-only; sign in with your Beezi account.",
+      "version": "0.1.3",
+      "author": { "name": "Beezi" },
+      "license": "Apache-2.0",
+      "keywords": [
+        "analytics",
+        "token-usage",
+        "beezi"
       ],
       "category": "analytics"
     }

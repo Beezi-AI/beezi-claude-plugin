@@ -1,24 +1,24 @@
 {
+  "modules": ["./card.jsx"],
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs"], "timeout": 10 } ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/track-prompt.mjs"], "timeout": 10 } ] },
-      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-ping.mjs"], "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-ping.mjs"], "timeout": 10, "async": true } ] }
     ],
     "PreCompact": [
-      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-ping.mjs"], "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-ping.mjs"], "timeout": 10, "async": true } ] }
     ],
     "SubagentStop": [
-      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-ping.mjs"], "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/usage-ping.mjs"], "timeout": 10, "async": true } ] }
     ],
     "PermissionRequest": [
       { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/permission-request.mjs"], "timeout": 5 } ] }
     ],
     "PostToolUse": [
-      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/checkpoint.mjs"], "timeout": 10 } ] },
-      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/pulse.mjs"], "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use.mjs"], "timeout": 10, "async": true } ] }
     ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/stop.mjs"], "timeout": 10 } ] }

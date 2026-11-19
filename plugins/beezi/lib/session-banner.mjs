@@ -1,6 +1,7 @@
 import { isMultiTenant, joinTenantNames, tenantsOf } from './workspace.mjs';
 import { routeOfSession, routeText } from './route-describe.mjs';
 import { TrackingMode, isTenantDark } from './tracking.mjs';
+import { anonymizationFor, kindsOf } from './anonymization.mjs';
 
 const RULES = '/beezi:settings rules';
 
@@ -95,8 +96,34 @@ function severalAccounts(rows, { state, place, trackingByKey, asking, unconnecte
 // The session-start banner for the signed-in accounts, or null when none is signed in.
 // `place` is placeOfDir(cwd) (null: unknown cwd),
 // `asking` whether this start asks about a place with no rule, `unconnected` the keys of accounts whose platform workspace has this repo unconnected.
+// Every workspace the accounts send to, once each, with its name and whether it is anonymized.
+function workspacesOf(rows) {
+  const seen = new Map();
+  rows.forEach((row) => {
+    const tenants = tenantsOf(row);
+    if (tenants == null || tenants.length === 0) {
+      const block = anonymizationFor(row, null);
+      const id = block != null && block.tenantId != null ? block.tenantId : row.key;
+      if (!seen.has(id)) seen.set(id, { name: row.tenantName || id, anonymized: kindsOf(block).length > 0 });
+      return;
+    }
+    tenants.forEach((t) => {
+      if (!seen.has(t.id)) seen.set(t.id, { name: joinTenantNames(row, [t.id]), anonymized: kindsOf(anonymizationFor(row, t.id)).length > 0 });
+    });
+  });
+  return Array.from(seen.values());
+}
+
+function anonymizedLines(rows) {
+  const workspaces = workspacesOf(rows);
+  const anonymized = workspaces.filter((w) => w.anonymized);
+  if (workspaces.length === 1) return anonymized.length === 1 ? ['Beezi: this workspace is anonymized.'] : [];
+  return anonymized.map((w) => `Beezi: sessions sent to ${w.name} are anonymized.`);
+}
+
 export function buildBanner({ sessions, state = null, place = null, trackingByKey = new Map(), asking = false, unconnected = new Set() }) {
   if (!Array.isArray(sessions) || sessions.length === 0) return null;
   const opts = { state, place, trackingByKey, asking, unconnected };
-  return sessions.length === 1 ? oneAccount(sessions[0], opts) : severalAccounts(sessions, opts);
+  const text = sessions.length === 1 ? oneAccount(sessions[0], opts) : severalAccounts(sessions, opts);
+  return [text].concat(anonymizedLines(sessions)).join('\n');
 }

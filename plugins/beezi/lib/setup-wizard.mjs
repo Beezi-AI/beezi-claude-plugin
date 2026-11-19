@@ -1,29 +1,30 @@
-import { chooseAccount } from './setup-account.mjs';
-import { askMachineSettings, offerDefault, uploadHistory } from './setup-finish.mjs';
+import { chooseAccount, signedInLine } from './setup-account.mjs';
+import { closingLines } from './setup-finale.mjs';
+import { applyDefaults, uploadPast } from './setup-finish.mjs';
 import { capturePlan } from './setup-plan.mjs';
-import { askNewFolders, reviewJoined, reviewRoutes } from './setup-routing.mjs';
+import { askTracking } from './setup-routing.mjs';
 
-export const MACHINE_LABEL = 'Checking this machine…';
-export const WORKSPACES_LABEL = 'Checking your workspaces…';
-export const PLAN_LABEL = 'Checking your plan…';
-export const SESSIONS_LABEL = 'Looking at your past sessions…';
-export const SETTINGS_LABEL = 'Saving your settings…';
+const MACHINE_LABEL = 'Checking this machine';
+const SESSIONS_LABEL = 'Checking past sessions';
+export const AGENT = 'Claude Code';
 
-// The terminal setup flow; 0 when done, 1 when no account was chosen or signed in. Each phase names the activity line its runs show.
+// Account, plan, tracking, upload, machine defaults, closing block (ctx.notices just before it); 1 when no account signed in.
 export async function runSetup(ctx) {
   ctx.progress(MACHINE_LABEL);
   const account = await chooseAccount(ctx);
   if (account === null) return 1;
-  ctx.progress(WORKSPACES_LABEL);
-  await askNewFolders(ctx, account.key);
-  ctx.progress(PLAN_LABEL);
-  await capturePlan(ctx, account.key);
+  ctx.print(await signedInLine(ctx, account));
+  const plan = await capturePlan(ctx, account.key);
+  if (plan !== null) ctx.print(`✓ Plan found: ${plan}`);
   ctx.progress(SESSIONS_LABEL);
-  await reviewJoined(ctx, account.key);
-  await reviewRoutes(ctx, account.key);
-  await uploadHistory(ctx, account.key);
-  ctx.progress(SETTINGS_LABEL);
-  await offerDefault(ctx, account);
-  await askMachineSettings(ctx);
+  const tracking = await askTracking(ctx, account.key);
+  if (tracking !== null && tracking.tracked) await uploadPast(ctx, account.key);
+  if (tracking !== null) tracking.trailer.forEach((line) => ctx.print(line));
+  ctx.progress(MACHINE_LABEL);
+  const on = await applyDefaults(ctx);
+  ctx.notices.forEach((line) => ctx.print(line));
+  const pastFailed = tracking !== null && tracking.failed === true;
+  closingLines({ agent: AGENT, style: ctx.style, crash: on.crash, statusline: on.statusline, planFound: plan !== null, pastFailed })
+    .forEach((line) => ctx.print(line));
   return 0;
 }

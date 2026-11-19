@@ -22,12 +22,11 @@ function pluginVersion() {
 // only — auth stays the bearer token). X-Beezi-Agent picks the tool axis for the
 // backfill scope and analytics source — the server defaults an absent header to
 // claude-code, but explicit beats implicit. X-Beezi-Plugin-Version is stored on the
-// machine row; absent when the manifest cannot be read.
-export function machineHeaders(clientId) {
-  const headers = {
-    'X-Beezi-Agent': 'claude-code',
-    'X-Beezi-Host': String(os.hostname()).slice(0, 255),
-  };
+// machine row; absent when the manifest cannot be read. X-Beezi-Host is the given host, os.hostname()
+// when none is given, and absent for a null host.
+export function machineHeaders(clientId, { host = os.hostname() } = {}) {
+  const headers = { 'X-Beezi-Agent': 'claude-code' };
+  if (host != null) headers['X-Beezi-Host'] = String(host).slice(0, 255);
   if (clientId) headers['X-Beezi-Client'] = clientId;
   const version = pluginVersion();
   if (version) headers['X-Beezi-Plugin-Version'] = version;

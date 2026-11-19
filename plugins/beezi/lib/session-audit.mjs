@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 import { sessionFor as _sessionFor } from './sessions.mjs';
 import { getAuthentication as _getAuthentication, getAccessToken as _getAccessToken, INTERACTIVE_REFRESH_WAIT_MS } from './token.mjs';
 import { AUTH_STATES } from './auth-state.mjs';
@@ -18,7 +19,6 @@ import {
 } from './audit-ledger.mjs';
 import {
   flushBackfillChunks as _flushBackfillChunks,
-  completeBackfill as _completeBackfill,
   planChunks,
   BackfillSessionStatus,
   BackfillHalt,
@@ -30,6 +30,7 @@ import { readLastCostState as _readLastCostState, toCostStateItem } from './cost
 import { listAnalyticsSessions } from './analytics-sessions.mjs';
 import { nonRegressingSnapshot, sameCumulativeUsage } from './cowork-snapshot.mjs';
 import { acquireOwnedLock } from './single-instance-lock.mjs';
+import { drainQueueLocked, queuedSessionNames, queueSessionName } from './upload-drain.mjs';
 import { readSessionShell as _readSessionShell } from './transcript-shell.mjs';
 import { sessionNameFrom as _sessionNameFrom } from './session-name.mjs';
 import { loadRepoMap as _loadRepoMap, resolveRemoteOffline } from './repo-map.mjs';
@@ -39,7 +40,7 @@ import { createTranscriptMemo } from './transcript-memo.mjs';
 import { postSessionError as _postSessionError } from './session-error-report.mjs';
 import { resolveSessionTranscript } from './transcript.mjs';
 import { isMultiTenant, tenantsOf } from './workspace.mjs';
-import { createRouteContext, planSessionRoutes, waitingRoutes } from './workspace-rules.mjs';
+import { createRouteContext, planSessionRoutes } from './workspace-rules.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import { whoami as _whoami } from './whoami.mjs';
 import { bindInstallationIfNeeded as _bindInstallationIfNeeded } from './installation-binding.mjs';
@@ -52,14 +53,10 @@ import {
   isTenantDark,
   markBackfillCompleted,
   recordWhoami,
-  linkedAtMs,
   TrackingMode,
 } from './tracking.mjs';
 import { UserError } from './friendly-error.mjs';
-
-// A transcript this big, parsed and held for its session (segments, timeline, task descriptions),
-// would put the process into the hundreds of MB. Report it rather than let node die mid-run.
-const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+import { anonymizationFor } from './anonymization.mjs';
 
 // Error posts are single small upserts, so a little parallelism is free — but not unbounded,
 // or a 200-session run opens 200 sockets at once.
@@ -70,8 +67,18 @@ const AUDIT_TIMEOUT_MS = 60_000;
 // At most two chunk POSTs in flight: what today's server takes safely; more needs server work first.
 const UPLOAD_LANES = 2;
 
-// Repeatable history sync (/beezi:sync) rather than the one-time pull driven by /beezi:login.
+// The repeatable sync engine: it resumes each session from the coverage the server reports.
 export const SYNC_MODE = 'sync';
+
+// Why a run stopped before uploading anything; read by the scripts and the history worker.
+export const AuditReason = Object.freeze({
+  NO_ACCOUNT: 'no-account',
+  AUTH_UNAVAILABLE: 'auth-unavailable',
+  WORKSPACE_REQUIRED: 'workspace-required',
+  ALREADY_COMPLETED: 'already-completed',
+  AUDIT_ONLY: 'audit-only',
+  BUSY: 'busy',
+});
 
 // Refreshes the session-audit lock well inside LOCK_STALE_MS so a long history run is never broken into.
 const AUDIT_LOCK_HEARTBEAT_MS = 60 * 1000;
@@ -147,52 +154,10 @@ function readOnce(read) {
   };
 }
 
-// Seal only when a re-run could not improve the outcome, and only when the run covered
-// everything: any retryable failure, unattributable chunk, whole-chunk rejection, halt or scope
-// flag leaves the pull open. Per-item errors[] (unconnected repos on platform tenants) and
-// oversize/unreadable transcripts deliberately do NOT block — a re-run cannot help them, and
-// blocking would deadlock the seal forever.
-export function shouldFinalize(result, options = {}) {
-  if (!result.ok) return false;
-  if (result.coworkWarnings > 0) return false;
-  // /beezi:sync is repeatable by definition; sealing the one-time pull from it would lock the user
-  // out of the very command they just ran.
-  if (options.mode === SYNC_MODE) return false;
-  if (options.dryRun === true) return false;
-  if (options.sinceMs != null) return false;
-  if (result.halt !== null) return false;
-  if (result.reportsFailed > 0) return false;
-  if (result.unattributed > 0) return false;
-  if (result.permanentRejections > 0) return false;
-  // A transcript we could not read is a retryable failure like any other, and sealing over it
-  // loses that session for good — the seal is one-time per account and tool, and --force skips
-  // only the LOCAL caches, never the server's verdict. So the first failure holds the pull open.
-  //
-  // Only the FIRST failure, though: a permission error is indistinguishable from transient I/O at
-  // the call site, so gating on every occurrence would let one permanently unreadable file block
-  // the seal forever and tell the user to re-run login on a loop.
-  //
-  // `empty` and `noRemote` never block: the first has nothing to upload, and the second can never
-  // succeed (a transcript with no recorded cwd will have none on the next run either).
-  if (result.retriableUnreadable > 0) return false;
-  // A cost-state-only session has no reports, so a failure on one contributes NOTHING to
-  // reportsFailed above — sealing on top of it would lose that session's entire usage for good.
-  if (result.costStatesFailed > 0) return false;
-  if (result.costStatesUnsupported) return false;
-  // Repos still waiting for a rule may yet be routed here, so the one-time pull stays open for them.
-  if (result.routeDeferred > 0) return false;
-  return true;
-}
-
 // Routes every past session of a multi-workspace account (its rule, else New folders) and lists the workspaces any route reaches, in row order.
-// markWaiting sets `waiting` on the routes waitingRoutes finds (New folders: Ask me only), the only ones that hold a seal.
-export function planWorkspaceRuns(row, { markWaiting = false } = {}) {
+export function planWorkspaceRuns(row) {
   const entries = _listAllTranscripts();
-  const ctx = createRouteContext();
-  const routes = planSessionRoutes(row, entries, ctx);
-  if (markWaiting) {
-    for (const sessionId of waitingRoutes(row, entries, ctx, { routes }).keys()) routes.get(sessionId).waiting = true;
-  }
+  const routes = planSessionRoutes(row, entries, createRouteContext());
   const counts = { rule: 0, 'new-folders': 0, none: 0, pending: 0 };
   const reached = new Set();
   for (const route of routes.values()) {
@@ -218,8 +183,8 @@ export function createRunCache() {
   return { git: memoizeGit(git), gitRoots: new Map() };
 }
 
-// Backfill every past session on this machine into Beezi via the chunked backfill route, then
-// seal the one-time pull. Timelines ride IN the chunk payload (the tracking-gated standalone
+// Backfill every past session on this machine into Beezi via the chunked backfill route.
+// Timelines ride IN the chunk payload (the tracking-gated standalone
 // timeline route is unreachable for audit tenants); only rate-limit error reports remain a
 // live-only follow-up — and only for sessions the server judged accepted, so a failed session
 // stays fully retryable.
@@ -227,7 +192,7 @@ export async function runAudit(deps = {}, options = {}) {
   if (options.account == null) return runAuditUnlocked(deps, options);
   const acquire = deps.acquireAuditLock == null ? acquireOwnedLock : deps.acquireAuditLock;
   const lock = acquire('session-audit');
-  if (lock == null) return { ok: false, reason: 'busy', scanned: 0 };
+  if (lock == null) return { ok: false, reason: AuditReason.BUSY, scanned: 0 };
   const heartbeat = setInterval(() => { lock.refresh(); }, AUDIT_LOCK_HEARTBEAT_MS);
   if (typeof heartbeat.unref === 'function') heartbeat.unref();
   try { return await runAuditUnlocked(deps, options); }
@@ -243,7 +208,6 @@ async function runAuditUnlocked(deps, options) {
   const recordedCwd = deps.firstRecordedCwd == null ? _firstRecordedCwd : deps.firstRecordedCwd;
   const runCheckpoint = deps.runCheckpointImpl == null ? _runCheckpoint : deps.runCheckpointImpl;
   const flushBackfillChunks = deps.flushBackfillChunksImpl == null ? _flushBackfillChunks : deps.flushBackfillChunksImpl;
-  const completeBackfill = deps.completeBackfillImpl == null ? _completeBackfill : deps.completeBackfillImpl;
   const loadLedger = deps.loadLedgerImpl == null ? _loadLedger : deps.loadLedgerImpl;
   const saveLedger = deps.saveLedgerImpl == null ? _saveLedger : deps.saveLedgerImpl;
   const fetchCoverage = deps.fetchCoverageImpl == null ? _fetchCoverage : deps.fetchCoverageImpl;
@@ -277,9 +241,7 @@ async function runAuditUnlocked(deps, options) {
     active: 0,
     // The live and active sessions above that this workspace would take: [{ sessionId, path }].
     recent: [],
-    liveTracked: 0,
     alreadyImported: 0,
-    oversize: 0,
     candidates: 0,
     plannedChunks: 0,
     // Reports built and handed to the flush — in a dry run, what WOULD have been sent. Counted in
@@ -295,7 +257,7 @@ async function runAuditUnlocked(deps, options) {
     costStatesStored: 0,
     costStatesSkipped: 0,
     // Cost-state sessions the server never judged. They contribute nothing to reportsFailed (they
-    // have no reports), so they are counted separately and block the seal on their own.
+    // have no reports), so they are counted separately.
     costStatesFailed: 0,
     costStatesUnsupported: false,
     sessionsImported: 0,
@@ -308,10 +270,7 @@ async function runAuditUnlocked(deps, options) {
     // A transcript we could not read, whether the throw escaped runCheckpoint or was caught
     // inside it — the user-visible fact is the same, so it is one number.
     unreadable: 0,
-    // Unreadable sessions this run is willing to hold the pull open for: the ones we had not
-    // already tried. A file that fails on the retry too is deterministic (a permission error is
-    // indistinguishable from a transient one at the call site), and blocking on it forever would
-    // trade the old silent-loss bug for a pull that can never seal.
+    // Unreadable sessions this run had not already tried; a file that fails again is counted only in `unreadable`.
     retriableUnreadable: 0,
     // Sessions, not reports: reportsRejected counts reports and was never printed at all.
     sessionsRejected: 0,
@@ -322,7 +281,6 @@ async function runAuditUnlocked(deps, options) {
     reportsFailed: 0,
     unattributed: 0,
     permanentRejections: 0,
-    finalized: false,
     // Set when the server said the pull is sealed AND the workspace has no live tracking — the
     // audit window is the only reason to run again, so the summary points at an upgrade.
     upgradeAdvised: false,
@@ -336,32 +294,35 @@ async function runAuditUnlocked(deps, options) {
     timelinesDropped: 0,
     sessionErrors: 0,
     lastError: null,
-    // Multi-workspace runs only: sessions whose route leaves this workspace out, and those of them still waiting for a rule.
+    // Multi-workspace runs only: sessions whose route leaves this workspace out.
     routedElsewhere: 0,
-    routeDeferred: 0,
     // One-workspace runs only: sessions a matched rule excludes from tracking (`excludedSessionIds`).
     excluded: 0,
+    // Every session handed to an upload, dry or real: [{ sessionId, startedAtMs, folder }].
+    plannedSessions: [],
+    // Sync only: sessions left out of this run because the live queue still holds a report of theirs.
+    pendingLive: 0,
   };
 
-  if (options.account == null) { result.reason = 'no-account'; return result; }
+  if (options.account == null) { result.reason = AuditReason.NO_ACCOUNT; return result; }
   const key = options.account;
   const auth = await getAuthentication(deps, { account: key, waitMs: INTERACTIVE_REFRESH_WAIT_MS }).catch(() => null);
   if (auth == null || auth.authState !== AUTH_STATES.READY) {
-    result.reason = auth != null && auth.authState === AUTH_STATES.UNLINKED ? 'no-account' : 'auth-unavailable';
+    result.reason = auth != null && auth.authState === AUTH_STATES.UNLINKED ? AuditReason.NO_ACCOUNT : AuditReason.AUTH_UNAVAILABLE;
     result.authState = auth == null ? null : auth.authState;
     result.authReason = auth == null ? null : auth.reason;
     return result;
   }
   const sessionFor = deps.sessionFor == null ? _sessionFor : deps.sessionFor;
   const resolved = await sessionFor(key, { ...deps, getAccessToken: async () => auth.accessToken }).catch(() => null);
-  if (resolved == null) { result.reason = 'no-account'; return result; }
+  if (resolved == null) { result.reason = AuditReason.NO_ACCOUNT; return result; }
   // --tenant picks the workspace; a single-workspace account goes headerless.
   const tenantId = options.tenantId == null ? null : options.tenantId;
   // A multi-workspace account never sends headerless.
-  if (isMultiTenant(resolved) && tenantId == null) { result.reason = 'workspace-required'; return result; }
+  if (isMultiTenant(resolved) && tenantId == null) { result.reason = AuditReason.WORKSPACE_REQUIRED; return result; }
   // Each workspace of a multi-workspace account keeps its own ledger, so one import never blocks the rest.
   const ledgerTenant = isMultiTenant(resolved) ? tenantId : null;
-  // Rebound by renewSession; dispatches, follow-ups and /complete read it when they run.
+  // Rebound by renewSession; dispatches and follow-ups read it when they run.
   let session = { ...resolved, token: auth.accessToken, tenantId };
   const identity = session.clientId;
   // Sync drops every gate that encodes one-timeness and every skip keyed on the session id alone;
@@ -375,17 +336,20 @@ async function runAuditUnlocked(deps, options) {
   // The sealed flag is per account, so it cannot vouch for one of several workspaces.
   if (!syncMode && !options.force && !isMultiTenant(resolved) && trackingValid && tracking != null && tracking.backfillCompleted === true) {
     result.ok = true;
-    result.reason = 'already-completed';
+    result.reason = AuditReason.ALREADY_COMPLETED;
     result.upgradeAdvised = tracking.trackingMode != null && tracking.trackingMode !== TrackingMode.LIVE;
     return result;
   }
 
   // The server is the authority on "has this pull been used": local caches can be deleted (or
   // a reinstall never had them), and without this check a re-run would re-parse every
-  // transcript only to be 403'd on its first chunk. Offline/old servers answer null — proceed;
-  // the chunk-level ALREADY_COMPLETED guard still stands behind us.
+  // transcript only to be 403'd on its first chunk. With no valid answer a dry run still counts,
+  // but an upload sends nothing (see freshBlock below).
   const who = await whoamiImpl(session, { fetchImpl }).catch(() => null);
+  // Every send hides what the owner hides now: the fresh blocks replace the cached row's, never fall back to them.
+  const freshBlock = who != null && who.valid ? anonymizationFor(who, tenantId) : null;
   if (who != null && who.valid) {
+    session = { ...session, tenants: who.tenants, anonymization: who.anonymization };
     // One workspace's answer must not overwrite a multi-workspace account's cache.
     if (!isMultiTenant(resolved)) {
       try { recordWhoamiImpl(key, who, identity); } catch { /* best-effort */ }
@@ -393,14 +357,14 @@ async function runAuditUnlocked(deps, options) {
     if (!syncMode && who.backfillCompleted === true) {
       try { markCompleted(key); } catch { /* best-effort */ }
       result.ok = true;
-      result.reason = 'already-completed';
+      result.reason = AuditReason.ALREADY_COMPLETED;
       result.upgradeAdvised = who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE;
       return result;
     }
-    // liveOnly (login's upload to a joined workspace) stops before anything is sent when the workspace is not live, so it can take the one-time import.
+    // liveOnly stops the run before anything is sent when this workspace is not live.
     if (syncMode && options.liveOnly === true && who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE) {
       result.ok = true;
-      result.reason = 'audit-only';
+      result.reason = AuditReason.AUDIT_ONLY;
       return result;
     }
   }
@@ -408,7 +372,7 @@ async function runAuditUnlocked(deps, options) {
   const ledger = loadLedger(key, identity, ledgerTenant);
   if (!syncMode && !options.force && isComplete(ledger)) {
     result.ok = true;
-    result.reason = 'already-completed';
+    result.reason = AuditReason.ALREADY_COMPLETED;
     return result;
   }
 
@@ -416,28 +380,41 @@ async function runAuditUnlocked(deps, options) {
   // queue/<segmentId>.json; if it landed after this run's wide re-send, the server would hold a
   // narrow row inside a wider one — the one direction its containment supersede cannot dedupe, so
   // both would count in every SUM. Draining first also makes the coverage answer below current.
+  // The drain runs under the background uploader's `upload` lock (taken after `session-audit`,
+  // never the other way round). If a worker holds it past the bounded wait, report busy before
+  // any re-send: an unlocked drain beside the worker could reorder narrow and wide windows.
   if (syncMode && !options.coworkLive) {
-    try { await flushQueue(session, { fetchImpl }); } catch { /* best-effort; coverage still bounds us */ }
+    const drained = await drainQueueLocked(session, Object.assign({}, deps.uploadLockDeps, {
+      fetchImpl,
+      flushQueue,
+      acquireLock: deps.acquireUploadLock,
+    }));
+    if (!drained.locked) return { ok: false, reason: 'busy', scanned: 0 };
   }
+  // A drain can leave files queued (5xx, 401, offline, a stopped group). Re-sending such a session
+  // from coverage to EOF would post a wide window around a narrow one still queued, and the worker
+  // would post the narrow one after it: the order the server counts twice. Those sessions sit this
+  // run out and the next sync takes them once their queue has drained. Skipped, never deleted.
+  const queuedLive = syncMode ? queuedSessionNames(key) : new Set();
 
   const live = liveSessionId(env, deps);
   const all = listTranscripts();
   result.coworkWarnings = all.coworkWarnings || 0;
   result.scanned = all.length;
 
-  // Live-tracking tenants: everything since the machine link was tracked live; re-sending it
-  // would double-count once its per-session cursor was pruned. Dark-mode tenants never tracked
-  // live, so every transcript is fair game.
-  // The account-wide cache describes the web workspace; a multi-workspace run uses this workspace's own whoami.
-  const liveMode = isMultiTenant(resolved)
-    ? who != null && who.valid && who.trackingMode === TrackingMode.LIVE
-    : trackingValid && tracking != null && tracking.trackingMode === TrackingMode.LIVE;
-  // Sync keeps post-link sessions in scope on purpose: a session whose hooks died after 200 of 900
-  // lines is exactly what it exists to repair, and coverage stops it re-sending what already landed.
-  const linkCutoffMs = liveMode && !syncMode ? linkedAtMs(tracking) : null;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
   const sessionRoutes = options.sessionRoutes == null ? null : options.sessionRoutes;
   const excludedSessionIds = options.excludedSessionIds == null ? null : options.excludedSessionIds;
+  const offered = options.onlySessionIds == null ? null : new Set(options.onlySessionIds);
+  const historyCutoffMs = options.historyCutoffMs == null ? null : options.historyCutoffMs;
+  const coworkSince = options.coworkSince == null ? null : options.coworkSince;
+  const coworkStartedMs = (entry) => (entry.shell == null ? NaN : Date.parse(entry.shell.startedAt));
+  // Non-Cowork entries are tested on their last write; Cowork ones on their start.
+  const isAfterLink = (entry) => (entry.source === 'claude-cowork'
+    ? coworkStartedMs(entry) >= historyCutoffMs
+    : entry.mtimeMs >= historyCutoffMs);
+  // An unparsable start fails closed, like a pre-link one; a ledgered session was uploaded before.
+  const isCoworkBeforeLink = (entry) => !(coworkStartedMs(entry) >= coworkSince) && ledger.sessions[entry.sessionId] == null;
   const routedHere = (entry) => {
     if (sessionRoutes == null) return true;
     const route = sessionRoutes.get(entry.sessionId);
@@ -446,9 +423,10 @@ async function runAuditUnlocked(deps, options) {
 
   const candidates = [];
   for (const entry of all) {
+    if (offered != null && !offered.has(entry.sessionId)) continue;
+    if (historyCutoffMs != null && isAfterLink(entry)) continue;
+    if (coworkSince != null && entry.source === 'claude-cowork' && isCoworkBeforeLink(entry)) continue;
     const liveCowork = options.coworkLive === true && entry.source === 'claude-cowork';
-    // Cowork sessions are never tracked by the hooks, so the post-link cutoff does not cover them.
-    const trackedLive = entry.source !== 'claude-cowork' && linkCutoffMs != null && entry.mtimeMs >= linkCutoffMs;
     if (!liveCowork && live && entry.sessionId === live) {
       result.live += 1;
       // The live skip precedes the route filter, so only a session routed here is one to wait on.
@@ -460,19 +438,13 @@ async function runAuditUnlocked(deps, options) {
     // Filtered before the ledger and the cost-state pass, so a later rule can still send it here.
     if (sessionRoutes != null) {
       const route = sessionRoutes.get(entry.sessionId);
-      if (route == null || route.tenantIds.indexOf(tenantId) === -1) {
-        result.routedElsewhere += 1;
-        // Holds the seal only for a waiting session this run would take if a rule sent it here (post-link ones are tracked live).
-        if (route != null && route.waiting === true && !trackedLive) result.routeDeferred += 1;
-        continue;
-      }
+      if (route == null || route.tenantIds.indexOf(tenantId) === -1) { result.routedElsewhere += 1; continue; }
     }
     if (!liveCowork && entry.mtimeMs > activeCutoffMs) { result.active += 1; noteRecent(result, entry); continue; }
-    if (trackedLive) { result.liveTracked += 1; continue; }
     // Session-keyed, so it goes stale the moment a session grows — coverage supersedes it in sync.
     if (!syncMode && !options.force && isImported(ledger, entry.sessionId)) { result.alreadyImported += 1; continue; }
     if (options.sinceMs != null && entry.mtimeMs < options.sinceMs) continue;
-    if (entry.size > MAX_TRANSCRIPT_BYTES) { result.oversize += 1; continue; }
+    if (queuedLive.has(queueSessionName(entry.sessionId))) { result.pendingLive += 1; continue; }
     candidates.push(entry);
   }
   result.candidates = candidates.length;
@@ -485,24 +457,16 @@ async function runAuditUnlocked(deps, options) {
   // back to its local cursor rather than re-sending from line 0 on a blip.
   let coverage = null;
 
-  const finalize = async () => {
-    if (!shouldFinalize(result, options)) return;
-    const sealed = await completeBackfill(session, { fetchImpl }, { timeoutMs: AUDIT_TIMEOUT_MS });
-    if (sealed.completed || sealed.code === 'BACKFILL_ALREADY_COMPLETED') {
-      result.finalized = true;
-      markComplete(ledger);
-      try { saveLedger(key, ledger, ledgerTenant); } catch { /* best-effort */ }
-      try { markCompleted(key); } catch { /* best-effort */ }
-    } else {
-      result.lastError = sealed.reason == null ? result.lastError : sealed.reason;
-    }
-  };
-
   if (candidates.length === 0) {
     result.ok = true;
-    // A previous run delivered everything but its finalize POST was lost: retry the seal here,
-    // or the pull stays IN_PROGRESS forever while every rerun early-returns.
-    await finalize();
+    return result;
+  }
+
+  // No block for this workspace in the run's own whoami: send nothing, so an owed upload stays owed for a retry.
+  if (!options.dryRun && freshBlock == null) {
+    result.ok = true;
+    result.halt = BackfillHalt.ANONYMIZATION_UNKNOWN;
+    result.lastError = BackfillHalt.ANONYMIZATION_UNKNOWN;
     return result;
   }
 
@@ -545,12 +509,36 @@ async function runAuditUnlocked(deps, options) {
   // One per run, shared by every flush: the first proxy refusal of gzip turns it off for the rest of the run.
   const compression = { enabled: true };
 
+  const candidateById = new Map(candidates.map((entry) => [entry.sessionId, entry]));
+  // Block-only groups for sessions the server already holds segments of: an overlay, not a session the offer counts.
+  const overlayOnly = new Set();
+  const plannedSession = (entry) => {
+    const cowork = entry.source === 'claude-cowork';
+    let startedAtMs = NaN;
+    try {
+      const shell = cowork ? entry.shell : readShell(entry.transcriptPath);
+      if (shell != null) startedAtMs = Date.parse(shell.startedAt);
+    } catch { /* falls back to the last write */ }
+    let cwd = null;
+    if (!cowork) {
+      try { cwd = recordedCwd(entry.transcriptPath); } catch { /* folder unknown */ }
+    }
+    return {
+      sessionId: entry.sessionId,
+      startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : entry.mtimeMs,
+      folder: cowork ? 'Cowork' : (cwd == null ? null : path.basename(cwd)),
+    };
+  };
+
   const dispatchBatch = async (batch) => {
     if (deps.shouldContinue != null && !deps.shouldContinue()) {
       if (result.halt === null) result.halt = 'tracking-stopped';
       halted = true; return;
     }
     result.plannedReports += batch.reduce((sum, g) => sum + g.reports.length, 0);
+    for (const group of batch) {
+      if (!overlayOnly.has(group.sessionId)) result.plannedSessions.push(plannedSession(candidateById.get(group.sessionId)));
+    }
     if (options.dryRun) {
       const chunks = planChunks(batch);
       result.plannedChunks += chunks.length;
@@ -594,7 +582,6 @@ async function runAuditUnlocked(deps, options) {
       if (status === BackfillSessionStatus.FAILED) {
         result.reportsFailed += group.reports.length;
         // A cost-record-only group carries no reports, so the line above counts zero for it.
-        // Without this the seal would land on top of a session whose entire usage never arrived.
         // A group with reports is already counted there — counting it again would double-report.
         if (group.costState != null && group.reports.length === 0) result.costStatesFailed += 1;
       }
@@ -606,7 +593,7 @@ async function runAuditUnlocked(deps, options) {
         status === BackfillSessionStatus.REJECTED
       ) {
         const previousEntry = ledger.sessions[group.sessionId];
-        markImported(ledger, group.sessionId, { outcome: status, reports: group.reports.length });
+        markImported(ledger, group.sessionId, { outcome: status, reports: group.reports.length, consented: options.consented === true });
         if (previousEntry != null && previousEntry.coworkSnapshot != null) {
           ledger.sessions[group.sessionId].coworkSnapshot = previousEntry.coworkSnapshot;
         }
@@ -680,8 +667,7 @@ async function runAuditUnlocked(deps, options) {
     flights.add(flight);
   };
 
-  // First failure earns a retry and holds the pull open; a second one does not, so a permanently
-  // unreadable file costs one extra login rather than sealing the pull never.
+  // Only a session's first unreadable run counts as retriable; the ledger marker records the attempt.
   let unreadableDirty = false;
   const noteUnreadable = (sessionId) => {
     if (!wasUnreadable(ledger, sessionId)) result.retriableUnreadable += 1;
@@ -691,9 +677,9 @@ async function runAuditUnlocked(deps, options) {
 
   // computeDelta counts lines already consumed, and the server reports to_line 1-based inclusive, so
   // a coverage of N maps straight onto a start cursor of N — the next window opens at line N+1.
-  // Backfill reads from line 0; only a live workspace with no link time keeps the local cursor.
+  // Backfill reads from line 0.
   const startCursorFor = (sessionId) => {
-    if (!syncMode) return liveMode && linkCutoffMs == null ? null : 0;
+    if (!syncMode) return 0;
     if (coverage == null) return null;
     const covered = coverage.get(sessionId);
     return covered == null ? 0 : covered;
@@ -832,6 +818,7 @@ async function runAuditUnlocked(deps, options) {
     if (block == null) return false;
     result.costStateSessions += 1;
     if (block.only) result.costStateOnlySessions += 1;
+    else overlayOnly.add(group.sessionId);
     await queueGroup(
       { sessionId: group.sessionId, reports: [], timeline: null, costState: block.costState, cowork: group.cowork },
       Buffer.byteLength(JSON.stringify(block.costState), 'utf-8'),
@@ -953,7 +940,7 @@ async function runAuditUnlocked(deps, options) {
     // A throw from the loop itself still waits for every flight, so none writes after the lock is released.
     await Promise.all(flights);
   }
-  // The last batch flies alone once both lanes are clear; /complete below waits for every flight.
+  // The last batch flies alone once both lanes are clear.
   await dispatch({ alone: true });
   await Promise.all(flights);
   if (flightError != null) throw flightError;
@@ -965,6 +952,5 @@ async function runAuditUnlocked(deps, options) {
   }
 
   result.ok = true;
-  await finalize();
   return result;
 }

@@ -7,6 +7,8 @@ export const HISTORY_RETRY_NOTICE_AT = 3;
 export const HISTORY_BUSY_RETRY_MS = 5 * 60 * 1000;
 // A pass stamped this long ago and never settled died (the worker's watchdog is 30 minutes).
 export const HISTORY_PASS_MAX_MS = 40 * 60 * 1000;
+export const HISTORY_REFUSED_RETRY_MS = 24 * 60 * 60 * 1000;
+export const HISTORY_WATCHDOG_MS = 30 * 60 * 1000;
 
 export const HistoryStatus = Object.freeze({ SENT: 'sent', RETRYING: 'retrying', GAVE_UP: 'gave-up' });
 
@@ -24,9 +26,30 @@ function memberIds(row) {
     : [];
 }
 
+// The workspaces an entry can be owed for: the workspace list, else a row's own tenantId when it has no list.
+function owedIds(row) {
+  const members = memberIds(row);
+  return members.length > 0 || typeof row.tenantId !== 'string' || row.tenantId === '' ? members : [row.tenantId];
+}
+
+// The replay an accepted offer stands for; a repeated yes adds its sessions to the earlier one's and keeps the larger open count.
+function acceptedOf(offer, earlier) {
+  const before = earlier != null && Array.isArray(earlier.sessionIds) ? earlier.sessionIds : [];
+  return {
+    via: offer.via,
+    engine: offer.engine,
+    historyCutoffMs: offer.historyCutoffMs == null ? null : offer.historyCutoffMs,
+    override: offer.override === true,
+    changedAt: offer.changedAt == null ? null : offer.changedAt,
+    sessionIds: before.concat(offer.sessionIds.filter((id) => before.indexOf(id) === -1)),
+    active: Math.max(earlier == null ? 0 : earlier.active || 0, offer.active || 0),
+  };
+}
+
+// Only entries an accepted offer stamped; unstamped ones from older plugins are dropped on the next write.
 function entriesOf(row) {
   return Array.isArray(row.pendingHistory)
-    ? row.pendingHistory.filter((e) => e != null && typeof e.tenantId === 'string')
+    ? row.pendingHistory.filter((e) => e != null && typeof e.tenantId === 'string' && typeof e.consentedAt === 'string')
     : [];
 }
 
@@ -42,23 +65,17 @@ export function newFoldersSendIds(row) {
   return nf.tenantIds.filter((id) => members.indexOf(id) !== -1);
 }
 
+// Where a place with no rule sends: the lone workspace, else New folders' send list.
+export function defaultRouteIds(row) {
+  const members = memberIds(row);
+  return members.length === 1 ? members : newFoldersSendIds(row);
+}
+
 // Every workspace a written rule sends to (members only, in member order); a one-workspace account sends unless the rule is [].
-// Requesting ids the place already sent to is harmless: the worker uploads only sessions a workspace lacks.
 export function ruleRequestIds(row, tenantIds) {
   const members = memberIds(row);
   if (members.length === 1) return tenantIds.length === 0 ? [] : members;
   return members.filter((id) => tenantIds.indexOf(id) !== -1);
-}
-
-// After a rule is removed its places fall through to some remaining rule or New folders "send", so this requests
-// every member those still reach (a one-workspace account: its workspace); over-requesting is harmless, as above.
-export function removalRequestIds(row) {
-  const members = memberIds(row);
-  if (members.length === 1) return members;
-  const rules = Array.isArray(row.workspaceRules) ? row.workspaceRules : [];
-  const reached = newFoldersSendIds(row);
-  for (const r of rules) if (r != null && Array.isArray(r.tenantIds)) reached.push(...r.tenantIds);
-  return members.filter((id) => reached.indexOf(id) !== -1);
 }
 
 // Ids in `after` that `before` lacks, once each, in `after` order.
@@ -66,27 +83,30 @@ export function gainedIds(before, after) {
   return after.filter((id, i) => before.indexOf(id) === -1 && after.indexOf(id) === i);
 }
 
-// Adds an entry per gained workspace, or refreshes one (due now, counts kept); drops workspaces the account left.
-export function requestHistory(row, tenantIds, nowIso) {
-  const members = memberIds(row);
-  const entries = entriesOf(row).filter((e) => members.indexOf(e.tenantId) !== -1);
+// Adds a consented entry per workspace carrying the accepted offer (`accepted`: the replay the worker runs), or refreshes
+// one (due now, counts kept, sessions added); drops workspaces the account left.
+export function requestHistory(row, tenantIds, nowIso, offer) {
+  const owed = owedIds(row);
+  const entries = entriesOf(row).filter((e) => owed.indexOf(e.tenantId) !== -1);
   for (const id of tenantIds) {
-    if (members.indexOf(id) === -1) continue;
+    if (owed.indexOf(id) === -1) continue;
     const found = entries.find((e) => e.tenantId === id);
     if (found != null) {
       found.requestedAt = nowIso;
+      found.consentedAt = nowIso;
       found.lastAttemptAt = null;
+      found.accepted = acceptedOf(offer, found.accepted);
       continue;
     }
-    entries.push({ tenantId: id, requestedAt: nowIso, attempts: 0, lastAttemptAt: null, inFlight: false, sent: 0, skipped: 0, retryNoticed: false });
+    entries.push({ tenantId: id, requestedAt: nowIso, consentedAt: nowIso, attempts: 0, lastAttemptAt: null, inFlight: false, sent: 0, skipped: 0, retryNoticed: false, accepted: acceptedOf(offer, null) });
   }
   if (entries.length > 0 || Array.isArray(row.pendingHistory)) row.pendingHistory = entries;
   return entries;
 }
 
 export function pendingHistoryOf(row) {
-  const members = memberIds(row);
-  return entriesOf(row).filter((e) => members.indexOf(e.tenantId) !== -1);
+  const owed = owedIds(row);
+  return entriesOf(row).filter((e) => owed.indexOf(e.tenantId) !== -1);
 }
 
 // A retry trigger may start the worker: some entry was never tried, or not within the hour.

@@ -13,8 +13,8 @@ const LEDGER_VERSION = 1;
 //
 // The ledger is per account and the server's pull record is per (tenant, user, tool), so it also
 // binds to the login that wrote it: a ledger recorded under another identity is discarded, or a
-// logout→login into a different workspace would replay it, find zero candidates, and seal the
-// new tenant's pull EMPTY (there is no reopen).
+// logout→login into a different workspace would skip the old login's sessions on the backfill engine
+// and let segment repair push them into the new workspace.
 export function loadLedger(key, identity = null, tenantId = null) {
   const raw = readJson(auditLedgerFile(key, tenantId), null);
   // A ledger from a future/foreign shape is discarded rather than merged: re-sending is
@@ -43,7 +43,7 @@ function emptyLedger(identity) {
   };
 }
 
-// The pull was sealed server-side (we finalized it, or a chunk answered ALREADY_COMPLETED).
+// The pull was sealed server-side (an earlier plugin finalized it, and a chunk answered ALREADY_COMPLETED).
 export function markComplete(ledger, { at = new Date() } = {}) {
   ledger.complete = true;
   ledger.updatedAt = at.toISOString();
@@ -62,8 +62,12 @@ export function isImported(ledger, sessionId) {
   return Object.prototype.hasOwnProperty.call(sessions == null ? {} : sessions, sessionId);
 }
 
-export function markImported(ledger, sessionId, { outcome, reports = 0, at = new Date() } = {}) {
-  ledger.sessions[sessionId] = { at: at.toISOString(), outcome, reports };
+// A consented stamp is written only as true and survives every later re-mark.
+export function markImported(ledger, sessionId, { outcome, reports = 0, consented = false, at = new Date() } = {}) {
+  const previous = ledger.sessions[sessionId];
+  const entry = { at: at.toISOString(), outcome, reports };
+  if (consented === true || (previous != null && previous.consented === true)) entry.consented = true;
+  ledger.sessions[sessionId] = entry;
   // A session that read fine this time is not unreadable any more; leaving the marker would make
   // wasUnreadable() answer yes forever for a session that has since imported.
   if (ledger.unreadable != null) delete ledger.unreadable[sessionId];
@@ -72,9 +76,9 @@ export function markImported(ledger, sessionId, { outcome, reports = 0, at = new
 }
 
 // A transcript that could not be read. Deliberately NOT in `sessions`: the session stays eligible,
-// so the next run parses it again. It only records that we already gave it one chance, which is
-// what lets the pull seal on the second attempt instead of blocking forever on a file that fails
-// deterministically (a permission error reads exactly like a transient one).
+// so the next run parses it again. It only records that we already gave it one chance, so only the
+// first failure counts as retriable and a file that fails deterministically (a permission error
+// reads exactly like a transient one) is not reported as retriable forever.
 export function markUnreadable(ledger, sessionId, { at = new Date() } = {}) {
   ledger.unreadable[sessionId] = { at: at.toISOString() };
   ledger.updatedAt = at.toISOString();

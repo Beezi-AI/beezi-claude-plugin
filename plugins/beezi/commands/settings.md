@@ -1,6 +1,6 @@
 ---
-description: Show and change Beezi settings: rules, new folders, account and plan, crash reports, status line
-argument-hint: "[show | rules [show | add | remove <n>] | new-folders [show] | account [show] | refresh | undo | telemetry [show | on|off|correlate|anonymous] | statusline [on|off | badge on|off]]"
+description: Show and change Beezi settings: rules, new folders, account and plan, crash reports, status line, plan usage check
+argument-hint: "[show | rules [show | add | remove <n>] | new-folders [show] | account [show] | refresh | undo | telemetry [show | on|off|correlate|anonymous] | statusline [on|off | badge on|off] | usage-check [show | on|off]]"
 allowed-tools: Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/accounts.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/billing-capture.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/key-resolve.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/statusline-install.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/telemetry.mjs:*), Bash(node ${CLAUDE_PLUGIN_ROOT}/scripts/workspace.mjs:*), AskUserQuestion
 ---
 
@@ -39,6 +39,8 @@ script to read settings. The commands below only change settings or refresh the 
 | `telemetry` or `statusline`, alone or + `show`  | `node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs privacy`     |
 | `telemetry <mode>` or `statusline on`/`off`     | nothing: go to Crash reports & status line                 |
 | `statusline badge on`/`off`                     | nothing: go to Crash reports & status line                 |
+| `usage-check`, alone or + `show`                | `node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs privacy`     |
+| `usage-check on`/`off`                          | nothing: go to Crash reports & status line                 |
 | `refresh`                                       | nothing: go to Refresh my Claude plan                      |
 | `undo`                                          | nothing: run `node ${CLAUDE_PLUGIN_ROOT}/scripts/workspace.mjs undo` and write its first line verbatim; stop |
 | nothing, or anything else                       | `node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs`             |
@@ -51,7 +53,7 @@ Its output is blocks, each from a `<name …>` line to its `</name>` line:
   - one line per linked account: `account=<key> default=<yes|no> multi=<yes|no> workspaces=<n> status=<…> email=<email>`
     (`multi=yes`: the account is in several workspaces; `workspaces=<n>` is its known workspace
     count, `0` when not known yet; no such line: nothing is linked);
-  - `crash=<correlate|on|anonymous|off> statusline=<on|off> badge=<on|off>`.
+  - `crash=<correlate|on|anonymous|off> statusline=<on|off> usage-check=<on|off> badge=<on|off>`.
 - `<labels>` — with no arguments only: one line per `menu=` label, in the same order, the label
   with its current state (e.g. `Rules: here → Acme`, `New folders: ask me`, `Account: 2 linked`);
   these are the menu question's option labels.
@@ -72,7 +74,8 @@ block verbatim as your reply's first text, before the section's first question.
 ## Route
 
 First, `show` prints the current settings and changes nothing: `show` alone, or a section followed
-by `show` (`rules show`, `new-folders show`, `account show`, `telemetry show` or `statusline show`)
+by `show` (`rules show`, `new-folders show`, `account show`, `telemetry show`, `statusline show` or
+`usage-check show`)
 → the `<show>` block is the whole reply; stop.
 
 Otherwise, by the first word of the arguments:
@@ -82,7 +85,8 @@ Otherwise, by the first word of the arguments:
 - `account` → Account.
 - `refresh` → Account → Refresh my Claude plan.
 - `undo` → the read table's `undo` row (already done there).
-- `telemetry` or `statusline` → Crash reports & status line, with the rest of the arguments.
+- `telemetry`, `statusline` or `usage-check` → Crash reports & status line, with the rest of the
+  arguments.
 - Nothing, or anything else → ask (single-select, with previews: each option's `preview` = the
   lines of its section's `<preview section="<label>">` block) "What do you want to change?" with
   one option per `<labels>` line, in its order and with exactly its text. The n-th `<labels>` line
@@ -246,6 +250,8 @@ dismissal runs nothing.
 After `rule add`, `rule set` or `rule remove`, write its first line verbatim (an error line too;
 it ends with " Undo: /beezi:settings undo" when there is a change to undo).
 
+Changing where analytics go uploads nothing. If this machine has past sessions for a workspace that gains a folder, Beezi asks about uploading them when a later session starts; a workspace whose owner chose upload without asking gets a notice and the upload instead.
+
 ### One-workspace rules
 
 For a one-workspace account (the chosen `account=` line has `workspaces=1`), there is no workspace
@@ -359,6 +365,8 @@ with no rule is sent"); add " (current)" to the description of the option matchi
   `node ${CLAUDE_PLUGIN_ROOT}/scripts/workspace.mjs new-folders send <ids> --account <key>`
 
 Write the command's first line verbatim (an error line too).
+
+Changing where analytics go uploads nothing. If this machine has past sessions for a workspace that gains a folder, Beezi asks about uploading them when a later session starts; a workspace whose owner chose upload without asking gets a notice and the upload instead.
 
 ## Account
 
@@ -513,8 +521,9 @@ output verbatim and stop:
   `node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs set crash=<mode>`
 - `statusline on` or `statusline off` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs set statusline=<on|off>`
 - `statusline badge on` or `statusline badge off` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs set badge=<on|off>`
+- `usage-check on` or `usage-check off` → `node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs set usage-check=<on|off>`
 
-Otherwise the section's text is the current settings; make ONE AskUserQuestion call with two
+Otherwise the section's text is the current settings; make ONE AskUserQuestion call with three
 questions:
 
 1. (with previews: the section's text) "How should Beezi crash reports work?" with the options "Correlate (recommended)" (description
@@ -526,19 +535,25 @@ questions:
    looks the same"), "On, with a Beezi badge" ("Also shows where this folder's analytics go, like
    Beezi → Acme, at the end of your status line") and "Off" ("Usage is still read from Claude
    Code's cache, less often").
+3. "Should Beezi check your plan usage where the status line can't run, like the desktop app?"
+   with the options "Off" (description "Nothing is sent from the desktop app; usage is read from
+   Claude Code's cache") and "On" ("One small Haiku request on your plan at most every 30 minutes,
+   only when no fresher reading exists").
 
 Add ", current setting" to the description of the option matching `crash=` (`correlate`, `on`,
-`off`, `anonymous`) and of the one matching `statusline=` and `badge=` (`statusline=on badge=off`
-→ "On", `statusline=on badge=on` → "On, with a Beezi badge", `statusline=off` → "Off").
+`off`, `anonymous`), of the one matching `statusline=` and `badge=` (`statusline=on badge=off`
+→ "On", `statusline=on badge=on` → "On, with a Beezi badge", `statusline=off` → "Off") and of
+the one matching `usage-check=` (`on` → "On", `off` → "Off").
 
 Then apply only what changed, in ONE command: run EXACTLY
 
-`node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs set crash=<correlate|on|off|anonymous> statusline=<on|off> badge=<on|off>`
+`node ${CLAUDE_PLUGIN_ROOT}/scripts/settings.mjs set crash=<correlate|on|off|anonymous> statusline=<on|off> badge=<on|off> usage-check=<on|off>`
 
 keeping only the parts whose answer differs from the current one (`crash=` for a crash-report
 change; for question 2, "On" means `statusline=on badge=off`, "On, with a Beezi badge"
 `statusline=on badge=on` and "Off" `statusline=off`, and only the parts that differ from the
-current `statusline=` and `badge=` are kept). Write its output verbatim. When nothing changed,
+current `statusline=` and `badge=` are kept; `usage-check=` for a question 3 change). Write its
+output verbatim. When nothing changed,
 run nothing and say the settings are unchanged.
 
 If the user asks what crash reports collect: plugin and Claude Code versions, OS, and which plugin
