@@ -105,3 +105,14 @@ export function changeTarget(facts) {
   const hasChoices = (a) => optionsFor(facts, a).length > 0;
   return facts.accounts.find((a) => a.isDefault && hasChoices(a)) || facts.accounts.find(hasChoices);
 }
+
+const BAR_CELLS = 30;
+
+// The upload bar as its filled and empty runs, BAR_CELLS wide, with the whole percent centered across both.
+export function uploadBar({ processed, total }) {
+  const ratio = total > 0 ? processed / total : 0;
+  const percent = `${total > 0 ? Math.floor((processed * 100) / total) : 0}%`;
+  const cells = `${' '.repeat(Math.floor((BAR_CELLS - percent.length) / 2))}${percent}`.padEnd(BAR_CELLS);
+  const filled = Math.round(ratio * BAR_CELLS);
+  return { filled: cells.slice(0, filled), rest: cells.slice(filled) };
+}

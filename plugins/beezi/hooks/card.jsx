@@ -1,16 +1,20 @@
 // The startup card: Beezi's sign-in and where this folder's sessions go, drawn in the band above the prompt.
-import { LOGO_LINES, changeTarget, dotColor, optionsFor, placeLine, placeText, question, updateSteps, updateText, versionText } from '../lib/card-view.mjs';
+import { LOGO_LINES, changeTarget, dotColor, optionsFor, placeLine, placeText, question, updateSteps, updateText, uploadBar, versionText } from '../lib/card-view.mjs';
 import { finishingText, isFinishing, spinnerFrame } from '../lib/upload-phase.mjs';
 
 const VIOLET = '#8F75F8';
+const BAR_TRACK = '#2E2650';
 const CARD = { mode: 'card', account: null };
 const STRIP = { mode: 'strip', account: null };
 const UPDATE = { mode: 'update', account: null };
 // Surfaces that draw the card; scripts and hooks see BEEZI_CARD only there.
 const CARD_SURFACES = ['terminal', 'desktop', 'mobile'];
 const POLL_MS = 1000;
+// Catches what other sessions and terminals change, such as a sign-in or an upload they started.
+const REFRESH_MS = 60_000;
 // Mirrors isLive's limit in lib/upload-progress.mjs, which needs Node and so can't load here.
 const STALE_MS = 120_000;
+const NOT_AUTHORIZED = 'Not authorized · run /beezi:login';
 
 // Module variables, not $.state: variants rename the plugin, and state refs must name it literally.
 let facts = null;
@@ -23,6 +27,7 @@ let poller = null;
 let tick = 0;
 // The folder the card loads for; null where no card draws.
 let cardCwd = null;
+let refresher = null;
 
 // A $ method an older engine lacks (the desktop app's has no process.hookEnv) gives the fallback instead of throwing.
 async function guard(call, fallback) {
@@ -76,7 +81,11 @@ async function takeUploads($, cwd, loaded) {
     if (upload.finished) await guard(() => runNode($, cwd, [`${$.plugin.root}/scripts/card.mjs`, '--reported', upload.key, upload.tenantId]), null);
   }
   if (poller == null && uploads.some((upload) => !upload.finished)) {
-    poller = await guard(() => $.clock.every(POLL_MS, () => void guard(() => poll($))), null);
+    try {
+      poller = $.clock.every(POLL_MS, () => void guard(() => poll($)));
+    } catch {
+      poller = null;
+    }
   }
 }
 
@@ -102,7 +111,7 @@ async function poll($) {
   }
   uploads = next;
   if (!uploads.some((upload) => !upload.finished) || finished) stopPolling();
-  if (finished) await loadFacts($, facts.cwd);
+  if (finished) await loadFacts($, cardCwd);
   else await redraw($);
 }
 
@@ -116,16 +125,16 @@ function drawsCard(surface) {
   return surface == null || CARD_SURFACES.includes(surface);
 }
 
-// An upload started after the card loaded (a worker, "Upload now") gets its row on the next prompt or turn end.
-function reloadForUploads($) {
-  if (cardCwd != null && poller == null) void loadFacts($, cardCwd);
+// Sign-ins, rule changes and uploads started after the card loaded show on the next prompt, turn end or minute.
+function reload($) {
+  if (cardCwd != null) void loadFacts($, cardCwd);
 }
 
 async function flagCard($, surface) {
   if (CARD_SURFACES.includes(surface)) await guard(async () => $.env.set('BEEZI_CARD', await $.session.id()));
 }
 
-function uploadRows({ Box, Text, Progress }) {
+function uploadRows({ Box, Text }) {
   return uploads.map((upload) => {
     if (upload.finished) return <Text>{upload.line}</Text>;
     if (isFinishing(upload)) {
@@ -136,19 +145,17 @@ function uploadRows({ Box, Text, Progress }) {
         </Box>
       );
     }
+    const bar = uploadBar(upload);
     return (
       <Box gap={1}>
         <Text color={VIOLET}>↑</Text>
-        {Progress != null ? (
-          <Progress
-            label={`Uploading past sessions to ${upload.workspace}`}
-            value={upload.processed}
-            max={upload.total}
-            valueText={`${upload.processed}/${upload.total}`}
-          />
-        ) : (
-          <Text>{`Uploading past sessions to ${upload.workspace}  ${upload.processed}/${upload.total}`}</Text>
-        )}
+        <Box flexDirection="column">
+          <Text>{`Uploading past sessions to ${upload.workspace} ${upload.processed}/${upload.total}`}</Text>
+          <Box>
+            <Text mono weight="bold" color="#FFFFFF" backgroundColor={VIOLET}>{bar.filled}</Text>
+            <Text mono weight="bold" color={VIOLET} backgroundColor={BAR_TRACK}>{bar.rest}</Text>
+          </Box>
+        </Box>
       </Box>
     );
   });
@@ -180,8 +187,11 @@ export const register = (on) => {
     uploads = [];
     tick = 0;
     stopPolling();
+    if (refresher != null) refresher.cancel();
+    refresher = null;
     cardCwd = null;
     if (e.isInteractive) {
+      refresher = await guard(() => $.clock.every(REFRESH_MS, () => reload($)), null);
       await flagCard($, e.surface);
       if (drawsCard(e.surface)) {
         cardCwd = e.cwd;
@@ -202,20 +212,20 @@ export const register = (on) => {
 
   on('prompt.submit', async ($, e, next) => {
     if (view.mode !== 'strip') await show($, STRIP);
-    reloadForUploads($);
+    reload($);
     return next(e);
   });
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e);
-    if (e.agentId == null) reloadForUploads($);
+    if (e.agentId == null) reload($);
     return done;
   });
 
   on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
     if (e.props.hasSurvey || facts == null) return next(e);
-    const { Box, Text, Button, Svg, Progress } = $.ui.resolve(e);
-    const rows = uploadRows({ Box, Text, Progress });
+    const { Box, Text, Button, Svg } = $.ui.resolve(e);
+    const rows = uploadRows({ Box, Text });
     const isTerminal = e.surface === 'terminal';
     const where = placeText(facts);
     let logo = null;
@@ -233,6 +243,13 @@ export const register = (on) => {
       return (
         <Box flexDirection="column">
           <Box gap={1}>
+            {facts.accounts.length === 0 && (
+              <Box gap={1}>
+                <Text color="warning">●</Text>
+                <Text dimColor>Beezi</Text>
+                <Text color="warning">{NOT_AUTHORIZED}</Text>
+              </Box>
+            )}
             {facts.accounts.map((a) => (
               <Box gap={1}>
                 <Text color={dotColor(a)}>●</Text>
@@ -319,7 +336,9 @@ export const register = (on) => {
         <Box flexDirection="column">
           <Box gap={2}>
             <Text weight="bold" color={VIOLET}>Beezi</Text>
-            <Text dimColor>{single != null ? single.label : `${facts.accounts.length} accounts`}</Text>
+            {facts.accounts.length === 0
+              ? <Text color="warning">{NOT_AUTHORIZED}</Text>
+              : <Text dimColor>{single != null ? single.label : `${facts.accounts.length} accounts`}</Text>}
             {version != null && <Text dimColor>{version}</Text>}
             {update != null && <Text color="warning">· {update}</Text>}
           </Box>

@@ -1,5 +1,12 @@
 # Beezi plugin release notes
 
+## 0.46.6 (2026-11-19) — The card warns when not signed in and stays current
+
+### Improved
+- **The card warns when no account is authorized** — with no linked Beezi account, or only ones whose sign-in was rejected, the card shows `Not authorized · run /beezi:login` in warning color instead of `0 accounts`. The one-line view after the first prompt shows the same warning.
+- **A violet upload bar** — past-session uploads show a short violet bar with the percent in its center, under the `Uploading past sessions to Acme 139/179` line, instead of a full-width bar.
+- **The card stays current** — the card refreshes at every prompt and turn end, also while an upload runs, and once a minute, so a sign-in, sign-out or upload from this or another session shows up on its own.
+
 ## 0.46.5 (2026-11-19) — Maintenance release
 
 ### Improved
