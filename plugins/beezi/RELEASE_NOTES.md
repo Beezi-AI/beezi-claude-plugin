@@ -1,5 +1,10 @@
 # Beezi plugin release notes
 
+## 0.46.5 (2026-11-19) — Maintenance release
+
+### Improved
+- **No changes in how Beezi works** — this release only moves the version forward, so the card's `v0.46.5 available` note and its `How to update` steps can be checked on a machine running 0.46.4.
+
 ## 0.46.4 (2026-11-19) — Setup uploads every past session
 
 ### Improved
