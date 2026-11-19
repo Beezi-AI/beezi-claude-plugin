@@ -10,6 +10,7 @@ import { resolveSessionId } from '../lib/permission-mode-store.mjs';
 import { isLiveTrackingAllowed, readTrackingState } from '../lib/tracking.mjs';
 import { claudePlan, crashMode } from '../lib/machine-settings.mjs';
 import { badgeEnabled, setBadgeEnabled } from '../lib/statusline-badge.mjs';
+import { cardEnabled, setCardEnabled } from '../lib/card-setting.mjs';
 import { installStatusline, statuslineInstalled, uninstallStatusline } from '../lib/statusline-install.mjs';
 import { setUsageCheckEnabled, usageCheckEnabled } from '../lib/usage-check.mjs';
 import { UserError, friendlyMessage } from '../lib/friendly-error.mjs';
@@ -25,9 +26,9 @@ const LABEL_WIDTH = 17;
 const PREVIEW_WIDTH = 13;
 const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const USAGE = 'Usage: settings.mjs [rules | new-folders | account | privacy | all | keys]'
-  + ' | refresh [--account <ref>] | set [crash=<correlate|on|off|anonymous>] [statusline=<on|off>] [badge=<on|off>] [usage-check=<on|off>]';
+  + ' | refresh [--account <ref>] | set [crash=<correlate|on|off|anonymous>] [statusline=<on|off>] [badge=<on|off>] [usage-check=<on|off>] [card=<on|off>]';
 const CRASH_MODES = ['correlate', 'on', 'off', 'anonymous'];
-const SET_NAMES = ['crash', 'statusline', 'badge', 'usage-check'];
+const SET_NAMES = ['crash', 'statusline', 'badge', 'usage-check', 'card'];
 // key-resolve statuses whose answer is the local capture (settings.md, Refresh Step 2).
 const CAPTURE_STATUSES = ['no_key', 'not_linked'];
 
@@ -177,7 +178,7 @@ function keyLines(view, badge = false) {
     out.push(`account=${a.key} default=${a.key === def ? 'yes' : 'no'} multi=${isMultiTenant(a) ? 'yes' : 'no'} workspaces=${workspaceCount(a)} status=${a.status || 'linked'} email=${a.email || 'unknown'}`);
   }
   const machine = `crash=${crashMode()} statusline=${statuslineInstalled() ? 'on' : 'off'} usage-check=${usageCheckEnabled() ? 'on' : 'off'}`;
-  out.push(badge ? `${machine} badge=${badgeEnabled() ? 'on' : 'off'}` : machine);
+  out.push(badge ? `${machine} badge=${badgeEnabled() ? 'on' : 'off'} card=${cardEnabled() ? 'on' : 'off'}` : machine);
   return out;
 }
 
@@ -329,6 +330,7 @@ function privacySection() {
     field('Crash reports', crashText(crashMode())),
     field('Status line', statuslineText()),
     field('Plan usage check', usageCheckEnabled() ? 'On — one small request at most every 30 minutes where the status line can\'t run' : 'Off'),
+    field('Beezi card', cardEnabled() ? 'On — above the prompt in the terminal and the desktop app' : 'Off'),
   ];
 }
 
@@ -423,7 +425,7 @@ export async function refresh(argv, run = runScript) {
   block('capture', [capture.code === 0 ? capture.stdout : capture.stderr]);
 }
 
-// `crash=<mode>`, `statusline=<on|off>`, `badge=<on|off>` and/or `usage-check=<on|off>`: every change in one call, each result line printed.
+// `crash=<mode>`, `statusline=<on|off>`, `badge=<on|off>`, `usage-check=<on|off>` and/or `card=<on|off>`: every change in one call, each result line printed.
 function set(argv) {
   const wanted = {};
   for (const arg of argv) {
@@ -434,7 +436,7 @@ function set(argv) {
   }
   if (Object.keys(wanted).length === 0) throw new UserError(USAGE);
   if (wanted.crash != null && CRASH_MODES.indexOf(wanted.crash) === -1) throw new UserError(USAGE);
-  for (const name of ['statusline', 'badge', 'usage-check']) {
+  for (const name of ['statusline', 'badge', 'usage-check', 'card']) {
     if (wanted[name] != null && wanted[name] !== 'on' && wanted[name] !== 'off') throw new UserError(USAGE);
   }
   if (wanted.crash != null) console.log(setTelemetry(wanted.crash));
@@ -443,6 +445,12 @@ function set(argv) {
     console.log(wanted['usage-check'] === 'on'
       ? '✓ Plan usage check on: where the status line can\'t run, Beezi checks your plan usage with one small request at most every 30 minutes.'
       : '✓ Plan usage check off.');
+  }
+  if (wanted.card != null) {
+    setCardEnabled(wanted.card === 'on');
+    console.log(wanted.card === 'on'
+      ? '✓ Beezi card on: it shows above the prompt again.'
+      : '✓ Beezi card off: the start message says where analytics go instead. Turn it back on with /beezi:settings card on.');
   }
   // The badge lives in the status line, so badge=on installs it first when it is not there.
   if (wanted.statusline != null || (wanted.badge === 'on' && !statuslineInstalled())) {

@@ -1,5 +1,15 @@
 # Beezi plugin release notes
 
+## 0.46.7 (2026-11-19) — Fold the card to one line, or hide it
+
+### Improved
+- **Collapse or hide the card** — `2: Collapse` folds the card to one line, as `Hide` did before. `3: Hide` asks first (`9: Hide · 0: Cancel`), then turns the card off on this machine; a running upload still shows its bar. Turn it back on with `/beezi:settings card on`. `How to update` moves to 4.
+- **No second copy of the card at start** — while the card is on, terminal and desktop-app sessions no longer print the `Beezi ✓ …` lines when they start; warnings and other notices still show. With the card off, those lines come back.
+
+### Fixed
+- **Every card key works from the prompt** — Cancel, Later, Back and the one-line view's details answer `0` instead of a letter, which the prompt typed instead of passing to the card.
+- **The card comes back in full after /clear** — it used to stay folded to one line.
+
 ## 0.46.6 (2026-11-19) — The card warns when not signed in and stays current
 
 ### Improved

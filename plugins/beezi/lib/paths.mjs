@@ -315,6 +315,10 @@ export function statuslineBadgeFile() {
   return path.join(beeziHome(), 'statusline-badge.json');
 }
 
+export function cardSettingFile() {
+  return path.join(beeziHome(), 'card.json');
+}
+
 // Whether the plan-usage check may run where the status line can't: { version, enabled }. Off until turned on.
 export function usageCheckFile() {
   return path.join(beeziHome(), 'usage-check.json');

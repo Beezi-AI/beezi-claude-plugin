@@ -57,9 +57,12 @@ import { checkForUpdate as _checkForUpdate } from './update-check.mjs';
 import { readSessionWorkspace, resolveReadTenant, expandTargets, isMultiTenant, tenantById, tenantsOf } from './workspace.mjs';
 import { placeOfDir, routeOfSession } from './route-describe.mjs';
 import { buildBanner, liveOffNote } from './session-banner.mjs';
+import { cardEnabled } from './card-setting.mjs';
 
 // Only a new session or /clear asks about a place with no rule (workspace-prompt's ASK_SOURCES).
 const ASK_SOURCES = ['startup', 'clear'];
+// Claude Code entrypoints whose sessions draw the Beezi card above the prompt.
+const CARD_ENTRYPOINTS = ['cli', 'claude-desktop'];
 
 // Tests (and only tests) inject a bare `getAccessToken`. Map its two answers onto the typed
 // shape so the hook has exactly one code path: a token is ready, no token is unlinked, and a
@@ -383,7 +386,8 @@ export async function runSessionStart(input, deps = {}) {
   const defaultKey = await (deps.getDefaultKey == null ? getDefaultKey : deps.getDefaultKey)(deps).catch(() => null);
   // Built after the pre-warm so placeOfDir reads the warmed repo map.
   let banner = { text: null, noted: new Set(), covered: new Set() };
-  if (input.source !== 'compact') {
+  const cardShowsBanner = cardEnabled() && CARD_ENTRYPOINTS.indexOf(oauthEnv.CLAUDE_CODE_ENTRYPOINT) !== -1;
+  if (input.source !== 'compact' && !cardShowsBanner) {
     try { banner = sessionBanner(input, sessions, { workspaceState, trackingByKey, unconnected }); } catch { /* best-effort */ }
   }
   // The banner's route line already says an unconnected repo tracks nothing.

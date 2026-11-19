@@ -7,6 +7,7 @@ const BAR_TRACK = '#2E2650';
 const CARD = { mode: 'card', account: null };
 const STRIP = { mode: 'strip', account: null };
 const UPDATE = { mode: 'update', account: null };
+const CONFIRM_HIDE = { mode: 'confirm-hide', account: null };
 // Surfaces that draw the card; scripts and hooks see BEEZI_CARD only there.
 const CARD_SURFACES = ['terminal', 'desktop', 'mobile'];
 const POLL_MS = 1000;
@@ -175,6 +176,21 @@ async function save($, option) {
   await guard(() => $.ui.toast(`Beezi: ${option.done}. Undo with /beezi:settings undo`));
 }
 
+async function hide($) {
+  if (facts == null) return;
+  const cwd = facts.cwd;
+  const ran = await guard(() => runNode($, cwd, [`${$.plugin.root}/scripts/settings.mjs`, 'set', 'card=off']), null);
+  if (ran == null || ran.exitCode !== 0) {
+    const why = firstLine(ran && ran.stderr) || firstLine(ran && ran.stdout) || 'The command did not run.';
+    await guard(() => $.ui.toast(`Beezi: couldn't hide the card. ${why}`));
+    await show($, CARD);
+    return;
+  }
+  view = CARD;
+  await loadFacts($, cwd);
+  await guard(() => $.ui.toast('Beezi: card hidden. Turn it back on with /beezi:settings card on'));
+}
+
 function show($, next) {
   view = next;
   return redraw($);
@@ -210,6 +226,16 @@ export const register = (on) => {
     return attached;
   });
 
+  // A /clear raises no session.start: the fresh conversation gets the full card back here.
+  on('session.end', async ($, e, next) => {
+    const ended = await next(e);
+    if (e.reason === 'clear') {
+      view = CARD;
+      reload($);
+    }
+    return ended;
+  });
+
   on('prompt.submit', async ($, e, next) => {
     if (view.mode !== 'strip') await show($, STRIP);
     reload($);
@@ -226,6 +252,7 @@ export const register = (on) => {
     if (e.props.hasSurvey || facts == null) return next(e);
     const { Box, Text, Button, Svg } = $.ui.resolve(e);
     const rows = uploadRows({ Box, Text });
+    if (facts.hidden) return rows.length > 0 ? <Box flexDirection="column">{rows}</Box> : next(e);
     const isTerminal = e.surface === 'terminal';
     const where = placeText(facts);
     let logo = null;
@@ -257,7 +284,7 @@ export const register = (on) => {
                 {a.anonymized && <Text dimColor>· anonymized</Text>}
               </Box>
             ))}
-            <Button key="open" label="details" hotkey="b" plain dimColor onPress={() => show($, CARD)} />
+            <Button key="open" label="details" hotkey="0" plain dimColor onPress={() => show($, CARD)} />
           </Box>
           {rows}
         </Box>
@@ -299,7 +326,7 @@ export const register = (on) => {
                 </Box>
               ))}
               <Box gap={2}>
-                <Button key="later" label={asking ? 'Later' : 'Cancel'} hotkey="l" plain dimColor onPress={() => show($, CARD)} />
+                <Button key="later" label={asking ? 'Later' : 'Cancel'} hotkey="0" plain dimColor onPress={() => show($, CARD)} />
                 {isTerminal && <Text dimColor>Press a number while the prompt is empty</Text>}
               </Box>
             </Box>
@@ -319,7 +346,26 @@ export const register = (on) => {
             </Box>
             {updateSteps(facts).map((step) => <Text>{step}</Text>)}
             <Box marginTop={1}>
-              <Button key="back" label="Back" hotkey="l" plain dimColor onPress={() => show($, CARD)} />
+              <Button key="back" label="Back" hotkey="0" plain dimColor onPress={() => show($, CARD)} />
+            </Box>
+          </Box>
+        </Box>
+      );
+    }
+
+    if (view.mode === 'confirm-hide') {
+      return (
+        <Box borderStyle="round" borderColor={VIOLET} paddingX={1} gap={2}>
+          {logo}
+          <Box flexDirection="column">
+            <Box gap={1}>
+              <Text weight="bold" color={VIOLET}>Beezi</Text>
+              <Text>Hide the Beezi card on this machine?</Text>
+            </Box>
+            <Text dimColor>It comes back with /beezi:settings card on. A running upload still shows its bar.</Text>
+            <Box gap={2} marginTop={1}>
+              <Button key="confirm-hide" label="Hide" hotkey="9" plain onPress={() => hide($)} />
+              <Button key="cancel-hide" label="Cancel" hotkey="0" plain dimColor onPress={() => show($, CARD)} />
             </Box>
           </Box>
         </Box>
@@ -362,8 +408,9 @@ export const register = (on) => {
                 onPress={() => show($, { mode: 'pick', account: target.key })}
               />
             )}
-            <Button key="hide" label="Hide" hotkey="2" plain dimColor onPress={() => show($, STRIP)} />
-            {update != null && <Button key="update" label="How to update" hotkey="3" plain onPress={() => show($, UPDATE)} />}
+            <Button key="collapse" label="Collapse" hotkey="2" plain dimColor onPress={() => show($, STRIP)} />
+            <Button key="hide" label="Hide" hotkey="3" plain dimColor onPress={() => show($, CONFIRM_HIDE)} />
+            {update != null && <Button key="update" label="How to update" hotkey="4" plain onPress={() => show($, UPDATE)} />}
           </Box>
         </Box>
       </Box>

@@ -13,6 +13,7 @@ import { oneLine } from '../lib/one-line.mjs';
 import { SAFE_TENANT_ID } from '../lib/whoami.mjs';
 import { readLocalPlugin, readUpdateCheck, updateCommands } from '../lib/update-check.mjs';
 import { isNewer } from '../lib/version-compare.mjs';
+import { cardEnabled } from '../lib/card-setting.mjs';
 
 const ACCOUNT_KEY = /^[0-9a-f]{8}$/;
 const PLAIN_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
@@ -40,7 +41,7 @@ function updateFact(local, record) {
 
 export function cardFacts({
   rows, def, state, dir, ctx, readTracking = readTrackingState, list = listProgress, now = Date.now,
-  readLocal = readLocalPlugin, readCheck = readUpdateCheck,
+  readLocal = readLocalPlugin, readCheck = readUpdateCheck, readCardEnabled = cardEnabled,
 }) {
   const place = placeOfDir(dir, ctx);
   const linked = rows.filter((row) => row.status == null || row.status === AccountStatus.LINKED);
@@ -78,6 +79,7 @@ export function cardFacts({
     uploads,
     version: local == null ? null : oneLine(local.version),
     update: updateFact(local, readCheck()),
+    hidden: !readCardEnabled(),
   };
 }
 
