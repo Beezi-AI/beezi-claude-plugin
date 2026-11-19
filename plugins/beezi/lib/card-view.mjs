@@ -10,6 +10,20 @@ const FOOTER = {
   outside: 'The rule covers every session in your home folder, / or a temp folder.',
 };
 
+export function versionText(facts) {
+  return facts.version == null ? null : `v${facts.version}`;
+}
+
+export function updateText(facts) {
+  return facts.update == null ? null : `v${facts.update.latest} available`;
+}
+
+// The numbered commands to update, or the /plugin hint when the cached check names no marketplace.
+export function updateSteps(facts) {
+  if (facts.update.commands == null) return ['Run /plugin to update it, then restart Claude Code to apply it.'];
+  return [...facts.update.commands, 'Restart Claude Code to apply it.'].map((step, i) => `${i + 1}. ${step}`);
+}
+
 export function placeText(facts) {
   if (facts.place == null) return 'This session';
   return facts.place.kind === 'outside' ? 'Sessions outside a project' : facts.place.short;

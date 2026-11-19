@@ -7,9 +7,11 @@ import { claudeProjectsDir } from './paths.mjs';
 // non-session file, so no path built from the result can escape the project dir.
 const SESSION_ID = /^[a-zA-Z0-9-]+$/;
 
-// How much of a transcript's head to read looking for the recorded cwd. The cwd is on the very
-// first record in practice; the cap keeps a 50MB transcript from being slurped for one field.
-const CWD_SCAN_BYTES = 64 * 1024;
+// How much of a transcript's head to read looking for the recorded cwd, in chunks. The cwd is on
+// the first records in practice, but a long queued prompt can push it past 64KB; the cap keeps a
+// 50MB transcript from being slurped for one field.
+const CWD_SCAN_BYTES = 4 * 1024 * 1024;
+const CWD_CHUNK_BYTES = 64 * 1024;
 
 // Every past session transcript on this machine: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl.
 //
@@ -65,33 +67,42 @@ export function listAllTranscripts({ projectsDir = claudeProjectsDir() } = {}) {
 // silently dropped. A past session has no live process cwd, so the file is the only source.
 // Returns null when no record carries a string cwd.
 export function firstRecordedCwd(transcriptPath) {
-  let head;
   try {
     const fd = fs.openSync(transcriptPath, 'r');
     try {
-      const buffer = Buffer.alloc(CWD_SCAN_BYTES);
-      const read = fs.readSync(fd, buffer, 0, CWD_SCAN_BYTES, 0);
-      head = buffer.subarray(0, read).toString('utf-8');
+      return scanForCwd(fd);
     } finally {
       fs.closeSync(fd);
     }
   } catch {
     return null;
   }
+}
 
-  const lines = head.split('\n');
-  // Drop a trailing partial line: the read is byte-bounded, so the last line may be truncated
-  // mid-JSON unless the head happened to end exactly on a newline.
-  if (!head.endsWith('\n')) lines.pop();
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (parsed != null && typeof parsed.cwd === 'string' && parsed.cwd) return parsed.cwd;
+function cwdOfLine(line) {
+  try {
+    const { cwd } = JSON.parse(line) ?? {};
+    return typeof cwd === 'string' && cwd ? cwd : null;
+  } catch {
+    return null;
   }
-  return null;
+}
+
+// Carries the unfinished tail of each chunk as bytes, so a line or a multi-byte character split
+// across chunks is decoded whole.
+function scanForCwd(fd) {
+  const chunk = Buffer.alloc(CWD_CHUNK_BYTES);
+  let pending = Buffer.alloc(0);
+  for (let offset = 0; offset < CWD_SCAN_BYTES; ) {
+    const read = fs.readSync(fd, chunk, 0, CWD_CHUNK_BYTES, offset);
+    if (read === 0) break;
+    offset += read;
+    pending = Buffer.concat([pending, chunk.subarray(0, read)]);
+    for (let newline = pending.indexOf('\n'); newline !== -1; newline = pending.indexOf('\n')) {
+      const cwd = cwdOfLine(pending.subarray(0, newline).toString('utf-8'));
+      if (cwd) return cwd;
+      pending = pending.subarray(newline + 1);
+    }
+  }
+  return cwdOfLine(pending.toString('utf-8'));
 }

@@ -512,6 +512,8 @@ async function runAuditUnlocked(deps, options) {
   const candidateById = new Map(candidates.map((entry) => [entry.sessionId, entry]));
   // Block-only groups for sessions the server already holds segments of: an overlay, not a session the offer counts.
   const overlayOnly = new Set();
+  // Sessions whose main transcript the server holds and whose only new reports are subagent ones: sent, but not owed.
+  const subagentOnly = new Set();
   const plannedSession = (entry) => {
     const cowork = entry.source === 'claude-cowork';
     let startedAtMs = NaN;
@@ -537,7 +539,7 @@ async function runAuditUnlocked(deps, options) {
     }
     result.plannedReports += batch.reduce((sum, g) => sum + g.reports.length, 0);
     for (const group of batch) {
-      if (!overlayOnly.has(group.sessionId)) result.plannedSessions.push(plannedSession(candidateById.get(group.sessionId)));
+      if (!overlayOnly.has(group.sessionId) && !subagentOnly.has(group.sessionId)) result.plannedSessions.push(plannedSession(candidateById.get(group.sessionId)));
     }
     if (options.dryRun) {
       const chunks = planChunks(batch);
@@ -572,7 +574,7 @@ async function runAuditUnlocked(deps, options) {
       const verdict = flushed.bySession.get(group.sessionId);
       const status = verdict == null || verdict.status == null ? BackfillSessionStatus.FAILED : verdict.status;
       if (status === BackfillSessionStatus.ACCEPTED || status === BackfillSessionStatus.PARTIAL) {
-        result.sessionsImported += 1;
+        if (!subagentOnly.has(group.sessionId)) result.sessionsImported += 1;
         landed.push(group.sessionId);
       }
       if (status === BackfillSessionStatus.REJECTED) {
@@ -929,6 +931,9 @@ async function runAuditUnlocked(deps, options) {
       const costState = block == null ? null : block.costState;
       if (costState != null) result.costStateSessions += 1;
 
+      if (coverage != null && coverage.get(entry.sessionId) > 0 && reports.every((r) => r.is_subagent === true)) {
+        subagentOnly.add(entry.sessionId);
+      }
       followups.set(entry.sessionId, { sessionErrors });
       await queueGroup(
         { sessionId: entry.sessionId, reports, timeline, costState },
@@ -940,6 +945,8 @@ async function runAuditUnlocked(deps, options) {
     // A throw from the loop itself still waits for every flight, so none writes after the lock is released.
     await Promise.all(flights);
   }
+  // Every session is read; without this the record sits short of total while the last batch uploads alone.
+  onProgress({ processed, total: candidates.length, ...result });
   // The last batch flies alone once both lanes are clear.
   await dispatch({ alone: true });
   await Promise.all(flights);

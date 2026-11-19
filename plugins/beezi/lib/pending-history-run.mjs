@@ -10,6 +10,7 @@ import { tenantById } from './workspace.mjs';
 
 const REFUSED_REASONS = [AuditReason.NO_ACCOUNT, AuditReason.WORKSPACE_REQUIRED, AuditReason.AUDIT_ONLY, AuditReason.ALREADY_COMPLETED];
 const REFUSED_HALTS = [BackfillHalt.ALREADY_COMPLETED, BackfillHalt.NOT_ALLOWED, BackfillHalt.FORBIDDEN, BackfillHalt.UNSUPPORTED_SERVER];
+const HEARTBEAT_MS = 15000;
 
 // One run's meaning for the marker; `waiting` = a recent session predates the request. Only sync runs ask coverage.
 export function classifyRun(result, waiting, engine = OfferEngine.SYNC) {
@@ -43,16 +44,25 @@ function quietly(write) {
 // finishes failed unless the run ended clean under `engine`, and reported when the caller prints the result itself.
 export async function runWithProgress(runAudit, runDeps, options, writer, { engine = OfferEngine.SYNC, reported = false } = {}) {
   let counts = { processed: 0, total: 0, sent: 0 };
+  let progressed = false;
   const onProgress = (p) => {
     if (runDeps.onProgress != null) runDeps.onProgress(p);
     counts = { processed: p.processed, total: p.total, sent: p.sessionsImported };
+    progressed = true;
     quietly(() => writer.update(counts));
   };
   let result = null;
+  // Rewrites the last counts so a long final send never reads as a stalled run; silent until the run first reports,
+  // so a run still waiting on another run's lock never overwrites that run's record with 0/0.
+  const heartbeat = setInterval(() => {
+    if (progressed) quietly(() => writer.update(counts));
+  }, HEARTBEAT_MS);
+  if (typeof heartbeat.unref === 'function') heartbeat.unref();
   try {
     result = await runAudit({ ...runDeps, onProgress }, options);
     return result;
   } finally {
+    clearInterval(heartbeat);
     // A run that met another run's lock leaves that run's record alone.
     if (result == null || result.reason !== AuditReason.BUSY) {
       const failed = classifyRun(result, false, engine) !== RunOutcome.CLEAN;

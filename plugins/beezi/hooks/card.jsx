@@ -1,9 +1,11 @@
 // The startup card: Beezi's sign-in and where this folder's sessions go, drawn in the band above the prompt.
-import { LOGO_LINES, changeTarget, dotColor, optionsFor, placeLine, placeText, question } from '../lib/card-view.mjs';
+import { LOGO_LINES, changeTarget, dotColor, optionsFor, placeLine, placeText, question, updateSteps, updateText, versionText } from '../lib/card-view.mjs';
+import { finishingText, isFinishing, spinnerFrame } from '../lib/upload-phase.mjs';
 
 const VIOLET = '#8F75F8';
 const CARD = { mode: 'card', account: null };
 const STRIP = { mode: 'strip', account: null };
+const UPDATE = { mode: 'update', account: null };
 // Surfaces that draw the card; scripts and hooks see BEEZI_CARD only there.
 const CARD_SURFACES = ['terminal', 'desktop', 'mobile'];
 const POLL_MS = 1000;
@@ -17,6 +19,8 @@ let markSvg = null;
 // Finished uploads stay listed for the session after card.mjs stops listing them.
 let uploads = [];
 let poller = null;
+// Advances on each poll, so the finishing row's spinner moves.
+let tick = 0;
 // The folder the card loads for; null where no card draws.
 let cardCwd = null;
 
@@ -82,6 +86,7 @@ function isStale(record, nowMs) {
 
 // Re-reads each running upload's record; a finished one reloads the facts for its done line.
 async function poll($) {
+  tick += 1;
   const nowMs = await $.clock.now();
   const next = [];
   let finished = false;
@@ -123,6 +128,14 @@ async function flagCard($, surface) {
 function uploadRows({ Box, Text, Progress }) {
   return uploads.map((upload) => {
     if (upload.finished) return <Text>{upload.line}</Text>;
+    if (isFinishing(upload)) {
+      return (
+        <Box gap={1}>
+          <Text color={VIOLET}>↑</Text>
+          <Text>{`${spinnerFrame(tick)} ${finishingText(upload.workspace)}`}</Text>
+        </Box>
+      );
+    }
     return (
       <Box gap={1}>
         <Text color={VIOLET}>↑</Text>
@@ -165,6 +178,7 @@ export const register = (on) => {
     const started = await next(e);
     view = CARD;
     uploads = [];
+    tick = 0;
     stopPolling();
     cardCwd = null;
     if (e.isInteractive) {
@@ -277,8 +291,28 @@ export const register = (on) => {
       );
     }
 
+    if (view.mode === 'update' && facts.update != null) {
+      return (
+        <Box borderStyle="round" borderColor={VIOLET} paddingX={1} gap={2}>
+          {logo}
+          <Box flexDirection="column">
+            <Box gap={1}>
+              <Text weight="bold" color={VIOLET}>Beezi</Text>
+              <Text>Update Beezi {versionText(facts)} → v{facts.update.latest}</Text>
+            </Box>
+            {updateSteps(facts).map((step) => <Text>{step}</Text>)}
+            <Box marginTop={1}>
+              <Button key="back" label="Back" hotkey="l" plain dimColor onPress={() => show($, CARD)} />
+            </Box>
+          </Box>
+        </Box>
+      );
+    }
+
     const target = changeTarget(facts);
     const single = facts.accounts.length === 1 ? facts.accounts[0] : null;
+    const version = versionText(facts);
+    const update = updateText(facts);
     return (
       <Box borderStyle="round" borderColor={VIOLET} paddingX={1} gap={2}>
         {logo}
@@ -286,6 +320,8 @@ export const register = (on) => {
           <Box gap={2}>
             <Text weight="bold" color={VIOLET}>Beezi</Text>
             <Text dimColor>{single != null ? single.label : `${facts.accounts.length} accounts`}</Text>
+            {version != null && <Text dimColor>{version}</Text>}
+            {update != null && <Text color="warning">· {update}</Text>}
           </Box>
           {facts.accounts.map((a) => (
             <Box gap={1}>
@@ -308,6 +344,7 @@ export const register = (on) => {
               />
             )}
             <Button key="hide" label="Hide" hotkey="2" plain dimColor onPress={() => show($, STRIP)} />
+            {update != null && <Button key="update" label="How to update" hotkey="3" plain onPress={() => show($, UPDATE)} />}
           </Box>
         </Box>
       </Box>

@@ -11,8 +11,12 @@ import { listProgress, isLive, progressPath, markReported } from '../lib/upload-
 import { barLine, doneLine } from '../lib/upload-progress-view.mjs';
 import { oneLine } from '../lib/one-line.mjs';
 import { SAFE_TENANT_ID } from '../lib/whoami.mjs';
+import { readLocalPlugin, readUpdateCheck, updateCommands } from '../lib/update-check.mjs';
+import { isNewer } from '../lib/version-compare.mjs';
 
 const ACCOUNT_KEY = /^[0-9a-f]{8}$/;
+const PLAIN_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const MARKETPLACE_NAME = /^[A-Za-z0-9._-]+$/;
 
 // Live uploads, and finished ones nobody has shown yet. A run that did not end clean is not listed.
 function uploadFact(record, nowMs) {
@@ -24,7 +28,20 @@ function uploadFact(record, nowMs) {
   return { key, tenantId, workspace, processed, total, sent, finished, path: progressPath(key, tenantId), line };
 }
 
-export function cardFacts({ rows, def, state, dir, ctx, readTracking = readTrackingState, list = listProgress, now = Date.now }) {
+// The cached update check, when it names this plugin and a newer plain version than the installed one.
+// A marketplace name that is not a plain word gives no commands, so the card shows the /plugin hint.
+function updateFact(local, record) {
+  if (local == null || record == null || record.pluginName !== local.name) return null;
+  if (typeof record.latestVersion !== 'string' || !PLAIN_VERSION.test(record.latestVersion)) return null;
+  if (!isNewer(record.latestVersion, local.version)) return null;
+  const marketplace = typeof record.marketplaceName === 'string' && MARKETPLACE_NAME.test(record.marketplaceName) ? record.marketplaceName : null;
+  return { latest: record.latestVersion, commands: updateCommands(local.name, marketplace) };
+}
+
+export function cardFacts({
+  rows, def, state, dir, ctx, readTracking = readTrackingState, list = listProgress, now = Date.now,
+  readLocal = readLocalPlugin, readCheck = readUpdateCheck,
+}) {
   const place = placeOfDir(dir, ctx);
   const linked = rows.filter((row) => row.status == null || row.status === AccountStatus.LINKED);
   const accounts = linked
@@ -54,7 +71,14 @@ export function cardFacts({ rows, def, state, dir, ctx, readTracking = readTrack
     .flatMap((row) => list(row.key))
     .map((record) => uploadFact(record, nowMs))
     .filter((upload) => upload != null);
-  return { place: place == null ? null : { short: oneLine(place.short), kind: place.kind, path: oneLine(place.path), remote: oneLine(place.remote) }, accounts, uploads };
+  const local = readLocal();
+  return {
+    place: place == null ? null : { short: oneLine(place.short), kind: place.kind, path: oneLine(place.path), remote: oneLine(place.remote) },
+    accounts,
+    uploads,
+    version: local == null ? null : oneLine(local.version),
+    update: updateFact(local, readCheck()),
+  };
 }
 
 async function main() {

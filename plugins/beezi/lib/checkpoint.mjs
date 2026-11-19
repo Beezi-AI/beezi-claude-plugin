@@ -673,6 +673,11 @@ async function checkpointBody(input, deps, options, gate) {
   const seedIntervals = startCursor == null && Array.isArray(state.coveredIntervals) ? state.coveredIntervals : [];
   let covered = mergeIntervals(seedIntervals);
   let coveredDirty = false;
+  const claim = (intervals) => {
+    if (intervals == null || !intervals.length) return;
+    covered = claimIntervals(covered, intervals);
+    coveredDirty = true;
+  };
 
   const enqueueSegments = (segs, segmentScope, extra = null, { includeContext = true } = {}) => {
     // Range of the dropped segments so far, folded into the next payload we do send — the cursor
@@ -688,8 +693,11 @@ async function checkpointBody(input, deps, options, gate) {
       const durationSec = intervals
         ? Math.round(totalMs(subtractIntervals(intervals, covered)) / 1000)
         : seg.stats.duration_sec;
-      if (seg.stats.token_total === 0 && durationSec === 0) {
+      // No model entry: the server stores nothing for it, so sending it would leave a coverage hole.
+      const noModel = Object.keys(seg.stats.models).length === 0;
+      if ((seg.stats.token_total === 0 && durationSec === 0) || noModel) {
         if (carryFrom == null) carryFrom = seg.fromLine;
+        claim(intervals);
         continue;
       }
       const resolvedRemote = resolveRemote(seg.repoRoot);
@@ -731,10 +739,7 @@ async function checkpointBody(input, deps, options, gate) {
         carryFrom = null;
         // Claim only what actually reached the queue: a failed write must not swallow the window
         // for every later segment too.
-        if (intervals != null && intervals.length) {
-          covered = claimIntervals(covered, intervals);
-          coveredDirty = true;
-        }
+        claim(intervals);
         lastPayload = queued;
         enqueued += 1;
       } catch {

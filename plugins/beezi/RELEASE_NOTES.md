@@ -1,5 +1,13 @@
 # Beezi plugin release notes
 
+## 0.46.4 (2026-11-19) — Setup uploads every past session
+
+### Improved
+- **Sessions that open with a very long line are found** — setup now lists and uploads a past session even when its first lines are very long, such as a queued prompt. Before, it could not tell which folder these sessions belonged to and left them out, so the next session asked about them again.
+- **Uploaded sessions are not asked about again** — a session Beezi already holds is no longer offered a second time because it used subagents or had a quiet stretch with nothing to count.
+- **Uploads show they are still working** — a spinner turns while past sessions upload, and once every session has been read the line says `Finishing upload to Acme…`, with plain `Beezi: all sessions read, finishing upload…` where there is no terminal.
+- **The card shows the plugin version** — the Beezi card shows `v0.46.4`. When a newer version is out it adds `v0.46.5 available` and a `How to update` button that lists the steps.
+
 ## 0.46.3 (2026-11-18) — Past sessions follow the workspace owner
 
 ### Improved

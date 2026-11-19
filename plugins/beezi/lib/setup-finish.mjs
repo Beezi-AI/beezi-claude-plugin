@@ -1,6 +1,7 @@
 import { STOPPED, lastLine, outputLines, report, token } from './setup-routing.mjs';
 import { markReported as _markReported } from './upload-progress.mjs';
-import { REST_LINE, barLine, doneLine, followUploads, plainLine } from './upload-progress-view.mjs';
+import { isFinishing } from './upload-phase.mjs';
+import { REST_LINE, doneLine, followUploads, liveLine, plainLine } from './upload-progress-view.mjs';
 
 const FAILURE_LINE = /^(?:✗ |Beezi: )/;
 const CLEAR_LINE = '\r\x1b[2K';
@@ -21,15 +22,17 @@ function failureLines(result) {
   return lines.length > 0 ? lines : [STOPPED];
 }
 
-// The bar line cut to one row of a `columns`-wide terminal: the workspace name is shortened with '…', so the in-place
-// redraw, which clears one row, never leaves a wrapped row behind.
-function fittedBar(record, ascii, columns) {
+// The live line cut to one row of a `columns`-wide terminal: the workspace name is shortened with '…', so the in-place
+// redraw, which clears one row, never leaves a wrapped row behind. The finishing line already ends in '…', which then
+// marks the cut name, so only the bar line gets one of its own.
+function fittedLive(record, ascii, tick, columns) {
   const room = Math.min(Math.max((columns || 80) - 1, 20), MAX_ROW) - MARGIN_COLUMNS;
-  const line = barLine(record, { ascii });
+  const line = liveLine(record, { ascii, tick });
   if (line.length <= room) return line;
-  const keep = record.workspace.length - (line.length - room) - 1;
+  const cut = isFinishing(record) ? '' : '…';
+  const keep = record.workspace.length - (line.length - room) - cut.length;
   if (keep < 1) return `${line.slice(0, room - 1)}…`;
-  return barLine({ ...record, workspace: `${record.workspace.slice(0, keep).trimEnd()}…` }, { ascii });
+  return liveLine({ ...record, workspace: `${record.workspace.slice(0, keep).trimEnd()}${cut}` }, { ascii, tick });
 }
 
 // Follows the worker's progress records of `tenantIds` from `sinceMs`: on a terminal one line redrawn in place, else a
@@ -53,7 +56,9 @@ async function followPast(ctx, key, tenantIds, sinceMs) {
       sinceMs,
       capMs: onTerminal ? Infinity : PLAIN_CAP_MS,
       shouldStop: () => interrupt.stopped,
-      onUpdate: (record) => (onTerminal ? show(fittedBar(record, ascii, ctx.output.columns), '') : ctx.print(plainLine(record))),
+      // On a terminal every poll redraws the spinner; off it a line per change.
+      onUpdate: (record) => { if (!onTerminal) ctx.print(plainLine(record)); },
+      onTick: (record, tick) => { if (onTerminal) show(fittedLive(record, ascii, tick, ctx.output.columns), ''); },
       onDone: (record) => {
         show(doneLine(record));
         // A failed write only lets the next session repeat the done line.

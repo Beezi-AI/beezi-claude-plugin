@@ -1,4 +1,5 @@
 import { isLive, readProgress } from './upload-progress.mjs';
+import { FINISHING_PLAIN, finishingText, isFinishing, spinnerFrame } from './upload-phase.mjs';
 
 const BAR_CELLS = 14;
 const GLYPHS = { unicode: ['▓', '░'], ascii: ['#', '-'] };
@@ -20,7 +21,14 @@ export function barLine(record, { ascii = false } = {}) {
   return `Uploading past sessions to ${record.workspace}  ${bar}  ${record.processed}/${record.total}`;
 }
 
+// The terminal's live row: a spinner frame, then the bar while reading or the finishing text once every session is read.
+export function liveLine(record, { ascii = false, tick = 0 } = {}) {
+  const text = isFinishing(record) ? finishingText(record.workspace) : barLine(record, { ascii });
+  return `${spinnerFrame(tick, { ascii })} ${text}`;
+}
+
 export function plainLine(record) {
+  if (isFinishing(record)) return FINISHING_PLAIN;
   return `Beezi: ${record.processed}/${record.total} sessions read…`;
 }
 
@@ -40,6 +48,7 @@ export async function followUploads({
   capMs = Infinity,
   shouldStop = () => false,
   onUpdate,
+  onTick = () => {},
   onDone,
   read = readProgress,
   now = Date.now,
@@ -50,6 +59,7 @@ export async function followUploads({
   let index = 0;
   let lastSeenMs = startMs;
   let lastProcessed = null;
+  let tick = 0;
   while (index < tenantIds.length) {
     if (shouldStop()) return { finished, timedOut: false, stopped: true };
     const nowMs = now();
@@ -70,6 +80,8 @@ export async function followUploads({
         lastSeenMs = nowMs;
         if (record.processed !== lastProcessed) onUpdate(record);
         lastProcessed = record.processed;
+        onTick(record, tick);
+        tick += 1;
       }
     }
     if (nowMs - lastSeenMs >= NO_RECORD_MS) return { finished, timedOut: false, stopped: true };
