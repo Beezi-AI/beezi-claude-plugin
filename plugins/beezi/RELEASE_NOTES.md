@@ -1,5 +1,10 @@
 # Beezi plugin release notes
 
+## 0.46.8 (2026-11-20) — No console windows on Windows
+
+### Fixed
+- **No terminal windows popping up on Windows** — background uploads, such as the past-session upload that runs when a session starts, opened a console window for every `git` call they made, often one after another, and took focus from your work. They now run git with its window hidden.
+
 ## 0.46.7 (2026-11-19) — Fold the card to one line, or hide it
 
 ### Improved

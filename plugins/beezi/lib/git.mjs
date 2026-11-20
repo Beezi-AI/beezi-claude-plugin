@@ -4,8 +4,8 @@ import { execFileSync } from 'child_process';
 // yields the `task-<id>` token (see taskFromBranch).
 export const TASK_BRANCH_RE = /\/(task-[a-zA-Z0-9_-]+)/;
 
-export function git(args, cwd) {
-  return execFileSync('git', args, {
+export function git(args, cwd, exec = execFileSync) {
+  return exec('git', args, {
     cwd,
     encoding: 'utf-8',
     // Bound the spawn so a hung git can't burn the whole 10s hook budget.
@@ -14,6 +14,8 @@ export function git(args, cwd) {
     // Keep git's stderr off the user's terminal: every caller try/catches and reads a
     // failure as "no signal", so a probe outside a repo is normal, not something to report.
     stdio: ['ignore', 'pipe', 'ignore'],
+    // Detached background workers have no console: without this, Windows opens a visible one per call.
+    windowsHide: true,
     // Pin the C locale so parsed output (e.g. reflog "checkout: moving from…") stays
     // English regardless of the user's git language settings.
     env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
